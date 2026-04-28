@@ -3018,6 +3018,30 @@ function buildWhereClause(req) {
   return where;
 }
 
+// Helper function to filter project names by segment/class/series tokens
+function applyProjectTokenFilters(where, req) {
+  const tokenFilters = [];
+  
+  if (req.query.segment && req.query.segment !== 'All') {
+    // segment is the first token: FK_... or VK_...
+    tokenFilters.push({ project_name: { startsWith: `${req.query.segment}_` } });
+  }
+  if (req.query.class && req.query.class !== 'All') {
+    // class/year is the second token: _<class>_...
+    tokenFilters.push({ project_name: { contains: `_${req.query.class}_` } });
+  }
+  if (req.query.series && req.query.series !== 'All') {
+    // series is typically at position 3 or 4; use contains to be flexible
+    tokenFilters.push({ project_name: { contains: `_${req.query.series}_` } });
+  }
+  
+  if (tokenFilters.length > 0) {
+    where.AND = where.AND ? [...where.AND, ...tokenFilters] : tokenFilters;
+  }
+  
+  return where;
+}
+
 // ===== FILTER ENDPOINTS =====
 
 // Get all teams from database
@@ -3738,10 +3762,12 @@ function buildProjectViewWhere(req) {
   return where;
 }
 
-// Filter: distinct project names (respects team/employee/period)
+// Filter: distinct project names (respects team/employee/period only; NO segment/class/series)
 app.get('/api/dashboard/project-view/filter/project-names', async (req, res) => {
   try {
     const where = buildWhereClause(req);
+    // Do NOT apply segment/class/series filters here; fetch ALL project names
+    // so frontend can derive conditional options from the full list
     where.project_name = { not: null, notIn: ['', ' ', 'blank', 'Blank', 'BLANK'] };
 
     const rows = await prisma.masterDatabase.findMany({
@@ -3826,13 +3852,44 @@ app.get('/api/dashboard/project-view/projects', async (req, res) => {
     });
 
     // Sort each project's tasks by hours desc, then sort projects by totalHours desc, take 10
-    const result = Object.values(projectMap)
+    let result = Object.values(projectMap)
       .map(p => ({
         ...p,
         tasks: p.tasks.sort((a, b) => b.hours - a.hours)
       }))
-      .sort((a, b) => b.totalHours - a.totalHours)
-      .slice(0, 10);
+      ;
+
+    // Additional strict filtering by segment/class/series from query params.
+    // Use tokenized matching on project_name to avoid loose substring matches.
+    const matchProjectTokens = (projName) => {
+      if (!projName) return false;
+      const tokens = projName.split('_').map(t => t.trim()).filter(Boolean);
+      // segment -> token[0]
+      if (req.query.segment && req.query.segment !== 'All') {
+        if (tokens[0] !== req.query.segment) return false;
+      }
+      // class -> token[1]
+      if (req.query.class && req.query.class !== 'All') {
+        if (tokens[1] !== req.query.class) return false;
+      }
+      // series -> try to match at typical positions (3 or 4) or any token after position 2
+      if (req.query.series && req.query.series !== 'All') {
+        const series = req.query.series;
+        const candidatePositions = [];
+        if (tokens[3]) candidatePositions.push(tokens[3]);
+        if (tokens[4]) candidatePositions.push(tokens[4]);
+        // also allow any token after index 2
+        for (let i = 2; i < tokens.length; i++) candidatePositions.push(tokens[i]);
+        if (!candidatePositions.some(c => c === series)) return false;
+      }
+      return true;
+    };
+
+    // filter using the stricter token matcher
+    result = result.filter(p => matchProjectTokens(p.name));
+
+    // now sort and limit
+    result = result.sort((a, b) => b.totalHours - a.totalHours).slice(0, 10);
 
     res.json(result);
   } catch (error) {

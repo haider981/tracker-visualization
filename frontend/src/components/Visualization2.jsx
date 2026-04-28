@@ -588,7 +588,7 @@
 
 import React, { useState, useEffect, useRef, memo, useMemo } from 'react';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
-import { Filter, X, Search, TrendingUp } from 'lucide-react';
+import { Filter, X, Search } from 'lucide-react';
 
 const API_URL = 'http://localhost:3001/api/dashboard';
 
@@ -657,20 +657,17 @@ TimelineTooltip.displayName = 'TimelineTooltip';
 
 // ─── Main Component ────────────────────────────────────────────
 const Visualization2 = () => {
-  // ── filter state ──
-  const [departments]           = useState(['All', 'DTP', 'Editorial', 'Digital Marketing']);
-  const [allTeams, setAllTeams] = useState([]);
-  const [filteredTeams, setFilteredTeams] = useState([]);
-  const [employeeNames, setEmployeeNames] = useState([]);
+  // ── filter state (Segment / Series / Class / Project multi-select) ──
+  const [segments, setSegments] = useState([]);
+  const [seriesList, setSeriesList] = useState([]);
+  const [classesList, setClassesList] = useState([]);
 
-  const [selDept,       setSelDept]       = useState('All');
-  const [selTeam,       setSelTeam]       = useState('All');
-  const [selEmployee,   setSelEmployee]   = useState('All');
-  const [selProject,    setSelProject]    = useState('All');
-  const [selElement,    setSelElement]    = useState('All');
-  const [selTask,       setSelTask]       = useState('All');
-  const [selPeriod,     setSelPeriod]     = useState('All');
+  const [selSegment, setSelSegment] = useState('All');
+  const [selSeries, setSelSeries] = useState('All');
+  const [selClass, setSelClass] = useState('All');
+  const [selPeriod, setSelPeriod] = useState('All');
   const [projectSearch, setProjectSearch] = useState('');
+  const [selectedProjects, setSelectedProjects] = useState([]); // multi-select
 
   // ── dropdown visibility ──
   const [showProjDrop, setShowProjDrop] = useState(false);
@@ -682,7 +679,6 @@ const Visualization2 = () => {
   const [elementNames,    setElementNames]    = useState([]);  // for Project Element dropdown
   const [timeline,        setTimeline]        = useState([]);  // area chart rows
   const [timelineTasks,   setTimelineTasks]   = useState([]);  // task keys present in timeline
-  const [selectedProject, setSelectedProject] = useState(null); // clicked project name (drives timeline)
 
   const [loading, setLoading] = useState(true);
 
@@ -696,59 +692,72 @@ const Visualization2 = () => {
     return buildColorMap([...set]);
   }, [projects]);
 
-  // ─── fetch filter lists ──────────────────────────────────────
+  // ─── fetch all project names (NO filters) once to derive all segment/series/class options
   const fetchFilters = async () => {
     try {
+      // Fetch project names WITHOUT any segment/series/class filters (only team/employee/period)
       const params = new URLSearchParams();
-      if (selTeam !== 'All') params.append('team', selTeam);
-      if (selEmployee !== 'All') params.append('employee', selEmployee);
       if (selPeriod !== 'All') params.append('period', selPeriod);
-      const qs = params.toString();
-      const sfx = qs ? `?${qs}` : '';
+      const sfx = params.toString() ? `?${params.toString()}` : '';
+      const projRes = await fetch(`${API_URL}/project-view/filter/project-names${sfx}`);
+      const names = await projRes.json();
+      setProjectNames(names);
+      
+      // derive Segment / Class / Series from FULL list using heuristics
+      const segSet = new Set();
+      const classSet = new Set();
+      const seriesSet = new Set();
 
-      const [teamsRes, empRes, projRes, taskRes, elemRes] = await Promise.all([
-        fetch(`${API_URL}/filters/teams`),
-        fetch(`${API_URL}/filters/employees?${qs}`),
-        fetch(`${API_URL}/project-view/filter/project-names${sfx}`),
-        fetch(`${API_URL}/project-view/filter/tasks${sfx}`),
-        fetch(`${API_URL}/project-view/filter/elements${sfx}`)
-      ]);
+      const detectSeries = (parts) => {
+        // prefer token immediately before a parenthesised token like '(Eng)'
+        const parenIdx = parts.findIndex(p => p && /^\(.+\)$/.test(p));
+        if (parenIdx > 2) return parts[parenIdx - 1];
+        // otherwise prefer token immediately before a year token like '26-27'
+        const yearIdx = parts.findIndex(p => p && /^\d{2}-\d{2}$/.test(p));
+        if (yearIdx > 2) return parts[yearIdx - 1];
+        // fallback to 4th token if present, else 3rd
+        return parts[4] || parts[3] || '';
+      };
 
-      setAllTeams(await teamsRes.json());
-      setEmployeeNames(await empRes.json());
-      setProjectNames(await projRes.json());
-      setTaskNames(await taskRes.json());
-      setElementNames(await elemRes.json());
+      names.forEach(n => {
+        const parts = n.split('_').map(p => p.trim()).filter(Boolean);
+        if (parts[0]) segSet.add(parts[0]);
+        if (parts[1]) classSet.add(parts[1]);
+        const s = detectSeries(parts);
+        if (s) seriesSet.add(s);
+      });
+
+      setSegments(['All', ...[...segSet]]);
+      setClassesList(['All', ...[...classSet]]);
+      setSeriesList(['All', ...[...seriesSet]]);
     } catch (e) { console.error('fetchFilters', e); }
   };
 
-  // ─── fetch horizontal bar data ───────────────────────────────
+  // ─── fetch horizontal bar data and apply client-side filtering by segment/series/class/projects ───────────────────────────────
   const fetchProjects = async () => {
     try {
+      setLoading(true);
+      // Send filters to backend: segment/series/class/period + selected projects
       const params = new URLSearchParams();
-      if (selTeam !== 'All')     params.append('team', selTeam);
-      if (selEmployee !== 'All') params.append('employee', selEmployee);
-      if (selPeriod !== 'All')   params.append('period', selPeriod);
-      if (selProject !== 'All')  params.append('project_name', selProject);
-      if (selTask !== 'All')     params.append('task_name', selTask);
-      if (selElement !== 'All')  params.append('book_element', selElement);
+      if (selSegment !== 'All') params.append('segment', selSegment);
+      if (selSeries !== 'All') params.append('series', selSeries);
+      if (selClass !== 'All') params.append('class', selClass);
+      if (selPeriod !== 'All') params.append('period', selPeriod);
+      if (selectedProjects.length > 0) selectedProjects.forEach(p => params.append('project_name', p));
 
-      const res = await fetch(`${API_URL}/project-view/projects?${params}`);
+      const res = await fetch(`${API_URL}/project-view/projects?${params.toString()}`);
       const data = await res.json();
       setProjects(data);
       setLoading(false);
     } catch (e) { console.error('fetchProjects', e); setLoading(false); }
   };
 
-  // ─── fetch timeline for ONE project ──────────────────────────
-  const fetchTimeline = async (projectName) => {
-    if (!projectName) { setTimeline([]); setTimelineTasks([]); return; }
+  // ─── fetch timeline for selected projects (can be multiple) ──────────────────────────
+  const fetchTimeline = async (projectNamesArray) => {
+    if (!projectNamesArray || projectNamesArray.length === 0) { setTimeline([]); setTimelineTasks([]); return; }
     try {
       const params = new URLSearchParams();
-      params.append('project_name', projectName);
-      if (selTeam !== 'All')     params.append('team', selTeam);
-      if (selEmployee !== 'All') params.append('employee', selEmployee);
-      if (selPeriod !== 'All')   params.append('period', selPeriod);
+      projectNamesArray.forEach(n => params.append('project_name', n));
 
       const res = await fetch(`${API_URL}/project-view/timeline?${params}`);
       const { timeline: rows, tasks } = await res.json();
@@ -758,28 +767,14 @@ const Visualization2 = () => {
   };
 
   // ─── effects ─────────────────────────────────────────────────
-  useEffect(() => { fetchFilters(); }, []);
+  // initial load: fetch filters (ALL project names) and initial projects
+  useEffect(() => { fetchFilters(); fetchProjects(); }, []);
 
-  // Department → filtered teams
-  useEffect(() => {
-    if (selDept === 'All') { setFilteredTeams(allTeams); return; }
-    const fn = DEPARTMENT_TEAM_MAPPING[selDept];
-    setFilteredTeams(fn ? allTeams.filter(fn) : []);
-  }, [selDept, allTeams]);
+  // refetch projects automatically when filter selections change
+  useEffect(() => { fetchProjects(); }, [selSegment, selSeries, selClass, selPeriod, selectedProjects]);
 
-  // Any filter change → refetch projects
-  useEffect(() => {
-    fetchProjects();
-    fetchFilters();
-  }, [selTeam, selEmployee, selPeriod, selProject, selTask, selElement]);
-
-  // When department changes reset downstream
-  useEffect(() => { setSelTeam('All'); setSelEmployee('All'); }, [selDept]);
-  // When team changes reset employee
-  useEffect(() => { setSelEmployee('All'); }, [selTeam]);
-
-  // Timeline follows selectedProject
-  useEffect(() => { fetchTimeline(selectedProject); }, [selectedProject, selTeam, selEmployee, selPeriod]);
+  // timeline follows selected projects
+  useEffect(() => { fetchTimeline(selectedProjects); }, [selectedProjects]);
 
   // Click-outside closes project search dropdown
   useEffect(() => {
@@ -792,17 +787,90 @@ const Visualization2 = () => {
 
   // ─── clear all ───────────────────────────────────────────────
   const clearAll = () => {
-    setSelDept('All'); setSelTeam('All'); setSelEmployee('All');
-    setSelProject('All'); setSelElement('All'); setSelTask('All');
-    setSelPeriod('All'); setProjectSearch('');
-    setSelectedProject(null);
+    setSelSegment('All'); setSelSeries('All'); setSelClass('All');
+    setProjectSearch(''); setSelectedProjects([]);
+    setTimeline([]); setTimelineTasks([]);
   };
 
-  // ─── derived: filtered project names for the search dropdown ─
+  // toggle selection for a project name
+  const toggleProject = (name) => {
+    setSelectedProjects(prev => prev.includes(name) ? prev.filter(p => p !== name) : [...prev, name]);
+  };
+
+  // ─── derived: filtered project names for the search dropdown (respects segment/series/class + search) ─
   const filteredProjNames = useMemo(() => {
-    if (!projectSearch.trim()) return projectNames;
-    return projectNames.filter(n => n.toLowerCase().includes(projectSearch.toLowerCase()));
-  }, [projectSearch, projectNames]);
+    let results = projectNames;
+    
+    // filter by segment
+    if (selSegment !== 'All') {
+      results = results.filter(n => {
+        const parts = n.split('_').map(x => x.trim()).filter(Boolean);
+        return parts[0] === selSegment;
+      });
+    }
+    
+    // filter by class
+    if (selClass !== 'All') {
+      results = results.filter(n => {
+        const parts = n.split('_').map(x => x.trim()).filter(Boolean);
+        return parts[1] === selClass;
+      });
+    }
+    
+    // filter by series
+    if (selSeries !== 'All') {
+      results = results.filter(n => {
+        const parts = n.split('_').map(x => x.trim()).filter(Boolean);
+        const parenIdx = parts.findIndex(p => p && /^\(.+\)$/.test(p));
+        const yearIdx = parts.findIndex(p => p && /^\d{2}-\d{2}$/.test(p));
+        const series = parenIdx > 2 ? parts[parenIdx - 1] : (yearIdx > 2 ? parts[yearIdx - 1] : (parts[4] || parts[3]));
+        return series === selSeries;
+      });
+    }
+    
+    // filter by search text
+    if (projectSearch.trim()) {
+      results = results.filter(n => n.toLowerCase().includes(projectSearch.toLowerCase()));
+    }
+    
+    return results;
+  }, [projectNames, selSegment, selClass, selSeries, projectSearch]);
+
+  // derived lists for Series and Class based on selected Segment/Series
+  const derivedSeries = useMemo(() => {
+    // compute series options based on selected segment
+    if (selSegment === 'All') return seriesList;
+    const set = new Set();
+    projectNames.forEach(n => {
+      const parts = n.split('_').map(x => x.trim()).filter(Boolean);
+      if (parts[0] !== selSegment) return;
+      // use same detection logic as fetchFilters
+      const parenIdx = parts.findIndex(p => p && /^\(.+\)$/.test(p));
+      if (parenIdx > 2) { set.add(parts[parenIdx - 1]); return; }
+      const yearIdx = parts.findIndex(p => p && /^\d{2}-\d{2}$/.test(p));
+      if (yearIdx > 2) { set.add(parts[yearIdx - 1]); return; }
+      if (parts[4]) set.add(parts[4]);
+      else if (parts[3]) set.add(parts[3]);
+    });
+    return ['All', ...[...set]];
+  }, [selSegment, projectNames, seriesList]);
+
+  const derivedClasses = useMemo(() => {
+    const set = new Set();
+    projectNames.forEach(n => {
+      const parts = n.split('_').map(x => x.trim()).filter(Boolean);
+      if (selSegment !== 'All' && parts[0] !== selSegment) return;
+      if (selSeries !== 'All') {
+        // ensure series matches using same detection
+        const parenIdx = parts.findIndex(p => p && /^\(.+\)$/.test(p));
+        const yearIdx = parts.findIndex(p => p && /^\d{2}-\d{2}$/.test(p));
+        const seriesCandidate = parenIdx > 2 ? parts[parenIdx - 1] : (yearIdx > 2 ? parts[yearIdx - 1] : (parts[4] || parts[3]));
+        if (seriesCandidate !== selSeries) return;
+      }
+      if (parts[1]) set.add(parts[1]);
+    });
+    return ['All', ...[...set]];
+  }, [selSegment, selSeries, projectNames]);
 
   // ─── HORIZONTAL BAR CHART (custom SVG) ──────────────────────
   // Each project = one row.  Each row is segmented by task, widths proportional to hours.
@@ -868,8 +936,8 @@ const Visualization2 = () => {
         return seg;
       });
 
-      // Determine if this project name should be bold (it's the selected timeline project)
-      const isSelected = project.name === selectedProject;
+      // Determine if this project name is selected (multi-select)
+      const isSelected = selectedProjects.includes(project.name);
 
       return (
         <g key={pIdx}>
@@ -883,7 +951,7 @@ const Visualization2 = () => {
             fontSize={12}
             fontWeight={isSelected ? 700 : 400}
             style={{ cursor: 'pointer', userSelect: 'none' }}
-            onClick={() => setSelectedProject(isSelected ? null : project.name)}
+            onClick={() => toggleProject(project.name)}
           >
             {project.name.length > 36 ? project.name.slice(0, 34) + '…' : project.name}
           </text>
@@ -944,30 +1012,50 @@ const Visualization2 = () => {
               <h2 className="text-xl font-bold text-white flex items-center">
                 <Filter className="mr-2 text-purple-400" /> Filters
               </h2>
-              <button onClick={clearAll} className="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg flex items-center transition-colors text-sm font-semibold">
-                <X className="w-4 h-4 mr-2" /> CLEAR ALL
-              </button>
+              <div className="flex items-center gap-2">
+                <button onClick={clearAll} className="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg flex items-center transition-colors text-sm font-semibold">
+                  <X className="w-4 h-4 mr-2" /> CLEAR ALL
+                </button>
+              </div>
             </div>
-
-            {/* Row 1 */}
+            {/* Row 1: Segment / Series / Class / Project (multi-select search) */}
             <div className="grid grid-cols-4 gap-4 mb-4">
-              {/* Department */}
+              {/* Segment */}
               <div>
-                <label className="text-white text-sm font-semibold mb-2 block">Department</label>
-                <select value={selDept} onChange={e => setSelDept(e.target.value)}
+                <label className="text-white text-sm font-semibold mb-2 block">Segment</label>
+                <select value={selSegment} onChange={e => { setSelSegment(e.target.value); setSelSeries('All'); setSelClass('All'); }}
                   className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-purple-500">
-                  {departments.map(d => <option key={d} value={d}>{d}</option>)}
+                  <option value="All">All</option>
+                  {segments.filter(s => s).map(s => <option key={s} value={s}>{s}</option>)}
                 </select>
               </div>
 
-              {/* Project Category (search) */}
+              {/* Series */}
+              <div>
+                <label className="text-white text-sm font-semibold mb-2 block">Series</label>
+                <select value={selSeries} onChange={e => { setSelSeries(e.target.value); setSelClass('All'); }}
+                  className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-purple-500">
+                  {derivedSeries.map(s => <option key={s} value={s}>{s}</option>)}
+                </select>
+              </div>
+
+              {/* Class */}
+              <div>
+                <label className="text-white text-sm font-semibold mb-2 block">Class</label>
+                <select value={selClass} onChange={e => setSelClass(e.target.value)}
+                  className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-purple-500">
+                  {derivedClasses.map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+
+              {/* Project (search + multi-select) */}
               <div className="relative" ref={projDropRef}>
-                <label className="text-white text-sm font-semibold mb-2 block">Project Category</label>
+                <label className="text-white text-sm font-semibold mb-2 block">Project</label>
                 <div className="relative">
                   <input
                     type="text"
                     value={projectSearch}
-                    placeholder="Search…"
+                    placeholder="Search projects…"
                     onChange={e => { setProjectSearch(e.target.value); setShowProjDrop(true); }}
                     onFocus={() => setShowProjDrop(true)}
                     className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-4 py-2 pr-10 focus:outline-none focus:ring-2 focus:ring-purple-500"
@@ -976,63 +1064,28 @@ const Visualization2 = () => {
                 </div>
                 {showProjDrop && (
                   <div className="absolute top-full mt-1 w-full bg-gray-700 border border-gray-600 rounded-lg shadow-lg max-h-60 overflow-y-auto z-50">
-                    <div onClick={() => { setSelProject('All'); setProjectSearch(''); setShowProjDrop(false); }}
-                      className="px-4 py-2 hover:bg-gray-600 cursor-pointer text-white">All</div>
+                    <div className="flex items-center justify-between px-3 py-2 border-b border-gray-600">
+                      <button onClick={() => { setSelectedProjects(filteredProjNames.slice()); }} className="text-sm text-white hover:underline">Select All</button>
+                      <button onClick={() => { setSelectedProjects([]); }} className="text-sm text-gray-300 hover:underline">Clear</button>
+                    </div>
                     {filteredProjNames.map(n => (
-                      <div key={n} onClick={() => { setSelProject(n); setProjectSearch(n); setShowProjDrop(false); }}
-                        className="px-4 py-2 hover:bg-gray-600 cursor-pointer text-white truncate">{n}</div>
+                      <div key={n} onClick={() => toggleProject(n)}
+                        className="px-4 py-2 hover:bg-gray-600 cursor-pointer text-white truncate flex items-center gap-2">
+                        <input type="checkbox" readOnly checked={selectedProjects.includes(n)} className="w-4 h-4" />
+                        <span className="flex-1 text-sm">{n}</span>
+                      </div>
                     ))}
                     {filteredProjNames.length === 0 && <div className="px-4 py-2 text-gray-400">No match</div>}
+                    <div className="px-3 py-2 text-right">
+                      <button onClick={() => setShowProjDrop(false)} className="text-sm text-gray-300 hover:underline">Done</button>
+                    </div>
                   </div>
                 )}
               </div>
-
-              {/* Employee Name */}
-              <div>
-                <label className="text-white text-sm font-semibold mb-2 block">Employee Name</label>
-                <select value={selEmployee} onChange={e => setSelEmployee(e.target.value)}
-                  className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:opacity-50 disabled:cursor-not-allowed"
-                  disabled={selTeam === 'All'}>
-                  <option value="All">All</option>
-                  {employeeNames.map(e => <option key={e} value={e}>{e}</option>)}
-                </select>
-              </div>
-
-              {/* Project Element */}
-              <div>
-                <label className="text-white text-sm font-semibold mb-2 block">Project Element</label>
-                <select value={selElement} onChange={e => setSelElement(e.target.value)}
-                  className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-purple-500">
-                  <option value="All">All</option>
-                  {elementNames.map(e => <option key={e} value={e}>{e}</option>)}
-                </select>
-              </div>
             </div>
 
-            {/* Row 2 */}
-            <div className="grid grid-cols-4 gap-4">
-              {/* Team Name */}
-              <div>
-                <label className="text-white text-sm font-semibold mb-2 block">Team Name</label>
-                <select value={selTeam} onChange={e => setSelTeam(e.target.value)}
-                  className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:opacity-50 disabled:cursor-not-allowed"
-                  disabled={selDept === 'All'}>
-                  <option value="All">All</option>
-                  {filteredTeams.map(t => <option key={t} value={t}>{t}</option>)}
-                </select>
-              </div>
-
-              {/* Project Name dropdown */}
-              <div>
-                <label className="text-white text-sm font-semibold mb-2 block">Project Name</label>
-                <select value={selProject} onChange={e => setSelProject(e.target.value)}
-                  className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-purple-500">
-                  <option value="All">All</option>
-                  {projectNames.map(p => <option key={p} value={p}>{p}</option>)}
-                </select>
-              </div>
-
-              {/* Period */}
+            {/* Row 2: Period filter */}
+            <div className="grid grid-cols-4 gap-4 mb-4">
               <div>
                 <label className="text-white text-sm font-semibold mb-2 block">Period</label>
                 <select value={selPeriod} onChange={e => setSelPeriod(e.target.value)}
@@ -1046,16 +1099,9 @@ const Visualization2 = () => {
                   <option value="This Year">This Year</option>
                 </select>
               </div>
-
-              {/* Task */}
-              <div>
-                <label className="text-white text-sm font-semibold mb-2 block">Task</label>
-                <select value={selTask} onChange={e => setSelTask(e.target.value)}
-                  className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-purple-500">
-                  <option value="All">All</option>
-                  {taskNames.map(t => <option key={t} value={t}>{t}</option>)}
-                </select>
-              </div>
+              <div />
+              <div />
+              <div />
             </div>
           </div>
         </div>
@@ -1124,12 +1170,12 @@ const Visualization2 = () => {
         <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6">
           <h2 className="text-3xl font-bold text-white text-center mb-1">Project Timeline</h2>
 
-          {selectedProject ? (
+          {selectedProjects.length > 0 ? (
             <>
-              {/* legend: single dot + project name */}
+              {/* legend: selected projects */}
               <p className="text-center text-gray-300 text-sm mb-3">
                 <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', backgroundColor: '#10b981', marginRight: 6 }} />
-                {selectedProject}
+                {selectedProjects.join(', ')}
               </p>
 
               {timeline.length > 0 ? (
@@ -1157,12 +1203,12 @@ const Visualization2 = () => {
                   </AreaChart>
                 </ResponsiveContainer>
               ) : (
-                <p className="text-gray-500 text-center py-20">No timeline data available for this project.</p>
+                <p className="text-gray-500 text-center py-20">No timeline data available for the selected projects.</p>
               )}
             </>
           ) : (
             <p className="text-gray-500 text-center py-20 text-sm">
-              👆 Click a project name in the chart above to load its timeline.
+              👆 Click project names in the chart above (or select via Project filter) to load timelines.
             </p>
           )}
         </div>
