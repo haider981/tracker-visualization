@@ -3918,6 +3918,7 @@ app.get('/api/dashboard/project-view/timeline', async (req, res) => {
 
     // Date filter — default to all time for project timeline (no forced 30-day window)
     let dateFilter = {};
+    let periodStartDate = null;
     if (req.query.period && req.query.period !== 'All') {
       const now = new Date();
       let startDate;
@@ -3929,7 +3930,11 @@ app.get('/api/dashboard/project-view/timeline', async (req, res) => {
         case 'Last Year':     startDate = new Date(now); startDate.setMonth(startDate.getMonth() - 12); break;
         case 'This Year':     startDate = new Date(now.getFullYear(), 0, 1); break;
       }
-      if (startDate) dateFilter = { gte: startDate };
+      if (startDate) {
+        periodStartDate = new Date(startDate);
+        periodStartDate.setHours(0, 0, 0, 0);
+        dateFilter = { gte: periodStartDate };
+      }
     }
 
     const records = await prisma.masterDatabase.findMany({
@@ -3959,6 +3964,21 @@ app.get('/api/dashboard/project-view/timeline', async (req, res) => {
       const task = r.task_name || 'Unspecified';
       dateMap[dateKey][task] = (dateMap[dateKey][task] || 0) + (r.hours_spent || 0);
     });
+
+    // For period-based timeline, include missing dates as zero rows so full range is visible.
+    if (periodStartDate) {
+      const endDate = new Date();
+      endDate.setHours(0, 0, 0, 0);
+      const cursor = new Date(periodStartDate);
+      while (cursor <= endDate) {
+        const dateKey = cursor.toISOString().split('T')[0];
+        if (!dateMap[dateKey]) {
+          dateMap[dateKey] = { date: dateKey };
+          allTasks.forEach(t => { dateMap[dateKey][t] = 0; });
+        }
+        cursor.setDate(cursor.getDate() + 1);
+      }
+    }
 
     const timeline = Object.values(dateMap).sort((a, b) => a.date.localeCompare(b.date));
 
