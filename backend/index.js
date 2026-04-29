@@ -3744,8 +3744,21 @@ app.get('/api/dashboard/team-comparison', async (req, res) => {
 function buildProjectViewWhere(req) {
   const where = buildWhereClause(req); // team, employee, period already handled
 
-  if (req.query.project_name && req.query.project_name !== 'All') {
-    where.project_name = req.query.project_name;
+  const normalizeQueryValues = (input) => {
+    if (Array.isArray(input)) {
+      return input
+        .map(v => String(v || '').trim())
+        .filter(v => v && v !== 'All');
+    }
+    const single = String(input || '').trim();
+    return single && single !== 'All' ? [single] : [];
+  };
+
+  const projectNames = normalizeQueryValues(req.query.project_name);
+  if (projectNames.length === 1) {
+    where.project_name = projectNames[0];
+  } else if (projectNames.length > 1) {
+    where.project_name = { in: projectNames };
   }
   if (req.query.task_name && req.query.task_name !== 'All') {
     where.task_name = req.query.task_name;
@@ -3888,8 +3901,8 @@ app.get('/api/dashboard/project-view/projects', async (req, res) => {
     // filter using the stricter token matcher
     result = result.filter(p => matchProjectTokens(p.name));
 
-    // now sort and limit
-    result = result.sort((a, b) => b.totalHours - a.totalHours).slice(0, 10);
+    // sort by total hours; return all matched projects so frontend scroll can show full list
+    result = result.sort((a, b) => b.totalHours - a.totalHours);
 
     res.json(result);
   } catch (error) {
@@ -3950,6 +3963,295 @@ app.get('/api/dashboard/project-view/timeline', async (req, res) => {
     const timeline = Object.values(dateMap).sort((a, b) => a.date.localeCompare(b.date));
 
     res.json({ timeline, tasks: allTasks });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Project Deep Dive: employee contribution + task ownership breakdown for one project
+app.get('/api/dashboard/project-view/project-insights', async (req, res) => {
+  try {
+    const where = buildProjectViewWhere(req);
+    const selectedProjects = Array.isArray(req.query.project_name)
+      ? req.query.project_name.filter(p => p && p !== 'All')
+      : (req.query.project_name && req.query.project_name !== 'All' ? [req.query.project_name] : []);
+
+    if (selectedProjects.length === 0) {
+      return res.status(400).json({ error: 'project_name is required' });
+    }
+
+    const records = await prisma.masterDatabase.findMany({
+      where: {
+        ...where
+      },
+      select: {
+        project_name: true,
+        name: true,
+        task_name: true,
+        book_element: true,
+        chapter_number: true,
+        hours_spent: true,
+        number_of_units: true,
+        date: true
+      }
+    });
+
+    const employeeMap = {};
+    const taskMap = {};
+    const projectMap = {};
+    const dateHoursMap = {};
+    const employeeDayHoursMap = {};
+    const projectDateMap = {};
+    let totalHours = 0;
+    let totalUnits = 0;
+    let minDate = null;
+    let maxDate = null;
+
+    records.forEach((r) => {
+      const project = (r.project_name || 'Unspecified').trim();
+      const employee = (r.name || 'Unassigned').trim();
+      const task = (r.task_name || 'Unspecified').trim();
+      const bookElement = (r.book_element || '').trim();
+      const chapter = (r.chapter_number || '').trim();
+      const hours = r.hours_spent || 0;
+      const units = r.number_of_units || 0;
+      const dateKey = r.date
+        ? (r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10))
+        : null;
+
+      totalHours += hours;
+      totalUnits += units;
+
+      if (dateKey) {
+        dateHoursMap[dateKey] = (dateHoursMap[dateKey] || 0) + hours;
+        const empDateKey = `${employee}__${dateKey}`;
+        employeeDayHoursMap[empDateKey] = (employeeDayHoursMap[empDateKey] || 0) + hours;
+
+        if (!projectDateMap[project]) projectDateMap[project] = new Set();
+        projectDateMap[project].add(dateKey);
+
+        const d = new Date(dateKey);
+        if (!minDate || d < minDate) minDate = d;
+        if (!maxDate || d > maxDate) maxDate = d;
+      }
+
+      if (!projectMap[project]) {
+        projectMap[project] = { project, hours: 0, units: 0, taskCount: 0 };
+      }
+      projectMap[project].hours += hours;
+      projectMap[project].units += units;
+
+      if (!employeeMap[employee]) {
+        employeeMap[employee] = {
+          employee,
+          hours: 0,
+          units: 0,
+          taskCount: 0,
+          activeDays: new Set(),
+          projects: new Set()
+        };
+      }
+      employeeMap[employee].hours += hours;
+      employeeMap[employee].units += units;
+      if (dateKey) employeeMap[employee].activeDays.add(dateKey);
+      employeeMap[employee].projects.add(project);
+
+      if (!taskMap[task]) {
+        taskMap[task] = {
+          task,
+          totalHours: 0,
+          totalUnits: 0,
+          employeeHours: {},
+          projects: new Set(),
+          elementHours: {},
+          chapterHours: {},
+          ownerContext: {}
+        };
+      }
+      taskMap[task].totalHours += hours;
+      taskMap[task].totalUnits += units;
+      taskMap[task].employeeHours[employee] = (taskMap[task].employeeHours[employee] || 0) + hours;
+      taskMap[task].projects.add(project);
+      if (bookElement) taskMap[task].elementHours[bookElement] = (taskMap[task].elementHours[bookElement] || 0) + hours;
+      if (chapter) taskMap[task].chapterHours[chapter] = (taskMap[task].chapterHours[chapter] || 0) + hours;
+      if (!taskMap[task].ownerContext[employee]) {
+        taskMap[task].ownerContext[employee] = { chapterHours: {}, elementHours: {} };
+      }
+      if (bookElement) {
+        const elementMap = taskMap[task].ownerContext[employee].elementHours;
+        elementMap[bookElement] = (elementMap[bookElement] || 0) + hours;
+      }
+      if (chapter) {
+        const chapterMap = taskMap[task].ownerContext[employee].chapterHours;
+        chapterMap[chapter] = (chapterMap[chapter] || 0) + hours;
+      }
+    });
+
+    const taskBreakdown = Object.values(taskMap).map((taskEntry) => {
+      const owners = Object.entries(taskEntry.employeeHours)
+        .map(([employee, hours]) => ({ employee, hours }))
+        .sort((a, b) => b.hours - a.hours);
+
+      owners.forEach((owner) => {
+        if (employeeMap[owner.employee]) {
+          employeeMap[owner.employee].taskCount += 1;
+        }
+      });
+
+      const topElements = Object.entries(taskEntry.elementHours || {})
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([name, hours]) => ({ name, hours }));
+      const topChapters = Object.entries(taskEntry.chapterHours || {})
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([name, hours]) => ({ name, hours }));
+      const ownerContext = Object.entries(taskEntry.ownerContext || {})
+        .map(([employee, ctx]) => {
+          const ownerTopChapters = Object.entries(ctx.chapterHours || {})
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 2)
+            .map(([name, hours]) => ({ name, hours }));
+          const ownerTopElements = Object.entries(ctx.elementHours || {})
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 2)
+            .map(([name, hours]) => ({ name, hours }));
+          return {
+            employee,
+            hours: taskEntry.employeeHours[employee] || 0,
+            topChapters: ownerTopChapters,
+            topElements: ownerTopElements
+          };
+        })
+        .sort((a, b) => b.hours - a.hours);
+
+      return {
+        task: taskEntry.task,
+        totalHours: taskEntry.totalHours,
+        totalUnits: taskEntry.totalUnits,
+        primaryOwner: owners[0]?.employee || 'Unassigned',
+        projectCount: taskEntry.projects ? taskEntry.projects.size : 1,
+        primaryOwnerSharePct: taskEntry.totalHours > 0 ? ((owners[0]?.hours || 0) / taskEntry.totalHours) * 100 : 0,
+        collaborationCount: owners.length,
+        topElement: topElements[0]?.name || '-',
+        topChapter: topChapters[0]?.name || '-',
+        topElements,
+        topChapters,
+        ownerContext,
+        owners
+      };
+    }).sort((a, b) => b.totalHours - a.totalHours);
+
+    const employeeContribution = Object.values(employeeMap)
+      .map((entry) => ({
+        employee: entry.employee,
+        hours: entry.hours,
+        units: entry.units,
+        taskCount: entry.taskCount,
+        activeDays: entry.activeDays.size,
+        avgHoursPerActiveDay: entry.activeDays.size > 0 ? entry.hours / entry.activeDays.size : 0,
+        unitsPerHour: entry.hours > 0 ? entry.units / entry.hours : 0,
+        projectCount: entry.projects.size,
+        contributionPct: totalHours > 0 ? (entry.hours / totalHours) * 100 : 0
+      }))
+      .sort((a, b) => b.hours - a.hours);
+
+    const projectBreakdown = Object.values(projectMap)
+      .map((entry) => ({
+        ...entry,
+        contributionPct: totalHours > 0 ? (entry.hours / totalHours) * 100 : 0,
+        activeDays: projectDateMap[entry.project] ? projectDateMap[entry.project].size : 0,
+        avgHoursPerActiveDay: projectDateMap[entry.project] && projectDateMap[entry.project].size > 0
+          ? entry.hours / projectDateMap[entry.project].size
+          : 0
+      }))
+      .sort((a, b) => b.hours - a.hours);
+
+    const activeDateKeys = Object.keys(dateHoursMap).sort((a, b) => a.localeCompare(b));
+    const totalActiveDays = activeDateKeys.length;
+    const avgHoursPerActiveDay = totalActiveDays > 0 ? totalHours / totalActiveDays : 0;
+    const unitsPerHour = totalHours > 0 ? totalUnits / totalHours : 0;
+
+    let peakDay = { date: '-', hours: 0 };
+    let lowDay = { date: '-', hours: 0 };
+    if (activeDateKeys.length > 0) {
+      peakDay = activeDateKeys
+        .map((date) => ({ date, hours: dateHoursMap[date] || 0 }))
+        .sort((a, b) => b.hours - a.hours)[0];
+      lowDay = activeDateKeys
+        .map((date) => ({ date, hours: dateHoursMap[date] || 0 }))
+        .sort((a, b) => a.hours - b.hours)[0];
+    }
+
+    const spanDays = minDate && maxDate
+      ? Math.max(1, Math.floor((maxDate - minDate) / (1000 * 60 * 60 * 24)) + 1)
+      : totalActiveDays;
+    const activityRatePct = spanDays > 0 ? (totalActiveDays / spanDays) * 100 : 0;
+
+    const dailySeries = activeDateKeys.map((date) => ({ date, hours: dateHoursMap[date] || 0 }));
+    const recentWindow = dailySeries.slice(-7);
+    const previousWindow = dailySeries.slice(Math.max(0, dailySeries.length - 14), Math.max(0, dailySeries.length - 7));
+    const recent7DayHours = recentWindow.reduce((sum, d) => sum + d.hours, 0);
+    const previous7DayHours = previousWindow.reduce((sum, d) => sum + d.hours, 0);
+    const velocityTrendPct = previous7DayHours > 0
+      ? ((recent7DayHours - previous7DayHours) / previous7DayHours) * 100
+      : 0;
+
+    const topThreeTaskSharePct = (() => {
+      const top3 = taskBreakdown.slice(0, 3).reduce((sum, t) => sum + t.totalHours, 0);
+      return totalHours > 0 ? (top3 / totalHours) * 100 : 0;
+    })();
+    const topContributorSharePct = employeeContribution[0]?.contributionPct || 0;
+    const highlyOwnedTasksPct = taskBreakdown.length > 0
+      ? (taskBreakdown.filter(t => t.primaryOwnerSharePct >= 80).length / taskBreakdown.length) * 100
+      : 0;
+
+    const riskFlags = [];
+    if (topContributorSharePct > 45) riskFlags.push('High dependency on one contributor');
+    if (topThreeTaskSharePct > 75) riskFlags.push('Task concentration is high (top 3 tasks dominate effort)');
+    if (activityRatePct < 35) riskFlags.push('Low activity density across the selected date range');
+    if (previous7DayHours > 0 && velocityTrendPct < -20) riskFlags.push('Recent 7-day velocity has dropped significantly');
+    if (highlyOwnedTasksPct > 60) riskFlags.push('Many tasks rely on a single owner (low collaboration)');
+
+    const insights = {
+      health: {
+        activeDays: totalActiveDays,
+        spanDays,
+        activityRatePct,
+        avgHoursPerActiveDay,
+        unitsPerHour,
+        peakDay,
+        lowDay,
+        recent7DayHours,
+        previous7DayHours,
+        velocityTrendPct
+      },
+      concentration: {
+        topThreeTaskSharePct,
+        topContributorSharePct,
+        highlyOwnedTasksPct
+      },
+      topContributors: employeeContribution.slice(0, 3),
+      bottomContributors: employeeContribution.slice(-3).reverse(),
+      riskFlags
+    };
+
+    res.json({
+      projectName: selectedProjects.length === 1 ? selectedProjects[0] : 'All Selected Projects',
+      selectedProjects,
+      isMultiProject: selectedProjects.length > 1,
+      summary: {
+        totalHours,
+        totalUnits,
+        totalProjects: projectBreakdown.length,
+        totalEmployees: employeeContribution.length,
+        totalTasks: taskBreakdown.length
+      },
+      projectBreakdown,
+      employeeContribution,
+      taskBreakdown,
+      insights
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

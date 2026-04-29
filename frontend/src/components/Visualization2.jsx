@@ -587,7 +587,7 @@
 // export default Visualization2;
 
 import React, { useState, useEffect, useRef, memo, useMemo } from 'react';
-import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Line, ResponsiveContainer } from 'recharts';
 import { Filter, X, Search } from 'lucide-react';
 
 const API_URL = 'http://localhost:3001/api/dashboard';
@@ -615,19 +615,23 @@ function buildColorMap(taskNames) {
 }
 
 // ─── Timeline Tooltip (matches screenshot: Task | Hours table + Total row) ───
-const TimelineTooltip = memo(({ active, payload, label, taskColorMap }) => {
+const TimelineTooltip = memo(({ active, payload, label }) => {
   if (!active || !payload || !payload.length) return null;
 
-  // filter out zero-value entries, sort desc
+  const totalHoursEntry = payload.find(e => e.name === 'Total Hours');
   const entries = payload
-    .filter(e => e.value && e.value > 0)
+    .filter(e => e.name !== 'Total Hours' && e.value && e.value > 0)
     .sort((a, b) => b.value - a.value);
 
-  const total = entries.reduce((s, e) => s + (e.value || 0), 0);
+  const total = totalHoursEntry?.value || entries.reduce((s, e) => s + (e.value || 0), 0);
+  const topTask = entries[0]?.name || 'No task';
 
   return (
-    <div style={{ backgroundColor: 'rgb(17 24 39)', border: '2px solid #8b5cf6', borderRadius: 8, padding: '10px 14px', minWidth: 180, boxShadow: '0 4px 24px rgba(0,0,0,.5)', zIndex: 10001 }}>
+    <div style={{ backgroundColor: 'rgb(17 24 39)', border: '2px solid #8b5cf6', borderRadius: 8, padding: '10px 14px', minWidth: 220, boxShadow: '0 4px 24px rgba(0,0,0,.5)', zIndex: 10001 }}>
       {label && <p style={{ color: '#fff', fontWeight: 600, fontSize: 13, marginBottom: 6 }}>{label}</p>}
+      <p style={{ color: '#d1d5db', fontSize: 12, marginBottom: 6 }}>
+        Top task: <span style={{ color: '#fff', fontWeight: 600 }}>{topTask}</span>
+      </p>
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
         <thead>
           <tr style={{ borderBottom: '1px solid #374151' }}>
@@ -668,6 +672,7 @@ const Visualization2 = () => {
   const [selPeriod, setSelPeriod] = useState('All');
   const [projectSearch, setProjectSearch] = useState('');
   const [selectedProjects, setSelectedProjects] = useState([]); // multi-select
+  const [activeProject, setActiveProject] = useState(null); // drives timeline + deep dive
 
   // ── dropdown visibility ──
   const [showProjDrop, setShowProjDrop] = useState(false);
@@ -679,6 +684,9 @@ const Visualization2 = () => {
   const [elementNames,    setElementNames]    = useState([]);  // for Project Element dropdown
   const [timeline,        setTimeline]        = useState([]);  // area chart rows
   const [timelineTasks,   setTimelineTasks]   = useState([]);  // task keys present in timeline
+  const [projectInsights, setProjectInsights] = useState(null);
+  const [insightsLoading, setInsightsLoading] = useState(false);
+  const [expandedTask, setExpandedTask] = useState(null);
 
   const [loading, setLoading] = useState(true);
 
@@ -752,18 +760,55 @@ const Visualization2 = () => {
     } catch (e) { console.error('fetchProjects', e); setLoading(false); }
   };
 
-  // ─── fetch timeline for selected projects (can be multiple) ──────────────────────────
+  const displayedProjects = useMemo(() => {
+    if (activeProject) return [activeProject];
+    return selectedProjects;
+  }, [activeProject, selectedProjects]);
+
+  const isAllSelectedMode = !activeProject && selectedProjects.length > 1;
+  const currentScopeLabel = isAllSelectedMode ? 'All Selected Projects' : (activeProject || selectedProjects[0] || '');
+
+  // ─── fetch timeline for selected projects (single or multiple) ──────────────────────────
   const fetchTimeline = async (projectNamesArray) => {
     if (!projectNamesArray || projectNamesArray.length === 0) { setTimeline([]); setTimelineTasks([]); return; }
     try {
       const params = new URLSearchParams();
       projectNamesArray.forEach(n => params.append('project_name', n));
+      if (selPeriod !== 'All') params.append('period', selPeriod);
+      if (selSegment !== 'All') params.append('segment', selSegment);
+      if (selSeries !== 'All') params.append('series', selSeries);
+      if (selClass !== 'All') params.append('class', selClass);
 
       const res = await fetch(`${API_URL}/project-view/timeline?${params}`);
       const { timeline: rows, tasks } = await res.json();
       setTimeline(rows);
       setTimelineTasks(tasks);
     } catch (e) { console.error('fetchTimeline', e); }
+  };
+
+  const fetchProjectInsights = async (projectNamesArray) => {
+    if (!projectNamesArray || projectNamesArray.length === 0) {
+      setProjectInsights(null);
+      return;
+    }
+    try {
+      setInsightsLoading(true);
+      const params = new URLSearchParams();
+      projectNamesArray.forEach(n => params.append('project_name', n));
+      if (selPeriod !== 'All') params.append('period', selPeriod);
+      if (selSegment !== 'All') params.append('segment', selSegment);
+      if (selSeries !== 'All') params.append('series', selSeries);
+      if (selClass !== 'All') params.append('class', selClass);
+
+      const res = await fetch(`${API_URL}/project-view/project-insights?${params.toString()}`);
+      const data = await res.json();
+      setProjectInsights(data);
+    } catch (e) {
+      console.error('fetchProjectInsights', e);
+      setProjectInsights(null);
+    } finally {
+      setInsightsLoading(false);
+    }
   };
 
   // ─── effects ─────────────────────────────────────────────────
@@ -773,8 +818,15 @@ const Visualization2 = () => {
   // refetch projects automatically when filter selections change
   useEffect(() => { fetchProjects(); }, [selSegment, selSeries, selClass, selPeriod, selectedProjects]);
 
-  // timeline follows selected projects
-  useEffect(() => { fetchTimeline(selectedProjects); }, [selectedProjects]);
+  // timeline + deep dive follow active project OR all selected projects
+  useEffect(() => { fetchTimeline(displayedProjects); }, [displayedProjects, selPeriod, selSegment, selSeries, selClass]);
+  useEffect(() => { fetchProjectInsights(displayedProjects); }, [displayedProjects, selPeriod, selSegment, selSeries, selClass]);
+  useEffect(() => {
+    if (activeProject && !selectedProjects.includes(activeProject)) {
+      setActiveProject(null);
+    }
+  }, [selectedProjects, activeProject]);
+  useEffect(() => { setExpandedTask(null); }, [projectInsights]);
 
   // Click-outside closes project search dropdown
   useEffect(() => {
@@ -790,11 +842,24 @@ const Visualization2 = () => {
     setSelSegment('All'); setSelSeries('All'); setSelClass('All');
     setProjectSearch(''); setSelectedProjects([]);
     setTimeline([]); setTimelineTasks([]);
+    setActiveProject(null);
+    setProjectInsights(null);
+    setExpandedTask(null);
   };
 
   // toggle selection for a project name
   const toggleProject = (name) => {
-    setSelectedProjects(prev => prev.includes(name) ? prev.filter(p => p !== name) : [...prev, name]);
+    setSelectedProjects(prev => {
+      const next = prev.includes(name) ? prev.filter(p => p !== name) : [...prev, name];
+      if (next.includes(name)) {
+        // keep "all selected" mode when selecting from filter
+        if (activeProject && activeProject !== name) return next;
+      } else if (activeProject === name) {
+        setActiveProject(null);
+      }
+      if (next.length === 0) setActiveProject(null);
+      return next;
+    });
   };
 
   // ─── derived: filtered project names for the search dropdown (respects segment/series/class + search) ─
@@ -883,7 +948,7 @@ const Visualization2 = () => {
   const maxTotalHours = useMemo(() => Math.max(...projects.map(p => p.totalHours), 1), [projects]);
 
   // Hover state for bar tooltip
-  const [barTooltip, setBarTooltip] = useState(null); // { x, y, task, hours, units }
+  const [barTooltip, setBarTooltip] = useState(null); // { x, y, task, hours, units, projectName, projectTotalHours, projectTotalUnits, taskSharePct }
 
   const renderBars = () => {
     return projects.map((project, pIdx) => {
@@ -905,7 +970,17 @@ const Visualization2 = () => {
                 const svgRect = e.currentTarget.closest('svg').getBoundingClientRect();
                 const mouseX = e.clientX - svgRect.left;
                 const mouseY = e.clientY - svgRect.top;
-                setBarTooltip({ x: mouseX, y: mouseY, task: t.task, hours: t.hours, units: t.units, projectName: project.name });
+                setBarTooltip({
+                  x: mouseX,
+                  y: mouseY,
+                  task: t.task,
+                  hours: t.hours,
+                  units: t.units,
+                  projectName: project.name,
+                  projectTotalHours: project.totalHours,
+                  projectTotalUnits: project.totalUnits,
+                  taskSharePct: project.totalHours > 0 ? (t.hours / project.totalHours) * 100 : 0
+                });
               }}
               onMouseMove={(e) => {
                 const svgRect = e.currentTarget.closest('svg').getBoundingClientRect();
@@ -936,8 +1011,8 @@ const Visualization2 = () => {
         return seg;
       });
 
-      // Determine if this project name is selected (multi-select)
-      const isSelected = selectedProjects.includes(project.name);
+      // Highlight the active project that drives timeline/deep dive
+      const isSelected = project.name === activeProject;
 
       return (
         <g key={pIdx}>
@@ -951,7 +1026,10 @@ const Visualization2 = () => {
             fontSize={12}
             fontWeight={isSelected ? 700 : 400}
             style={{ cursor: 'pointer', userSelect: 'none' }}
-            onClick={() => toggleProject(project.name)}
+            onClick={() => {
+              setActiveProject(project.name);
+              setSelectedProjects(prev => prev.includes(project.name) ? prev : [...prev, project.name]);
+            }}
           >
             {project.name.length > 36 ? project.name.slice(0, 34) + '…' : project.name}
           </text>
@@ -980,6 +1058,42 @@ const Visualization2 = () => {
     timelineTasks.forEach(t => { map[t] = globalTaskColorMap[t] || TASK_COLORS[legendTasks.indexOf(t) % TASK_COLORS.length]; });
     return map;
   }, [timelineTasks, globalTaskColorMap, legendTasks]);
+
+  const timelineWithTotals = useMemo(() => {
+    return timeline.map(row => {
+      const totalHours = timelineTasks.reduce((sum, task) => sum + (row[task] || 0), 0);
+      return { ...row, totalHours };
+    });
+  }, [timeline, timelineTasks]);
+
+  const timelineSummary = useMemo(() => {
+    if (!timelineWithTotals.length) {
+      return { totalHours: 0, avgHours: 0, peakDate: '-', peakHours: 0, topTask: '-' };
+    }
+
+    const totalHours = timelineWithTotals.reduce((sum, row) => sum + row.totalHours, 0);
+    const avgHours = totalHours / timelineWithTotals.length;
+    const peak = timelineWithTotals.reduce((max, row) => row.totalHours > max.totalHours ? row : max, timelineWithTotals[0]);
+
+    const taskTotals = {};
+    timelineTasks.forEach(task => { taskTotals[task] = 0; });
+    timelineWithTotals.forEach(row => {
+      timelineTasks.forEach(task => {
+        taskTotals[task] += row[task] || 0;
+      });
+    });
+
+    const topTask = Object.entries(taskTotals)
+      .sort((a, b) => b[1] - a[1])[0]?.[0] || '-';
+
+    return {
+      totalHours,
+      avgHours,
+      peakDate: peak.date,
+      peakHours: peak.totalHours,
+      topTask
+    };
+  }, [timelineWithTotals, timelineTasks]);
 
   // ─── render ──────────────────────────────────────────────────
   if (loading) {
@@ -1058,6 +1172,20 @@ const Visualization2 = () => {
                     placeholder="Search projects…"
                     onChange={e => { setProjectSearch(e.target.value); setShowProjDrop(true); }}
                     onFocus={() => setShowProjDrop(true)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        const exact = filteredProjNames.find(
+                          n => n.toLowerCase() === projectSearch.trim().toLowerCase()
+                        );
+                        const chosen = exact || filteredProjNames[0];
+                        if (chosen) {
+                          setSelectedProjects(prev => prev.includes(chosen) ? prev : [...prev, chosen]);
+                          setProjectSearch(chosen);
+                          setShowProjDrop(false);
+                        }
+                      }
+                    }}
                     className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-4 py-2 pr-10 focus:outline-none focus:ring-2 focus:ring-purple-500"
                   />
                   <Search className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4" />
@@ -1125,7 +1253,7 @@ const Visualization2 = () => {
 
         {/* ── HORIZONTAL BAR CHART (custom SVG inside scrollable container) ── */}
         <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl overflow-hidden mb-6">
-          <div className="overflow-x-auto" style={{ position: 'relative' }}>
+          <div className="overflow-auto max-h-[560px]" style={{ position: 'relative' }}>
             <svg width={LABEL_COL_WIDTH + BAR_AREA_WIDTH + 20} height={svgHeight} style={{ display: 'block' }}>
               {renderBars()}
             </svg>
@@ -1143,18 +1271,30 @@ const Visualization2 = () => {
                 borderRadius: 8,
                 padding: '10px 16px',
                 boxShadow: '0 4px 24px rgba(0,0,0,.6)',
-                minWidth: 180
+                minWidth: 250
               }}>
-                <p style={{ color: '#fff', fontWeight: 700, fontSize: 15, marginBottom: 6 }}>{barTooltip.task}</p>
-                <div style={{ display: 'flex', gap: 32 }}>
+                <p style={{ color: '#fff', fontWeight: 700, fontSize: 14, marginBottom: 2 }}>{barTooltip.task}</p>
+                <p style={{ color: '#a5b4fc', fontSize: 12, marginBottom: 8 }}>
+                  {barTooltip.projectName}
+                </p>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
                   <div>
-                    <p style={{ color: '#fff', fontSize: 22, fontWeight: 700 }}>{barTooltip.units?.toLocaleString() || 0}</p>
-                    <p style={{ color: '#a78bfa', fontSize: 12, fontWeight: 600 }}>Units</p>
+                    <p style={{ color: '#fff', fontSize: 20, fontWeight: 700 }}>{barTooltip.hours?.toFixed(2)}</p>
+                    <p style={{ color: '#a78bfa', fontSize: 12, fontWeight: 600 }}>Task Hours</p>
                   </div>
                   <div>
-                    <p style={{ color: '#fff', fontSize: 22, fontWeight: 700 }}>{barTooltip.hours?.toFixed(2)}</p>
-                    <p style={{ color: '#a78bfa', fontSize: 12, fontWeight: 600 }}>Hours</p>
+                    <p style={{ color: '#fff', fontSize: 20, fontWeight: 700 }}>{barTooltip.units?.toLocaleString() || 0}</p>
+                    <p style={{ color: '#a78bfa', fontSize: 12, fontWeight: 600 }}>Task Units</p>
                   </div>
+                </div>
+                <div style={{ marginTop: 8, borderTop: '1px solid #374151', paddingTop: 8 }}>
+                  <p style={{ color: '#d1d5db', fontSize: 12 }}>
+                    Task share: <span style={{ color: '#fff', fontWeight: 700 }}>{barTooltip.taskSharePct?.toFixed(1)}%</span>
+                  </p>
+                  <p style={{ color: '#d1d5db', fontSize: 12 }}>
+                    Project total: <span style={{ color: '#fff', fontWeight: 700 }}>{barTooltip.projectTotalHours?.toFixed(2)} hrs</span> |{' '}
+                    <span style={{ color: '#fff', fontWeight: 700 }}>{barTooltip.projectTotalUnits?.toLocaleString() || 0} units</span>
+                  </p>
                 </div>
               </div>
             )}
@@ -1162,7 +1302,8 @@ const Visualization2 = () => {
 
           {/* horizontal scroll handle hint */}
           <div className="flex justify-between px-2 py-1">
-            <span className="text-gray-500 text-xs">← scroll →</span>
+            <span className="text-gray-500 text-xs">←/→ horizontal scroll | ↑/↓ vertical scroll</span>
+            <span className="text-gray-500 text-xs">{projects.length} projects</span>
           </div>
         </div>
 
@@ -1172,36 +1313,91 @@ const Visualization2 = () => {
 
           {selectedProjects.length > 0 ? (
             <>
-              {/* legend: selected projects */}
+              {/* current scope */}
+              <div className="flex items-center justify-center gap-2 mb-3 flex-wrap">
+                {selectedProjects.length > 1 && (
+                  <button
+                    onClick={() => setActiveProject(null)}
+                    className="text-xs px-3 py-1 rounded-full bg-purple-600 hover:bg-purple-700 text-white"
+                  >
+                    Show All Selected
+                  </button>
+                )}
+                {selectedProjects.length > 1 && (
+                  <select
+                    value={activeProject || ''}
+                    onChange={(e) => setActiveProject(e.target.value || null)}
+                    className="bg-gray-700 text-white border border-gray-600 rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  >
+                    <option value="">All Selected Projects</option>
+                    {selectedProjects.map(p => <option key={p} value={p}>{p}</option>)}
+                  </select>
+                )}
+              </div>
               <p className="text-center text-gray-300 text-sm mb-3">
                 <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', backgroundColor: '#10b981', marginRight: 6 }} />
-                {selectedProjects.join(', ')}
+                {currentScopeLabel}
               </p>
 
               {timeline.length > 0 ? (
-                <ResponsiveContainer width="100%" height={320}>
-                  <AreaChart data={timeline} margin={{ top: 10, right: 30, left: 10, bottom: 40 }}>
-                    <defs>
+                <>
+                  <div className="grid grid-cols-4 gap-3 mb-4">
+                    <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-3 text-center">
+                      <p className="text-gray-400 text-xs">Timeline Days</p>
+                      <p className="text-white text-lg font-bold">{timelineWithTotals.length}</p>
+                    </div>
+                    <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-3 text-center">
+                      <p className="text-gray-400 text-xs">Total Hours</p>
+                      <p className="text-white text-lg font-bold">{timelineSummary.totalHours.toFixed(2)}</p>
+                    </div>
+                    <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-3 text-center">
+                      <p className="text-gray-400 text-xs">Avg Hours / Day</p>
+                      <p className="text-white text-lg font-bold">{timelineSummary.avgHours.toFixed(2)}</p>
+                    </div>
+                    <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-3 text-center">
+                      <p className="text-gray-400 text-xs">Peak Day</p>
+                      <p className="text-white text-sm font-bold">{timelineSummary.peakDate}</p>
+                      <p className="text-purple-300 text-xs">{timelineSummary.peakHours.toFixed(2)} hrs</p>
+                    </div>
+                  </div>
+
+                  <p className="text-center text-gray-300 text-xs mb-2">
+                    Top timeline task: <span className="text-white font-semibold">{timelineSummary.topTask}</span>
+                  </p>
+
+                  <ResponsiveContainer width="100%" height={320}>
+                    <AreaChart data={timelineWithTotals} margin={{ top: 10, right: 40, left: 10, bottom: 40 }}>
+                      <defs>
+                        {timelineTasks.map((t, i) => (
+                          <linearGradient key={t} id={`grad_${i}`} x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%"  stopColor={timelineColorMap[t]} stopOpacity={0.7} />
+                            <stop offset="95%" stopColor={timelineColorMap[t]} stopOpacity={0.15} />
+                          </linearGradient>
+                        ))}
+                      </defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                      <XAxis dataKey="date" stroke="#9ca3af" fontSize={11} angle={-35} textAnchor="end" height={55} />
+                      <YAxis stroke="#9ca3af" fontSize={12} />
+                      <Tooltip content={<TimelineTooltip />}
+                        contentStyle={{ backgroundColor: 'rgb(17 24 39)', border: 'none', borderRadius: 8 }}
+                        wrapperStyle={{ zIndex: 10001, outline: 'none' }} />
                       {timelineTasks.map((t, i) => (
-                        <linearGradient key={t} id={`grad_${i}`} x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="5%"  stopColor={timelineColorMap[t]} stopOpacity={0.7} />
-                          <stop offset="95%" stopColor={timelineColorMap[t]} stopOpacity={0.15} />
-                        </linearGradient>
+                        <Area key={t} type="monotone" dataKey={t} stackId="1"
+                          stroke={timelineColorMap[t]} fill={`url(#grad_${i})`}
+                          name={t} isAnimationActive={false} />
                       ))}
-                    </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                    <XAxis dataKey="date" stroke="#9ca3af" fontSize={11} angle={-35} textAnchor="end" height={55} />
-                    <YAxis stroke="#9ca3af" fontSize={12} />
-                    <Tooltip content={<TimelineTooltip taskColorMap={timelineColorMap} />}
-                      contentStyle={{ backgroundColor: 'rgb(17 24 39)', border: 'none', borderRadius: 8 }}
-                      wrapperStyle={{ zIndex: 10001, outline: 'none' }} />
-                    {timelineTasks.map((t, i) => (
-                      <Area key={t} type="monotone" dataKey={t} stackId="1"
-                        stroke={timelineColorMap[t]} fill={`url(#grad_${i})`}
-                        name={t} isAnimationActive={false} />
-                    ))}
-                  </AreaChart>
-                </ResponsiveContainer>
+                      <Line
+                        type="monotone"
+                        dataKey="totalHours"
+                        name="Total Hours"
+                        stroke="#ffffff"
+                        strokeWidth={2}
+                        dot={false}
+                        isAnimationActive={false}
+                      />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </>
               ) : (
                 <p className="text-gray-500 text-center py-20">No timeline data available for the selected projects.</p>
               )}
@@ -1209,6 +1405,225 @@ const Visualization2 = () => {
           ) : (
             <p className="text-gray-500 text-center py-20 text-sm">
               👆 Click project names in the chart above (or select via Project filter) to load timelines.
+            </p>
+          )}
+        </div>
+
+        {/* ── PROJECT DEEP DIVE DASHBOARD ── */}
+        <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6 mt-6">
+          <h2 className="text-3xl font-bold text-white text-center mb-4">Project Deep Dive</h2>
+
+          {selectedProjects.length === 0 ? (
+            <p className="text-gray-500 text-center py-10 text-sm">
+              Select a project to view team contribution, task ownership, and hours spent.
+            </p>
+          ) : insightsLoading ? (
+            <p className="text-gray-300 text-center py-10">Loading detailed project insights...</p>
+          ) : projectInsights?.summary ? (
+            <>
+              {selectedProjects.length > 1 && (
+                <p className="text-yellow-300 text-xs mb-4 text-center">
+                  Showing details for: <span className="font-semibold">{currentScopeLabel}</span>
+                </p>
+              )}
+
+              <div className="grid grid-cols-4 gap-4 mb-6">
+                <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
+                  <p className="text-gray-400 text-xs">Total Projects</p>
+                  <p className="text-white text-2xl font-bold">{projectInsights.summary.totalProjects || 1}</p>
+                </div>
+                <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
+                  <p className="text-gray-400 text-xs">Total Employees</p>
+                  <p className="text-white text-2xl font-bold">{projectInsights.summary.totalEmployees}</p>
+                </div>
+                <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
+                  <p className="text-gray-400 text-xs">Total Tasks</p>
+                  <p className="text-white text-2xl font-bold">{projectInsights.summary.totalTasks}</p>
+                </div>
+                <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
+                  <p className="text-gray-400 text-xs">Total Hours</p>
+                  <p className="text-white text-2xl font-bold">{projectInsights.summary.totalHours.toFixed(2)}</p>
+                </div>
+              </div>
+
+              {projectInsights.insights?.health && (
+                <div className="grid grid-cols-4 gap-4 mb-6">
+                  <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
+                    <p className="text-gray-400 text-xs">Active Days</p>
+                    <p className="text-white text-2xl font-bold">{projectInsights.insights.health.activeDays}</p>
+                    <p className="text-gray-400 text-xs mt-1">of {projectInsights.insights.health.spanDays} days</p>
+                  </div>
+                  <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
+                    <p className="text-gray-400 text-xs">Activity Rate</p>
+                    <p className="text-white text-2xl font-bold">{projectInsights.insights.health.activityRatePct.toFixed(1)}%</p>
+                  </div>
+                  <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
+                    <p className="text-gray-400 text-xs">Avg Hours / Active Day</p>
+                    <p className="text-white text-2xl font-bold">{projectInsights.insights.health.avgHoursPerActiveDay.toFixed(2)}</p>
+                  </div>
+                  <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
+                    <p className="text-gray-400 text-xs">Velocity (Recent 7D)</p>
+                    <p className={`text-2xl font-bold ${projectInsights.insights.health.velocityTrendPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {projectInsights.insights.health.velocityTrendPct >= 0 ? '+' : ''}{projectInsights.insights.health.velocityTrendPct.toFixed(1)}%
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {projectInsights.insights?.concentration && (
+                <div className="grid grid-cols-3 gap-4 mb-6">
+                  <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4">
+                    <p className="text-gray-400 text-xs mb-1">Top 3 Task Concentration</p>
+                    <p className="text-white text-xl font-bold">{projectInsights.insights.concentration.topThreeTaskSharePct.toFixed(1)}%</p>
+                    <p className="text-gray-500 text-xs">Higher value means work is concentrated in fewer tasks.</p>
+                  </div>
+                  <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4">
+                    <p className="text-gray-400 text-xs mb-1">Top Contributor Share</p>
+                    <p className="text-white text-xl font-bold">{projectInsights.insights.concentration.topContributorSharePct.toFixed(1)}%</p>
+                    <p className="text-gray-500 text-xs">Indicates dependency risk on one employee.</p>
+                  </div>
+                  <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4">
+                    <p className="text-gray-400 text-xs mb-1">Single-owner Tasks</p>
+                    <p className="text-white text-xl font-bold">{projectInsights.insights.concentration.highlyOwnedTasksPct.toFixed(1)}%</p>
+                    <p className="text-gray-500 text-xs">Tasks where one owner handles ~80%+ of hours.</p>
+                  </div>
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 gap-4">
+                {projectInsights.projectBreakdown && projectInsights.projectBreakdown.length > 1 && (
+                  <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4">
+                    <h3 className="text-white text-lg font-semibold mb-3">Project Contribution</h3>
+                    <div className="max-h-72 overflow-y-auto">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="text-gray-400 border-b border-gray-700">
+                            <th className="text-left py-2">Project</th>
+                            <th className="text-right py-2">Hours</th>
+                            <th className="text-right py-2">Avg Hrs/Day</th>
+                            <th className="text-right py-2">Share</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {projectInsights.projectBreakdown.map((row) => (
+                            <tr key={row.project} className="border-b border-gray-800 text-gray-200">
+                              <td className="py-2 pr-2">{row.project}</td>
+                              <td className="py-2 text-right">{row.hours.toFixed(2)}</td>
+                              <td className="py-2 text-right">{row.avgHoursPerActiveDay.toFixed(2)}</td>
+                              <td className="py-2 text-right">{row.contributionPct.toFixed(1)}%</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4">
+                  <h3 className="text-white text-lg font-semibold mb-3">Employee Contribution</h3>
+                  <div className="max-h-72 overflow-y-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-gray-400 border-b border-gray-700">
+                          <th className="text-left py-2">Employee</th>
+                          <th className="text-right py-2">Hours</th>
+                          <th className="text-right py-2">Active Days</th>
+                          <th className="text-right py-2">Avg Hrs/Day</th>
+                          <th className="text-right py-2">Contribution</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {projectInsights.employeeContribution.map((row) => (
+                          <tr key={row.employee} className="border-b border-gray-800 text-gray-200">
+                            <td className="py-2 pr-2">{row.employee}</td>
+                            <td className="py-2 text-right">{row.hours.toFixed(2)}</td>
+                            <td className="py-2 text-right">{row.activeDays || 0}</td>
+                            <td className="py-2 text-right">{(row.avgHoursPerActiveDay || 0).toFixed(2)}</td>
+                            <td className="py-2 text-right">{row.contributionPct.toFixed(1)}%</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4 col-span-2">
+                  <h3 className="text-white text-lg font-semibold mb-3">Task Ownership & Hours</h3>
+                  <p className="text-gray-400 text-xs mb-2">Click a task row to expand employee-wise chapter and element split.</p>
+                  <div className="max-h-72 overflow-y-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-gray-400 border-b border-gray-700">
+                          <th className="text-left py-2">Task</th>
+                          <th className="text-left py-2">Context (Element / Chapter)</th>
+                          <th className="text-left py-2">Owner</th>
+                          <th className="text-right py-2">Hours</th>
+                          <th className="text-right py-2">Owner Share</th>
+                          <th className="text-right py-2">Collaborators</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {projectInsights.taskBreakdown.map((row) => (
+                          <React.Fragment key={row.task}>
+                            <tr
+                              className="border-b border-gray-800 text-gray-200 cursor-pointer hover:bg-gray-800/40"
+                              onClick={() => setExpandedTask(prev => prev === row.task ? null : row.task)}
+                            >
+                              <td className="py-2 pr-2">
+                                <span className="text-purple-300 mr-1">{expandedTask === row.task ? '▼' : '▶'}</span>
+                                {row.task}
+                              </td>
+                              <td className="py-2 pr-2">
+                                <p className="text-gray-200 text-xs">
+                                  {row.topElement && row.topElement !== '-' ? row.topElement : '-'}
+                                </p>
+                                <p className="text-gray-400 text-xs">
+                                  Ch: {row.topChapter && row.topChapter !== '-' ? row.topChapter : '-'}
+                                </p>
+                              </td>
+                              <td className="py-2 pr-2">{row.primaryOwner}</td>
+                              <td className="py-2 text-right">{row.totalHours.toFixed(2)}</td>
+                              <td className="py-2 text-right">{(row.primaryOwnerSharePct || 0).toFixed(1)}%</td>
+                              <td className="py-2 text-right">{row.collaborationCount || 0}</td>
+                            </tr>
+                            {expandedTask === row.task && (
+                              <tr className="border-b border-gray-800 bg-gray-900/70">
+                                <td colSpan={6} className="py-2 px-2">
+                                  <div className="grid grid-cols-2 gap-3">
+                                    {(row.ownerContext || []).map((owner) => (
+                                      <div key={`${row.task}_${owner.employee}`} className="bg-gray-800/70 border border-gray-700 rounded-md p-2">
+                                        <div className="flex justify-between items-center mb-1">
+                                          <span className="text-sm text-white font-semibold">{owner.employee}</span>
+                                          <span className="text-xs text-purple-300">{owner.hours.toFixed(2)} hrs</span>
+                                        </div>
+                                        <p className="text-xs text-gray-400">
+                                          Elements: {(owner.topElements || []).length > 0
+                                            ? owner.topElements.map(e => `${e.name} (${e.hours.toFixed(1)}h)`).join(', ')
+                                            : '-'}
+                                        </p>
+                                        <p className="text-xs text-gray-400">
+                                          Chapters: {(owner.topChapters || []).length > 0
+                                            ? owner.topChapters.map(c => `${c.name} (${c.hours.toFixed(1)}h)`).join(', ')
+                                            : '-'}
+                                        </p>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </td>
+                              </tr>
+                            )}
+                          </React.Fragment>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+            </>
+          ) : (
+            <p className="text-gray-500 text-center py-10 text-sm">
+              No detailed data available for the selected project.
             </p>
           )}
         </div>
