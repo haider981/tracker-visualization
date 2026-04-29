@@ -590,7 +590,8 @@ import React, { useState, useEffect, useRef, memo, useMemo } from 'react';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Line, ResponsiveContainer } from 'recharts';
 import { Filter, X, Search } from 'lucide-react';
 
-const API_URL = 'http://localhost:3001/api/dashboard';
+const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL || '').replace(/\/$/, '');
+const API_URL = `${BACKEND_URL}/api/dashboard`;
 
 // 30 distinct colours — enough to cover all task types without collisions
 const TASK_COLORS = [
