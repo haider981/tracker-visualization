@@ -3568,15 +3568,22 @@
 
 
 import React, { useState, useEffect, useMemo, memo, useRef } from 'react';
+import { NavLink, useLocation } from 'react-router-dom';
 import { createPortal } from 'react-dom';
 import { BarChart, Bar, LineChart, Line, PieChart, Pie, AreaChart, Area, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
-import { TrendingUp, Users, Clock, Briefcase, Activity, Zap, Target, CheckCircle, Filter, X, Search } from 'lucide-react';
+import { TrendingUp, Users, Clock, Briefcase, Activity, Zap, Target, CheckCircle, Filter, X, Search, Moon, BookMarked, AlertTriangle, LayoutDashboard } from 'lucide-react';
 
 const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL || '').replace(/\/$/, '');
 const API_URL = `${BACKEND_URL}/api/dashboard`;
 const REFRESH_INTERVAL = 60000;
 
 const COLORS = ['#8b5cf6', '#ec4899', '#f59e0b', '#10b981', '#3b82f6', '#ef4444', '#14b8a6', '#f97316'];
+
+function mainDashTabFromPath(pathname) {
+  if (pathname === '/night') return 'night';
+  if (pathname === '/books') return 'books';
+  return 'overall';
+}
 
 // Work mode colors matching PowerBI style - ALL 8 work modes
 const WORK_MODE_COLORS = {
@@ -4034,6 +4041,9 @@ const StatCard = ({ icon: Icon, title, value, subtitle, color }) => (
 );
 
 const Visualization = () => {
+  const location = useLocation();
+  const dashTab = mainDashTabFromPath(location.pathname);
+
   const [overview, setOverview] = useState(null);
   const [projects, setProjects] = useState([]);
   const [employees, setEmployees] = useState([]);
@@ -4047,7 +4057,16 @@ const Visualization = () => {
   const [auditStatus, setAuditStatus] = useState([]);
   const [loading, setLoading] = useState(true);
   const [lastUpdate, setLastUpdate] = useState(new Date());
-  
+
+  const [nightData, setNightData] = useState(null);
+  const [nightLoading, setNightLoading] = useState(false);
+  const [crossBooks, setCrossBooks] = useState(null);
+  const [booksLoading, setBooksLoading] = useState(false);
+  const [selectedBookGroup, setSelectedBookGroup] = useState(null);
+  const [bookSessionMin, setBookSessionMin] = useState(2);
+  const crossBooksFetchSeq = useRef(0);
+  const crossBookDetailRef = useRef(null);
+
   // Modal states for project details
   const [showProjectModal, setShowProjectModal] = useState(false);
   const [selectedProject, setSelectedProject] = useState(null);
@@ -4210,6 +4229,70 @@ const Visualization = () => {
     return () => clearInterval(interval);
   }, [selectedTeam, selectedEmployee, selectedPeriod]);
 
+  const fetchNightAnalytics = async () => {
+    setNightLoading(true);
+    try {
+      const queryString = buildQueryParams();
+      const urlSuffix = queryString ? `?${queryString}` : '';
+      const res = await fetch(`${API_URL}/night-analytics${urlSuffix}`);
+      const json = await res.json();
+      setNightData(json.error ? null : json);
+    } catch (e) {
+      console.error('Night analytics fetch failed:', e);
+      setNightData(null);
+    } finally {
+      setNightLoading(false);
+    }
+  };
+
+  const fetchCrossSessionBooks = async () => {
+    const seq = ++crossBooksFetchSeq.current;
+    setBooksLoading(true);
+    setCrossBooks(null);
+    setSelectedBookGroup(null);
+    try {
+      const params = new URLSearchParams();
+      if (selectedTeam !== 'All') params.append('team', selectedTeam);
+      if (selectedEmployee !== 'All') params.append('employee', selectedEmployee);
+      if (selectedPeriod !== 'All') params.append('period', selectedPeriod);
+      params.append('minSessions', String(bookSessionMin));
+      const qs = params.toString();
+      const res = await fetch(`${API_URL}/cross-session-books${qs ? `?${qs}` : ''}`);
+      const json = await res.json();
+      if (crossBooksFetchSeq.current !== seq) return;
+      setCrossBooks(json.error ? null : json);
+    } catch (e) {
+      console.error('Cross-session books fetch failed:', e);
+      if (crossBooksFetchSeq.current !== seq) return;
+      setCrossBooks(null);
+    } finally {
+      if (crossBooksFetchSeq.current === seq) {
+        setBooksLoading(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (dashTab === 'night') fetchNightAnalytics();
+  }, [dashTab, selectedTeam, selectedEmployee, selectedPeriod]);
+
+  useEffect(() => {
+    if (dashTab !== 'books') return undefined;
+    fetchCrossSessionBooks();
+    return () => {
+      crossBooksFetchSeq.current += 1;
+      setBooksLoading(false);
+    };
+  }, [dashTab, selectedTeam, selectedEmployee, selectedPeriod, bookSessionMin]);
+
+  useEffect(() => {
+    if (!selectedBookGroup) return;
+    const id = requestAnimationFrame(() => {
+      crossBookDetailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+    return () => cancelAnimationFrame(id);
+  }, [selectedBookGroup?.baseKey]);
+
   const clearAllFilters = () => {
     setSelectedDepartment('All');
     setSelectedTeam('All');
@@ -4265,11 +4348,57 @@ const Visualization = () => {
       {/* Fixed Header and Filters */}
       <div className="sticky top-0 z-50 bg-gradient-to-br from-gray-900 via-purple-900 to-gray-900 border-b border-gray-700 shadow-lg">
         {/* Header */}
-        <div className="px-8 pt-6 pb-4">
-          <h1 className="text-5xl font-bold text-white mb-2 bg-gradient-to-r from-purple-400 to-pink-400 bg-clip-text text-transparent">
-            Work Tracker Analytics
-          </h1>
-          <p className="text-gray-300">Real-time insights • Last updated: {lastUpdate.toLocaleTimeString()}</p>
+        <div className="px-8 pt-6 pb-4 flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4">
+          <div>
+            <h1 className="text-5xl font-bold text-white mb-2 bg-gradient-to-r from-purple-400 to-pink-400 bg-clip-text text-transparent">
+              Work Tracker Analytics
+            </h1>
+            <p className="text-gray-300">Real-time insights • Last updated: {lastUpdate.toLocaleTimeString()}</p>
+          </div>
+          <div className="flex flex-wrap gap-2 pb-1">
+            <NavLink
+              to="/"
+              end
+              className={({ isActive }) =>
+                `px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors ${
+                  isActive ? 'bg-purple-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                }`
+              }
+            >
+              <LayoutDashboard className="w-4 h-4" /> Overall
+            </NavLink>
+            <NavLink
+              to="/night"
+              className={({ isActive }) =>
+                `px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors ${
+                  isActive ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                }`
+              }
+            >
+              <Moon className="w-4 h-4" /> Night view
+            </NavLink>
+            <NavLink
+              to="/books"
+              className={({ isActive }) =>
+                `px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors ${
+                  isActive ? 'bg-teal-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                }`
+              }
+            >
+              <BookMarked className="w-4 h-4" /> Cross-session books
+            </NavLink>
+            <NavLink
+              to="/project"
+              end
+              className={({ isActive }) =>
+                `px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors ${
+                  isActive ? 'bg-fuchsia-700 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                }`
+              }
+            >
+              <Briefcase className="w-4 h-4" /> Project view
+            </NavLink>
+          </div>
         </div>
 
         {/* Filters Section */}
@@ -4394,6 +4523,8 @@ const Visualization = () => {
 
       {/* Scrollable Content */}
       <div className="px-8 py-6 overflow-y-auto">
+        {dashTab === 'overall' && (
+        <>
         {/* Stats Cards */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
           <StatCard
@@ -4698,6 +4829,370 @@ const Visualization = () => {
             </ResponsiveContainer>
           </div>
         </div>
+        </>
+        )}
+
+        {dashTab === 'night' && (
+          <div className="space-y-8 pb-8">
+            <div className="rounded-xl border border-indigo-500/40 bg-indigo-950/30 p-4 text-indigo-100 text-sm max-w-4xl">
+              <strong className="text-indigo-200">Night view</strong> includes only rows where <code className="text-indigo-300 bg-gray-900/80 px-1 rounded">work_mode</code> is Night
+              (case-insensitive). Hour-of-day uses <code className="text-indigo-300 bg-gray-900/80 px-1 rounded">submitted_at</code> when present, otherwise the work <code className="text-indigo-300 bg-gray-900/80 px-1 rounded">date</code>.
+              Day baseline for task ratios uses WFH, In Office, OT Office, OT Home, On Duty, and Half Day.
+            </div>
+            {nightLoading && (
+              <div className="flex justify-center py-24">
+                <div className="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-indigo-500" />
+              </div>
+            )}
+            {!nightLoading && nightData?.summary && (
+              <>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                  <StatCard icon={Moon} title="Night hours" value={Math.round(nightData.summary.totalNightHours || 0)} subtitle="Filtered scope" color="from-indigo-600 to-indigo-900" />
+                  <StatCard icon={Clock} title="Night entries" value={nightData.summary.totalNightEntries || 0} subtitle="Row count" color="from-slate-600 to-slate-900" />
+                  <StatCard icon={Users} title="Night contributors" value={nightData.summary.uniqueNightContributors || 0} subtitle="Distinct names" color="from-violet-600 to-violet-900" />
+                  <StatCard icon={Zap} title="Night share" value={`${(nightData.summary.nightPercentOfFilteredHours || 0).toFixed(1)}%`} subtitle="Of all hours in filter" color="from-fuchsia-600 to-purple-900" />
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-4 flex items-center"><Moon className="w-5 h-5 mr-2 text-indigo-400" /> Night hours — top projects</h2>
+                    <div className="flex flex-col lg:flex-row gap-6 items-stretch">
+                      <div className="h-[260px] w-full max-w-[280px] mx-auto lg:mx-0 shrink-0">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <PieChart margin={{ top: 4, right: 4, bottom: 4, left: 4 }}>
+                            <Pie
+                              data={nightData.nightProjectShare || []}
+                              dataKey="value"
+                              nameKey="name"
+                              cx="50%"
+                              cy="50%"
+                              innerRadius={56}
+                              outerRadius={92}
+                              paddingAngle={1}
+                              stroke="#1f2937"
+                              strokeWidth={1}
+                              label={false}
+                              isAnimationActive={false}
+                            >
+                              {(nightData.nightProjectShare || []).map((_, i) => (
+                                <Cell key={i} fill={COLORS[i % COLORS.length]} />
+                              ))}
+                            </Pie>
+                            <Tooltip
+                              wrapperStyle={{ zIndex: 10010 }}
+                              content={({ active, payload }) =>
+                                active && payload?.[0] ? (
+                                  <div className="rounded-lg border border-indigo-500 bg-gray-900 p-3 text-sm max-w-xs shadow-xl">
+                                    <p className="text-white font-semibold break-words">{payload[0].payload.fullName || payload[0].payload.name}</p>
+                                    <p className="text-indigo-200 mt-1">
+                                      {(Number(payload[0].value) || 0).toFixed(1)} hrs · {payload[0].payload.nightPercentOfNightTotal ?? 0}% of night total
+                                    </p>
+                                  </div>
+                                ) : null
+                              }
+                            />
+                          </PieChart>
+                        </ResponsiveContainer>
+                      </div>
+                      <ul className="flex-1 min-w-0 max-h-[280px] overflow-y-auto space-y-2.5 text-sm rounded-lg border border-gray-700/60 bg-gray-900/50 p-3">
+                        {(nightData.nightProjectShare || []).map((row, i) => (
+                          <li key={`${row.fullName || row.name}-${i}`} className="flex gap-3 items-start">
+                            <span className="mt-1.5 h-3 w-3 shrink-0 rounded-sm ring-1 ring-white/20" style={{ backgroundColor: COLORS[i % COLORS.length] }} />
+                            <div className="min-w-0 flex-1">
+                              <p className="text-gray-100 break-words leading-snug" title={row.fullName}>{row.fullName || row.name}</p>
+                              <p className="text-gray-400 text-xs mt-0.5 tabular-nums">
+                                {(row.value ?? 0).toFixed(1)} hrs · {row.nightPercentOfNightTotal ?? 0}% of night
+                              </p>
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-4 flex items-center"><Users className="w-5 h-5 mr-2 text-cyan-400" /> Night hours by team</h2>
+                    <ResponsiveContainer width="100%" height={320}>
+                      <BarChart data={(nightData.teamNight || []).slice(0, 12)} margin={{ bottom: 60 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis dataKey="team" stroke="#9ca3af" angle={-35} textAnchor="end" height={70} interval={0} fontSize={11} />
+                        <YAxis stroke="#9ca3af" />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Bar dataKey="hours" fill="#6366f1" name="Night hours" radius={[6, 6, 0, 0]} isAnimationActive={false} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-2 flex items-center"><Users className="w-5 h-5 mr-2 text-pink-400" /> Contributors — night % of own hours</h2>
+                    <p className="text-gray-400 text-xs mb-4">Who logs a large share of their time as Night mode (accountability lens).</p>
+                    <ResponsiveContainer width="100%" height={380}>
+                      <BarChart data={(nightData.contributorNight || []).slice(0, 14)} layout="vertical" margin={{ left: 8, right: 16 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis type="number" stroke="#9ca3af" />
+                        <YAxis type="category" dataKey="name" stroke="#9ca3af" width={100} tick={{ fontSize: 11 }} />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Bar dataKey="nightPercentOfOwnHours" fill="#ec4899" name="Night % own" radius={[0, 6, 6, 0]} isAnimationActive={false} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-2 flex items-center"><Activity className="w-5 h-5 mr-2 text-emerald-400" /> Night vs day — hours by task (top)</h2>
+                    <p className="text-gray-400 text-xs mb-4">Ratio &gt; 1 means more night hours than selected day-modes for that task.</p>
+                    <ResponsiveContainer width="100%" height={380}>
+                      <BarChart data={(nightData.nightVsDayByTask || []).filter((t) => t.nightHours > 0).slice(0, 12)} margin={{ bottom: 70 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis dataKey="task" stroke="#9ca3af" angle={-30} textAnchor="end" height={80} interval={0} fontSize={10} />
+                        <YAxis stroke="#9ca3af" />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Legend />
+                        <Bar dataKey="nightHours" fill="#6366f1" name="Night hrs" isAnimationActive={false} />
+                        <Bar dataKey="dayHours" fill="#94a3b8" name="Day-mode hrs" isAnimationActive={false} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-2 flex items-center"><Clock className="w-5 h-5 mr-2 text-amber-400" /> Submission / log hour (UTC)</h2>
+                    <p className="text-gray-400 text-xs mb-4">Bucketed by timestamp used for analytics (see note above).</p>
+                    <ResponsiveContainer width="100%" height={280}>
+                      <AreaChart data={nightData.hourlyBuckets || []} isAnimationActive={false}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis dataKey="hour" stroke="#9ca3af" label={{ value: 'Hour', fill: '#9ca3af', fontSize: 11 }} />
+                        <YAxis stroke="#9ca3af" />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Area type="monotone" dataKey="hours" stroke="#f59e0b" fill="#f59e0b" fillOpacity={0.35} name="Hours" />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-4 flex items-center"><Target className="w-5 h-5 mr-2 text-orange-400" /> Night workload by weekday</h2>
+                    <ResponsiveContainer width="100%" height={280}>
+                      <BarChart data={nightData.dowBuckets || []}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis dataKey="day" stroke="#9ca3af" />
+                        <YAxis stroke="#9ca3af" />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Bar dataKey="hours" fill="#14b8a6" name="Hours" radius={[6, 6, 0, 0]} isAnimationActive={false} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                  <h2 className="text-xl font-bold text-white mb-4 flex items-center"><TrendingUp className="w-5 h-5 mr-2 text-sky-400" /> Night hours over time</h2>
+                  <ResponsiveContainer width="100%" height={300}>
+                    <LineChart data={nightData.nightTimeline || []} isAnimationActive={false}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                      <XAxis dataKey="date" stroke="#9ca3af" fontSize={11} />
+                      <YAxis stroke="#9ca3af" />
+                      <Tooltip content={<CustomTooltip />} />
+                      <Line type="monotone" dataKey="hours" stroke="#818cf8" strokeWidth={2} dot={false} name="Night hours" />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-4 flex items-center"><Briefcase className="w-5 h-5 mr-2 text-purple-400" /> Projects — units per night hour</h2>
+                    <ResponsiveContainer width="100%" height={320}>
+                      <BarChart data={(nightData.projectsNight || []).filter((p) => p.hours >= 1).slice(0, 12)} margin={{ bottom: 72 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis dataKey="project_name" stroke="#9ca3af" angle={-30} textAnchor="end" height={90} interval={0} fontSize={9} tickFormatter={(v) => (v.length > 28 ? `${v.slice(0, 26)}…` : v)} />
+                        <YAxis stroke="#9ca3af" />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Bar dataKey="unitsPerHour" fill="#a78bfa" name="Units / hr" radius={[6, 6, 0, 0]} isAnimationActive={false} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-amber-500/30">
+                    <h2 className="text-xl font-bold text-white mb-4 flex items-center"><AlertTriangle className="w-5 h-5 mr-2 text-amber-400" /> Flags &amp; anomalies</h2>
+                    <ul className="space-y-3 text-sm text-gray-200 max-h-80 overflow-y-auto custom-scrollbar pr-2">
+                      {(nightData.anomalies || []).length === 0 && <li className="text-gray-500">No heuristic flags for the current filter.</li>}
+                      {(nightData.anomalies || []).map((a, i) => (
+                        <li key={i} className="border border-gray-700 rounded-lg p-3 bg-gray-900/50">
+                          <span className="text-amber-300 font-semibold text-xs uppercase">{a.type?.replace(/_/g, ' ')}</span>
+                          <p className="text-white font-medium mt-1">{a.entity}</p>
+                          <p className="text-gray-400 mt-1">{a.detail}</p>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              </>
+            )}
+            {!nightLoading && !nightData?.summary && (
+              <p className="text-gray-400">Could not load night analytics.</p>
+            )}
+          </div>
+        )}
+
+        {dashTab === 'books' && (
+          <div className="space-y-8 pb-8">
+            <div className="rounded-xl border border-teal-500/40 bg-teal-950/20 p-4 text-teal-100 text-sm max-w-4xl">
+              Books are grouped by stripping trailing academic session tokens from <code className="text-teal-300 bg-gray-900/80 px-1 rounded">project_name</code> (e.g. <code className="text-teal-300">…-25-26</code> and <code className="text-teal-300">…_26-27</code> collapse to the same base). Compare hours, contributors, and tasks across sessions to spot duplicate effort or unusual deltas.
+            </div>
+            <div className="flex flex-wrap items-center gap-4">
+              <label className="text-white text-sm font-semibold">Minimum distinct sessions</label>
+              <select
+                value={bookSessionMin}
+                onChange={(e) => setBookSessionMin(Number(e.target.value))}
+                className="bg-gray-700 text-white border border-gray-600 rounded-lg px-3 py-2"
+              >
+                {[2, 3, 4, 5].map((n) => (
+                  <option key={n} value={n}>{n}+</option>
+                ))}
+              </select>
+              {!booksLoading && crossBooks?.summary && (
+                <span className="text-gray-400 text-sm">{crossBooks.summary.groupsReturned} book(s) with at least {bookSessionMin} session suffixes.</span>
+              )}
+              {booksLoading && (
+                <span className="text-gray-500 text-sm italic">Loading…</span>
+              )}
+            </div>
+            {booksLoading && (
+              <div className="flex justify-center py-24">
+                <div className="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-teal-500" />
+              </div>
+            )}
+            {!booksLoading && crossBooks?.groups && (
+              <>
+                <div className="overflow-x-auto rounded-xl border border-gray-700">
+                  <table className="min-w-full text-sm text-left">
+                    <thead className="bg-gray-800 text-gray-300 uppercase text-xs">
+                      <tr>
+                        <th className="px-4 py-3">Base book</th>
+                        <th className="px-4 py-3">Sessions</th>
+                        <th className="px-4 py-3">Total hours</th>
+                        <th className="px-4 py-3">Flags</th>
+                        <th className="px-4 py-3"> </th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-700 bg-gray-900/40">
+                      {crossBooks.groups.map((g) => {
+                        const totalH = g.sessions.reduce((s, x) => s + (x.totalHours || 0), 0);
+                        const flagN = (g.flags || []).length;
+                        return (
+                          <tr key={g.baseKey} className="hover:bg-gray-800/80">
+                            <td className="px-4 py-3 text-white font-medium max-w-md truncate" title={g.displayBase}>{g.displayBase}</td>
+                            <td className="px-4 py-3 text-gray-300">{g.sessionCount}</td>
+                            <td className="px-4 py-3 text-gray-200">{totalH.toFixed(1)}</td>
+                            <td className="px-4 py-3">{flagN > 0 ? <span className="text-amber-400">{flagN}</span> : '—'}</td>
+                            <td className="px-4 py-3">
+                              <button type="button" className="text-teal-400 hover:underline" onClick={() => setSelectedBookGroup(g)}>Details</button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                {crossBooks.groups.length === 0 && (
+                  <p className="text-gray-400">No books matched with the current filters and session threshold. Try &quot;All&quot; teams / period or lower minimum sessions (not below 2 for cross-session compare).</p>
+                )}
+
+                {selectedBookGroup && (
+                  <div
+                    ref={crossBookDetailRef}
+                    className="rounded-xl border border-teal-500/40 bg-gray-800/50 p-6 space-y-6 scroll-mt-28"
+                  >
+                    <div className="flex justify-between items-start gap-4 flex-wrap">
+                      <div>
+                        <h3 className="text-2xl font-bold text-white">{selectedBookGroup.displayBase}</h3>
+                        <p className="text-gray-400 text-sm mt-1">Base key: {selectedBookGroup.baseKey}</p>
+                      </div>
+                      <button type="button" onClick={() => setSelectedBookGroup(null)} className="text-gray-400 hover:text-white text-sm">Close</button>
+                    </div>
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                      <div>
+                        <h4 className="text-lg font-semibold text-white mb-3">Hours &amp; contributors by session</h4>
+                        <ResponsiveContainer width="100%" height={300}>
+                          <BarChart data={selectedBookGroup.chartBySession || []}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                            <XAxis dataKey="session" stroke="#9ca3af" />
+                            <YAxis stroke="#9ca3af" />
+                            <Tooltip content={<CustomTooltip />} />
+                            <Legend />
+                            <Bar dataKey="hours" fill="#2dd4bf" name="Hours" radius={[6, 6, 0, 0]} isAnimationActive={false} />
+                            <Bar dataKey="contributors" fill="#f472b6" name="Contributors" radius={[6, 6, 0, 0]} isAnimationActive={false} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                      <div>
+                        <h4 className="text-lg font-semibold text-white mb-3">Hours per contributor</h4>
+                        <ResponsiveContainer width="100%" height={300}>
+                          <BarChart data={selectedBookGroup.chartBySession || []}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                            <XAxis dataKey="session" stroke="#9ca3af" />
+                            <YAxis stroke="#9ca3af" />
+                            <Tooltip content={<CustomTooltip />} />
+                            <Bar dataKey="hoursPerContributor" fill="#a78bfa" name="Hrs / contributor" radius={[6, 6, 0, 0]} isAnimationActive={false} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+                    {(selectedBookGroup.flags?.length > 0 || selectedBookGroup.insights?.length > 0) && (
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div className="rounded-lg border border-amber-500/30 bg-gray-900/50 p-4">
+                          <h5 className="text-amber-200 font-semibold mb-2 flex items-center gap-2"><AlertTriangle className="w-4 h-4" /> Flags</h5>
+                          <ul className="text-sm text-gray-300 space-y-2 list-disc pl-4">
+                            {(selectedBookGroup.flags || []).map((f, i) => (
+                              <li key={i}>{f.message}</li>
+                            ))}
+                          </ul>
+                        </div>
+                        <div className="rounded-lg border border-teal-500/30 bg-gray-900/50 p-4">
+                          <h5 className="text-teal-200 font-semibold mb-2">Insights</h5>
+                          <ul className="text-sm text-gray-300 space-y-2 list-disc pl-4">
+                            {(selectedBookGroup.insights || []).length === 0 && <li className="list-none text-gray-500">No cross-session insights.</li>}
+                            {(selectedBookGroup.insights || []).map((t, i) => (
+                              <li key={i}>{t}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      </div>
+                    )}
+                    <div>
+                      <h4 className="text-lg font-semibold text-white mb-3">Session detail</h4>
+                      <div className="space-y-6">
+                        {(selectedBookGroup.sessions || []).filter((s) => s.sessionLabel !== 'unspecified').map((s) => (
+                          <div key={s.sessionLabel} className="border border-gray-700 rounded-lg p-4 bg-gray-900/40">
+                            <div className="flex flex-wrap justify-between gap-2 mb-2">
+                              <span className="text-teal-300 font-bold">Session {s.sessionLabel}</span>
+                              <span className="text-gray-400 text-sm">{s.totalHours}h · {s.contributorCount} contributors · {s.entryCount} entries</span>
+                            </div>
+                            <p className="text-xs text-gray-500 mb-2">Projects: {(s.projectNames || []).join(', ')}</p>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                              <ResponsiveContainer width="100%" height={220}>
+                                <BarChart data={(s.taskHours || []).slice(0, 8)} layout="vertical" margin={{ left: 4 }}>
+                                  <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                                  <XAxis type="number" stroke="#9ca3af" />
+                                  <YAxis type="category" dataKey="task" stroke="#9ca3af" width={120} tick={{ fontSize: 10 }} />
+                                  <Tooltip content={<CustomTooltip />} />
+                                  <Bar dataKey="hours" fill="#34d399" radius={[0, 4, 4, 0]} isAnimationActive={false} />
+                                </BarChart>
+                              </ResponsiveContainer>
+                              <div className="text-xs text-gray-400 max-h-52 overflow-y-auto custom-scrollbar">
+                                <p className="text-gray-300 font-semibold mb-1">Contributors</p>
+                                <p>{(s.contributors || []).join(', ') || '—'}</p>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+            {!booksLoading && !crossBooks?.groups && (
+              <p className="text-gray-400">Could not load cross-session data.</p>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Auto-refresh indicator */}
