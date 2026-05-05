@@ -3042,6 +3042,48 @@ function applyProjectTokenFilters(where, req) {
   return where;
 }
 
+/** Strip trailing academic session (e.g. -25-26, _26-27) from project_name for cross-session book grouping. */
+function parseAcademicSessionFromProject(projectName) {
+  if (!projectName || typeof projectName !== 'string') {
+    return { baseKey: '_empty', sessionLabel: 'unknown', displayOriginal: '' };
+  }
+  const trimmed = projectName.trim();
+  const lower = trimmed.toLowerCase();
+  const re = /([-_])((?:20)?\d{2})[-_]((?:20)?\d{2})$/;
+  const m = lower.match(re);
+  if (m) {
+    const y1 = m[2].replace(/^20/, '');
+    const y2 = m[3].replace(/^20/, '');
+    const sessionLabel = `${y1}-${y2}`;
+    const baseKey = lower.slice(0, m.index).replace(/[-_]+$/g, '') || lower;
+    return { baseKey, sessionLabel, displayOriginal: trimmed };
+  }
+  return {
+    baseKey: lower.replace(/[-_]+$/g, '') || lower,
+    sessionLabel: 'unspecified',
+    displayOriginal: trimmed
+  };
+}
+
+function sessionChronologicalKey(sessionLabel) {
+  if (sessionLabel === 'unspecified' || sessionLabel === 'unknown') return 999999;
+  const [a, b] = sessionLabel.split('-').map((x) => parseInt(x, 10));
+  if (Number.isNaN(a)) return 999999;
+  const bb = Number.isNaN(b) ? 0 : b;
+  return a * 100 + bb;
+}
+
+/** Human-readable base title preserving original casing (strips trailing YY-YY). */
+function stripSessionForDisplay(projectName) {
+  const trimmed = String(projectName || '').trim();
+  if (!trimmed) return '';
+  const lower = trimmed.toLowerCase();
+  const re = /([-_])((?:20)?\d{2})[-_]((?:20)?\d{2})$/;
+  const m = lower.match(re);
+  if (!m) return trimmed;
+  return trimmed.slice(0, m.index).replace(/[-_]+$/g, '') || trimmed;
+}
+
 // ===== FILTER ENDPOINTS =====
 
 // Get all teams from database
@@ -3501,6 +3543,457 @@ app.get('/api/dashboard/workmode-by-days', async (req, res) => {
       .sort((a, b) => b.totalDays - a.totalDays);
 
     res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Cross-session book effort: group project_name by base book (strip YY-YY session suffix) and compare sessions
+app.get('/api/dashboard/cross-session-books', async (req, res) => {
+  try {
+    let where = applyProjectTokenFilters(buildWhereClause(req), req);
+    const rawProj = req.query.project_name;
+    const projList = rawProj == null ? [] : Array.isArray(rawProj) ? rawProj : [rawProj];
+    const projFiltered = projList.map((p) => String(p).trim()).filter((p) => p && p !== 'All');
+    if (projFiltered.length) {
+      where = { ...where, project_name: { in: projFiltered } };
+    }
+    const minSessions = Math.max(1, Math.min(20, parseInt(req.query.minSessions, 10) || 2));
+
+    const rows = await prisma.masterDatabase.findMany({
+      where: {
+        ...where,
+        project_name: { not: null, notIn: ['', ' ', 'blank', 'Blank', 'BLANK'] }
+      },
+      select: {
+        project_name: true,
+        hours_spent: true,
+        name: true,
+        task_name: true,
+        date: true,
+        number_of_units: true
+      }
+    });
+
+    /** baseKey -> sessionLabel -> aggregate bucket */
+    const tree = {};
+    for (const r of rows) {
+      const pn = r.project_name || '';
+      const { baseKey, sessionLabel } = parseAcademicSessionFromProject(pn);
+      if (!tree[baseKey]) tree[baseKey] = {};
+      if (!tree[baseKey][sessionLabel]) {
+        tree[baseKey][sessionLabel] = {
+          sessionLabel,
+          projectNames: new Set(),
+          totalHours: 0,
+          totalUnits: 0,
+          entryCount: 0,
+          contributors: new Set(),
+          taskHours: {},
+          dates: []
+        };
+      }
+      const b = tree[baseKey][sessionLabel];
+      b.projectNames.add(pn);
+      b.totalHours += r.hours_spent || 0;
+      b.totalUnits += r.number_of_units || 0;
+      b.entryCount += 1;
+      if (r.name) b.contributors.add(r.name);
+      const task = (r.task_name && String(r.task_name).trim()) || 'Unspecified';
+      b.taskHours[task] = (b.taskHours[task] || 0) + (r.hours_spent || 0);
+      if (r.date) b.dates.push(r.date);
+    }
+
+    const groups = [];
+    for (const [baseKey, sessionsMap] of Object.entries(tree)) {
+      const sessionLabels = Object.keys(sessionsMap);
+      const distinctSessions = sessionLabels.filter((s) => s !== 'unspecified' && s !== 'unknown');
+      if (distinctSessions.length < minSessions) continue;
+
+      const sessions = sessionLabels
+        .filter((s) => s !== 'unknown')
+        .map((s) => {
+          const x = sessionsMap[s];
+          const dateObjs = x.dates.filter(Boolean);
+          const minD = dateObjs.length ? new Date(Math.min(...dateObjs.map((d) => d.getTime()))) : null;
+          const maxD = dateObjs.length ? new Date(Math.max(...dateObjs.map((d) => d.getTime()))) : null;
+          const taskHoursSorted = Object.entries(x.taskHours)
+            .sort((a, b) => b[1] - a[1])
+            .map(([task, hours]) => ({ task, hours }));
+          return {
+            sessionLabel: s,
+            projectNames: [...x.projectNames].sort(),
+            totalHours: Math.round(x.totalHours * 100) / 100,
+            totalUnits: x.totalUnits,
+            entryCount: x.entryCount,
+            contributorCount: x.contributors.size,
+            contributors: [...x.contributors].sort(),
+            taskHours: taskHoursSorted,
+            dateFrom: minD ? minD.toISOString().slice(0, 10) : null,
+            dateTo: maxD ? maxD.toISOString().slice(0, 10) : null
+          };
+        })
+        .sort((a, b) => sessionChronologicalKey(a.sessionLabel) - sessionChronologicalKey(b.sessionLabel));
+
+      const chartBySession = sessions
+        .filter((s) => s.sessionLabel !== 'unspecified')
+        .map((s) => ({
+          session: s.sessionLabel,
+          hours: s.totalHours,
+          contributors: s.contributorCount,
+          entries: s.entryCount,
+          hoursPerContributor: s.contributorCount ? Math.round((s.totalHours / s.contributorCount) * 100) / 100 : 0
+        }));
+
+      const flags = [];
+      const insights = [];
+      const sortedForCompare = sessions.filter((s) => s.sessionLabel !== 'unspecified');
+      if (sortedForCompare.length >= 2) {
+        const hoursList = sortedForCompare.map((s) => s.totalHours);
+        const last = hoursList[hoursList.length - 1];
+        const prev = hoursList.slice(0, -1);
+        const meanPrev = prev.reduce((a, c) => a + c, 0) / prev.length;
+
+        if (meanPrev > 5 && last > meanPrev * 2) {
+          flags.push({
+            type: 'disproportionate_high',
+            severity: 'warning',
+            message: `Latest session (${sortedForCompare[sortedForCompare.length - 1].sessionLabel}) logged ${last.toFixed(1)}h vs prior-session average ${meanPrev.toFixed(1)}h — review for over-reporting or scope change.`
+          });
+        }
+        if (meanPrev > 10 && last < meanPrev * 0.25) {
+          flags.push({
+            type: 'disproportionate_low',
+            severity: 'info',
+            message: `Latest session shows much lower hours than prior sessions — possible under-reporting or reduced scope.`
+          });
+        }
+
+        const lastCont = new Set(sortedForCompare[sortedForCompare.length - 1].contributors);
+        const priorUnion = new Set();
+        for (let i = 0; i < sortedForCompare.length - 1; i++) {
+          sortedForCompare[i].contributors.forEach((n) => priorUnion.add(n));
+        }
+        let overlap = 0;
+        lastCont.forEach((n) => {
+          if (priorUnion.has(n)) overlap += 1;
+        });
+        const jaccard =
+          lastCont.size + priorUnion.size > 0
+            ? overlap / (new Set([...lastCont, ...priorUnion]).size || 1)
+            : 0;
+        if (overlap >= 3 && jaccard > 0.35) {
+          insights.push(
+            `${overlap} contributors appear in both the latest session and earlier sessions (overlap index ${(jaccard * 100).toFixed(0)}%) — validate against duplicate or repeated work.`
+          );
+        }
+
+        const hPerCont = sortedForCompare.map((s) =>
+          s.contributorCount ? s.totalHours / s.contributorCount : 0
+        );
+        const maxH = Math.max(...hPerCont);
+        const minH = Math.min(...hPerCont);
+        if (maxH > 0 && minH > 0 && maxH / minH > 2.5) {
+          insights.push('Hours per contributor vary strongly between sessions — check team composition or allocation consistency.');
+        }
+      }
+
+      const allNames = sessions.flatMap((s) => s.projectNames).sort();
+      const displayBase = allNames[0] ? stripSessionForDisplay(allNames[0]) : baseKey;
+
+      groups.push({
+        baseKey,
+        displayBase,
+        sessionCount: distinctSessions.length,
+        sessions,
+        chartBySession,
+        flags,
+        insights
+      });
+    }
+
+    groups.sort((a, b) => {
+      const ha = a.sessions.reduce((s, x) => s + x.totalHours, 0);
+      const hb = b.sessions.reduce((s, x) => s + x.totalHours, 0);
+      return hb - ha;
+    });
+
+    res.json({
+      summary: {
+        groupsReturned: groups.length,
+        minSessions,
+        note: 'Books are matched by stripping trailing academic year tokens (e.g. -25-26, _26-27) from project_name.'
+      },
+      groups
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Night work deep analytics (work_mode = Night, case-insensitive)
+app.get('/api/dashboard/night-analytics', async (req, res) => {
+  try {
+    let baseWhere = applyProjectTokenFilters(buildWhereClause(req), req);
+    const rawProj = req.query.project_name;
+    const projList = rawProj == null ? [] : Array.isArray(rawProj) ? rawProj : [rawProj];
+    const projFiltered = projList.map((p) => String(p).trim()).filter((p) => p && p !== 'All');
+    if (projFiltered.length) {
+      baseWhere = { ...baseWhere, project_name: { in: projFiltered } };
+    }
+    const nightWhere = {
+      ...baseWhere,
+      work_mode: { equals: 'night', mode: 'insensitive' }
+    };
+
+    const dayModes = ['WFH', 'In Office', 'OT Office', 'OT Home', 'On Duty', 'Half Day'];
+    const dayWhere = {
+      ...baseWhere,
+      work_mode: { in: dayModes }
+    };
+
+    const [
+      nightRows,
+      nightByProject,
+      nightByName,
+      nightByTeam,
+      nightByTask,
+      totalsAll,
+      totalsNightAgg,
+      dayTaskAgg
+    ] = await Promise.all([
+      prisma.masterDatabase.findMany({
+        where: nightWhere,
+        select: {
+          name: true,
+          team: true,
+          project_name: true,
+          task_name: true,
+          hours_spent: true,
+          number_of_units: true,
+          date: true,
+          submitted_at: true,
+          work_mode: true
+        }
+      }),
+      prisma.masterDatabase.groupBy({
+        by: ['project_name'],
+        where: { ...nightWhere, project_name: { not: null, notIn: ['', ' '] } },
+        _sum: { hours_spent: true, number_of_units: true },
+        _count: true
+      }),
+      prisma.masterDatabase.groupBy({
+        by: ['name', 'team'],
+        where: nightWhere,
+        _sum: { hours_spent: true, number_of_units: true },
+        _count: true
+      }),
+      prisma.masterDatabase.groupBy({
+        by: ['team'],
+        where: nightWhere,
+        _sum: { hours_spent: true, number_of_units: true },
+        _count: true
+      }),
+      prisma.masterDatabase.groupBy({
+        by: ['task_name'],
+        where: nightWhere,
+        _sum: { hours_spent: true, number_of_units: true },
+        _count: true
+      }),
+      prisma.masterDatabase.aggregate({
+        where: baseWhere,
+        _sum: { hours_spent: true, number_of_units: true }
+      }),
+      prisma.masterDatabase.aggregate({
+        where: nightWhere,
+        _sum: { hours_spent: true, number_of_units: true }
+      }),
+      prisma.masterDatabase.groupBy({
+        by: ['task_name'],
+        where: dayWhere,
+        _sum: { hours_spent: true, number_of_units: true },
+        _count: true
+      })
+    ]);
+
+    const totalNightEntries = await prisma.masterDatabase.count({ where: nightWhere });
+
+    const totalAllHours = totalsAll._sum.hours_spent || 0;
+    const totalNightHours = totalsNightAgg._sum.hours_spent || 0;
+    const totalNightUnits = totalsNightAgg._sum.number_of_units || 0;
+
+    const byUserAll = await prisma.masterDatabase.groupBy({
+      by: ['name'],
+      where: baseWhere,
+      _sum: { hours_spent: true }
+    });
+    const allHoursByName = {};
+    byUserAll.forEach((r) => {
+      allHoursByName[r.name] = r._sum.hours_spent || 0;
+    });
+
+    const contributorNight = nightByName
+      .map((r) => {
+        const nh = r._sum.hours_spent || 0;
+        const ah = allHoursByName[r.name] || nh;
+        const pct = ah > 0 ? (nh / ah) * 100 : 0;
+        return {
+          name: r.name,
+          team: r.team,
+          nightHours: Math.round(nh * 100) / 100,
+          nightEntries: r._count,
+          nightUnits: r._sum.number_of_units || 0,
+          totalHoursAllModes: Math.round(ah * 100) / 100,
+          nightPercentOfOwnHours: Math.round(pct * 10) / 10,
+          unitsPerHour:
+            nh > 0 ? Math.round(((r._sum.number_of_units || 0) / nh) * 1000) / 1000 : null
+        };
+      })
+      .sort((a, b) => b.nightHours - a.nightHours);
+
+    const hourlyBuckets = Array.from({ length: 24 }, (_, h) => ({ hour: h, count: 0, hours: 0 }));
+    const dowBuckets = [
+      'Sun',
+      'Mon',
+      'Tue',
+      'Wed',
+      'Thu',
+      'Fri',
+      'Sat'
+    ].map((d) => ({ day: d, hours: 0, entries: 0 }));
+    const timelineByDate = {};
+
+    for (const r of nightRows) {
+      const ts = r.submitted_at || r.date;
+      if (ts) {
+        const d = new Date(ts);
+        const h = d.getHours();
+        hourlyBuckets[h].count += 1;
+        hourlyBuckets[h].hours += r.hours_spent || 0;
+        const dow = d.getDay();
+        dowBuckets[dow].hours += r.hours_spent || 0;
+        dowBuckets[dow].entries += 1;
+      }
+      if (r.date) {
+        const key = r.date.toISOString().slice(0, 10);
+        if (!timelineByDate[key]) timelineByDate[key] = { date: key, hours: 0, entries: 0 };
+        timelineByDate[key].hours += r.hours_spent || 0;
+        timelineByDate[key].entries += 1;
+      }
+    }
+
+    const nightTimeline = Object.values(timelineByDate).sort((a, b) => a.date.localeCompare(b.date));
+
+    const projectsNight = nightByProject
+      .map((p) => {
+        const h = p._sum.hours_spent || 0;
+        const u = p._sum.number_of_units || 0;
+        return {
+          project_name: p.project_name,
+          hours: Math.round(h * 100) / 100,
+          entries: p._count,
+          units: u,
+          unitsPerHour: h > 0 ? Math.round((u / h) * 1000) / 1000 : null
+        };
+      })
+      .sort((a, b) => b.hours - a.hours);
+
+    const taskNight = nightByTask
+      .map((t) => ({
+        task: t.task_name || 'Unspecified',
+        hours: Math.round((t._sum.hours_spent || 0) * 100) / 100,
+        entries: t._count,
+        units: t._sum.number_of_units || 0
+      }))
+      .sort((a, b) => b.hours - a.hours);
+
+    const dayTaskMap = {};
+    dayTaskAgg.forEach((t) => {
+      dayTaskMap[(t.task_name || 'Unspecified').toLowerCase()] = {
+        hours: t._sum.hours_spent || 0,
+        units: t._sum.number_of_units || 0,
+        entries: t._count
+      };
+    });
+
+    const nightVsDayByTask = taskNight.slice(0, 25).map((t) => {
+      const d = dayTaskMap[t.task.toLowerCase()] || { hours: 0, units: 0, entries: 0 };
+      const ratio = d.hours > 0 ? t.hours / d.hours : null;
+      return {
+        task: t.task,
+        nightHours: t.hours,
+        dayHours: Math.round(d.hours * 100) / 100,
+        nightToDayHourRatio: ratio != null ? Math.round(ratio * 1000) / 1000 : null
+      };
+    });
+
+    const teamNight = nightByTeam
+      .map((t) => ({
+        team: t.team,
+        hours: Math.round((t._sum.hours_spent || 0) * 100) / 100,
+        entries: t._count,
+        units: t._sum.number_of_units || 0
+      }))
+      .sort((a, b) => b.hours - a.hours);
+
+    const nightShareGlobal = totalAllHours > 0 ? (totalNightHours / totalAllHours) * 100 : 0;
+
+    const anomalies = [];
+    contributorNight.slice(0, 40).forEach((c) => {
+      if (c.nightPercentOfOwnHours >= 45 && c.totalHoursAllModes >= 20) {
+        anomalies.push({
+          type: 'heavy_night_contributor',
+          entity: c.name,
+          detail: `${c.nightPercentOfOwnHours}% of logged hours are Night mode (${c.nightHours}h / ${c.totalHoursAllModes}h).`
+        });
+      }
+    });
+    if (totalNightHours > 0) {
+      projectsNight.slice(0, 8).forEach((p) => {
+        const share = (p.hours / totalNightHours) * 100;
+        if (share >= 12 && p.hours >= 8) {
+          anomalies.push({
+            type: 'night_reliant_project',
+            entity: p.project_name,
+            detail: `About ${share.toFixed(0)}% of all night hours in this filter (${p.hours.toFixed(1)}h) — disproportionate night reliance.`
+          });
+        }
+      });
+    }
+    const topAnomalies = anomalies.slice(0, 25);
+
+    const summary = {
+      totalNightHours: Math.round(totalNightHours * 100) / 100,
+      totalNightEntries: totalNightEntries,
+      totalNightUnits,
+      uniqueNightContributors: contributorNight.length,
+      nightPercentOfFilteredHours: Math.round(nightShareGlobal * 10) / 10,
+      avgHoursPerNightEntry:
+        totalNightEntries > 0 ? Math.round((totalNightHours / totalNightEntries) * 100) / 100 : 0,
+      globalUnitsPerNightHour:
+        totalNightHours > 0 ? Math.round((totalNightUnits / totalNightHours) * 1000) / 1000 : null
+    };
+
+    const nightProjectShare = projectsNight.slice(0, 15).map((p) => ({
+      name: p.project_name.length > 42 ? `${p.project_name.slice(0, 40)}…` : p.project_name,
+      fullName: p.project_name,
+      value: p.hours,
+      nightPercentOfNightTotal: totalNightHours > 0 ? Math.round((p.hours / totalNightHours) * 1000) / 10 : 0
+    }));
+
+    res.json({
+      summary,
+      contributorNight,
+      projectsNight,
+      teamNight,
+      taskNight,
+      hourlyBuckets,
+      dowBuckets,
+      nightTimeline,
+      nightVsDayByTask,
+      nightProjectShare,
+      anomalies: topAnomalies
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -4278,9 +4771,22 @@ app.get('/api/dashboard/project-view/project-insights', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+
+const server = app.listen(PORT, () => {
   console.log(`API Server running on port ${PORT}`);
 });
+
+async function shutdown(signal) {
+  try {
+    await prisma.$disconnect();
+  } catch {
+    /* ignore */
+  }
+  server.close(() => process.exit(signal === 'SIGTERM' ? 0 : 0));
+}
+
+process.once('SIGINT', () => void shutdown('SIGINT'));
+process.once('SIGTERM', () => void shutdown('SIGTERM'));
 
 
 
