@@ -14,18 +14,16 @@ function poolingDatabaseUrl(urlString) {
     return urlString;
   }
 
+  // Optional override. If not set, keep DATABASE_URL value.
   const explicit = process.env.DATABASE_CONNECTION_LIMIT?.trim();
   if (explicit && /^\d+$/.test(explicit) && explicit !== "0") {
     parsed.searchParams.set("connection_limit", explicit);
-  } else if (!parsed.searchParams.has("connection_limit")) {
-    parsed.searchParams.set("connection_limit", "5");
   }
 
+  // Optional override. If not set, keep DATABASE_URL value.
   const poolTimeout = process.env.DATABASE_POOL_TIMEOUT?.trim();
   if (poolTimeout && /^\d+$/.test(poolTimeout)) {
     parsed.searchParams.set("pool_timeout", poolTimeout);
-  } else if (!parsed.searchParams.has("pool_timeout")) {
-    parsed.searchParams.set("pool_timeout", "20");
   }
 
   return parsed.toString();

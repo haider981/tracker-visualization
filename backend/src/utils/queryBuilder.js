@@ -2,9 +2,28 @@
 
 function buildWhereClause(req) {
     const where = {};
+
+    // Department filter (maps to team naming conventions)
+    if (req.query.department && req.query.department !== 'All') {
+      if (req.query.department === 'DTP') {
+        where.OR = [
+          { team: { startsWith: 'DTP' } },
+          { team: { startsWith: 'Animation' } }
+        ];
+      } else if (req.query.department === 'Editorial') {
+        where.OR = [
+          { team: { startsWith: 'Editorial' } },
+          { team: { startsWith: 'CSMA' } }
+        ];
+      } else if (req.query.department === 'Digital Marketing') {
+        where.team = 'Digital_Marketing';
+      }
+    }
   
     if (req.query.team && req.query.team !== 'All') {
       where.team = req.query.team;
+      // Team is more specific than department; clear department OR guard
+      if (where.OR) delete where.OR;
     }
   
     if (req.query.employee && req.query.employee !== 'All') {

@@ -2977,8 +2977,27 @@ app.use(express.json());
 function buildWhereClause(req) {
   const where = {};
   
+  // Department filter (maps to team naming conventions)
+  if (req.query.department && req.query.department !== 'All') {
+    if (req.query.department === 'DTP') {
+      where.OR = [
+        { team: { startsWith: 'DTP' } },
+        { team: { startsWith: 'Animation' } }
+      ];
+    } else if (req.query.department === 'Editorial') {
+      where.OR = [
+        { team: { startsWith: 'Editorial' } },
+        { team: { startsWith: 'CSMA' } }
+      ];
+    } else if (req.query.department === 'Digital Marketing') {
+      where.team = 'Digital_Marketing';
+    }
+  }
+
   if (req.query.team && req.query.team !== 'All') {
     where.team = req.query.team;
+    // Team is more specific than department; clear department OR guard
+    if (where.OR) delete where.OR;
   }
   if (req.query.employee && req.query.employee !== 'All') {
     where.name = req.query.employee;
@@ -4187,6 +4206,147 @@ app.get('/api/dashboard/audit-status', async (req, res) => {
       hours: a._sum.hours_spent || 0,
       count: a._count,
     })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Employee × task (overall analytics: stacked bars + heatmap)
+app.get('/api/dashboard/employee-task-breakdown', async (req, res) => {
+  try {
+    // Include project-name token filters (segment/class/series) so cards update together
+    const where = applyProjectTokenFilters(buildWhereClause(req), req);
+    const rows = await prisma.masterDatabase.groupBy({
+      by: ['name', 'task_name'],
+      _sum: { hours_spent: true, number_of_units: true },
+      where: {
+        ...where,
+        name: { notIn: ['', ' '] },
+        task_name: { not: null, notIn: ['', ' '] }
+      }
+    });
+    res.json(
+      rows.map((r) => ({
+        employee: r.name,
+        task: r.task_name,
+        hours: r._sum.hours_spent || 0,
+        units: r._sum.number_of_units || 0
+      }))
+    );
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Project × task (treemap: project effort distribution)
+app.get('/api/dashboard/project-task-effort', async (req, res) => {
+  try {
+    // Include project-name token filters (segment/class/series)
+    const where = applyProjectTokenFilters(buildWhereClause(req), req);
+    const rows = await prisma.masterDatabase.groupBy({
+      by: ['project_name', 'task_name'],
+      _sum: { hours_spent: true, number_of_units: true },
+      where: {
+        ...where,
+        project_name: { not: null, notIn: ['', ' ', 'blank', 'Blank', 'BLANK'] },
+        task_name: { not: null, notIn: ['', ' '] }
+      }
+    });
+    res.json(
+      rows.map((r) => ({
+        project_name: r.project_name,
+        task_name: r.task_name,
+        hours: r._sum.hours_spent || 0,
+        units: r._sum.number_of_units || 0
+      }))
+    );
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Project × employee (stacked bar)
+app.get('/api/dashboard/project-employee-breakdown', async (req, res) => {
+  try {
+    // Include project-name token filters (segment/class/series)
+    const where = applyProjectTokenFilters(buildWhereClause(req), req);
+    const rows = await prisma.masterDatabase.groupBy({
+      by: ['project_name', 'name'],
+      _sum: { hours_spent: true, number_of_units: true },
+      where: {
+        ...where,
+        project_name: { not: null, notIn: ['', ' ', 'blank', 'Blank', 'BLANK'] },
+        name: { notIn: ['', ' '] }
+      }
+    });
+    const taskRows = await prisma.masterDatabase.groupBy({
+      by: ['project_name', 'name', 'task_name'],
+      _sum: { hours_spent: true },
+      where: {
+        ...where,
+        project_name: { not: null, notIn: ['', ' ', 'blank', 'Blank', 'BLANK'] },
+        name: { notIn: ['', ' '] },
+        task_name: { not: null, notIn: ['', ' '] }
+      }
+    });
+    const taskMap = new Map();
+    for (const tr of taskRows) {
+      const k = `${tr.project_name}\t${tr.name}`;
+      const arr = taskMap.get(k) || [];
+      arr.push({
+        task: tr.task_name,
+        hours: tr._sum.hours_spent || 0
+      });
+      taskMap.set(k, arr);
+    }
+    for (const [, arr] of taskMap) {
+      arr.sort((a, b) => b.hours - a.hours);
+    }
+    res.json(
+      rows.map((r) => ({
+        project_name: r.project_name,
+        employee: r.name,
+        hours: r._sum.hours_spent || 0,
+        units: r._sum.number_of_units || 0,
+        task_breakdown: taskMap.get(`${r.project_name}\t${r.name}`) || []
+      }))
+    );
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Employee performance trend (date × employee)
+app.get('/api/dashboard/employee-performance-over-time', async (req, res) => {
+  try {
+    // Include project-name token filters (segment/class/series)
+    const where = applyProjectTokenFilters(buildWhereClause(req), req);
+    const rows = await prisma.masterDatabase.groupBy({
+      by: ['date', 'name'],
+      _sum: { hours_spent: true, number_of_units: true },
+      where: {
+        ...where,
+        date: { not: null },
+        name: { notIn: ['', ' '] }
+      },
+      orderBy: [{ date: 'asc' }, { name: 'asc' }]
+    });
+
+    res.json(
+      rows.map((r) => {
+        const hours = r._sum.hours_spent || 0;
+        const units = r._sum.number_of_units || 0;
+        const productivity = hours > 0 ? units / hours : 0;
+        const d = r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10);
+        return {
+          date: d,
+          employee: r.name,
+          hours,
+          units,
+          productivity
+        };
+      })
+    );
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
