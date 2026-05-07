@@ -3570,7 +3570,7 @@
 import React, { useState, useEffect, useMemo, memo, useRef, useCallback } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { createPortal } from 'react-dom';
-import { BarChart, Bar, LineChart, Line, PieChart, Pie, AreaChart, Area, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Treemap } from 'recharts';
+import { BarChart, Bar, LineChart, Line, PieChart, Pie, AreaChart, Area, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Treemap, LabelList } from 'recharts';
 import { TrendingUp, Users, Clock, Briefcase, Activity, Zap, Target, CheckCircle, Filter, X, Search, Moon, BookMarked, AlertTriangle, LayoutDashboard } from 'lucide-react';
 
 const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL || '').replace(/\/$/, '');
@@ -5704,7 +5704,7 @@ const Visualization = () => {
           />
           <StatCard
             icon={Users}
-            title="Active Employees"
+            title="Employees"
             value={overview?.totalEmployees || 0}
             color="from-pink-500 to-pink-700"
           />
@@ -5737,13 +5737,13 @@ const Visualization = () => {
       isAnimationActive={false}
       layout="vertical"
       barCategoryGap="18%"
-      margin={{ top: 10, right: 30, left: 10, bottom: 20 }}
+      margin={{ top: 10, right: 70, left: 10, bottom: 20 }}
     >
       <CartesianGrid strokeDasharray="3 3" stroke="#374151" horizontal={false} />
       <XAxis
         type="number"
         stroke="#9ca3af"
-        domain={[0, (dataMax) => Math.ceil(dataMax * 1.15 / 50) * 50]}
+        domain={[0, (dataMax) => Math.ceil(dataMax * 1.2 / 50) * 50]}
         tick={{ fontSize: 12, fill: '#9ca3af' }}
         allowDecimals={false}
         label={{ value: 'Hours', position: 'insideBottom', offset: -2, fill: '#9ca3af', fontSize: 12 }}
@@ -5771,6 +5771,15 @@ const Visualization = () => {
         {projects.slice(0, 10).map((entry, index) => (
           <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
         ))}
+        <LabelList
+          dataKey="hours"
+          position="right"
+          formatter={(val) => {
+            const n = Number(val) || 0;
+            return n >= 100 ? `${Math.round(n)} hrs` : `${n.toFixed(1)} hrs`;
+          }}
+          style={{ fill: '#f3f4f6', fontSize: 12, fontWeight: 600 }}
+        />
       </Bar>
     </BarChart>
   </ResponsiveContainer>

@@ -1264,7 +1264,7 @@ const Visualization2 = () => {
           </div>
           <div className="flex flex-wrap gap-2 pb-1">
             <NavLink
-              to="/project"
+              to="/"
               end
               className={({ isActive }) =>
                 `px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors ${
@@ -1272,10 +1272,10 @@ const Visualization2 = () => {
                 }`
               }
             >
-              <LayoutDashboard className="w-4 h-4" /> Projects
+              <LayoutDashboard className="w-4 h-4" /> Team view
             </NavLink>
             <NavLink
-              to="/project/night"
+              to="/night"
               className={({ isActive }) =>
                 `px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors ${
                   isActive ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
@@ -1285,7 +1285,7 @@ const Visualization2 = () => {
               <Moon className="w-4 h-4" /> Night view
             </NavLink>
             <NavLink
-              to="/project/books"
+              to="/books"
               className={({ isActive }) =>
                 `px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors ${
                   isActive ? 'bg-teal-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
@@ -1295,7 +1295,7 @@ const Visualization2 = () => {
               <BookMarked className="w-4 h-4" /> Cross-session books
             </NavLink>
             <NavLink
-              to="/"
+              to="/project"
               end
               className={({ isActive }) =>
                 `px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors ${
@@ -1303,7 +1303,7 @@ const Visualization2 = () => {
                 }`
               }
             >
-              <Briefcase className="w-4 h-4" /> Team view
+              <Briefcase className="w-4 h-4" /> Project view
             </NavLink>
           </div>
         </div>
