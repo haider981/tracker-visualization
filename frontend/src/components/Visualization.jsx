@@ -3602,7 +3602,7 @@ const WORK_MODE_COLORS = {
 // Department to Team mapping (handled on frontend)
 const DEPARTMENT_TEAM_MAPPING = {
   'DTP': (teamName) => teamName.startsWith('DTP') || teamName.startsWith('Animation'),
-  'Editorial': (teamName) => teamName.startsWith('Editorial') || teamName.startsWith('CSMA'),
+  'Editorial': (teamName) => teamName.startsWith('Editorial') || teamName.startsWith('CSMA') || teamName.startsWith('University'),
   'Digital Marketing': (teamName) => teamName === 'Digital_Marketing'
 };
 
@@ -4774,10 +4774,10 @@ const Visualization = () => {
 
   const workModeBarSize = useMemo(() => {
     const n = workModeByDaysChartData?.length || 0;
-    if (n <= 3) return 90; // department view: thick bars like "Tasks by hours"
-    if (n <= 8) return 56; // team view
-    if (n <= 16) return 36;
-    return 28; // many employees
+    if (n <= 3) return 60; // department view: slimmer bars + larger gaps
+    if (n <= 8) return 48; // team view
+    if (n <= 16) return 34;
+    return 26; // many employees
   }, [workModeByDaysChartData]);
   const projectEmployeeMinWidth = useMemo(
     () => Math.max(1200, (projectEmployeeBreakdown?.length ? new Set((projectEmployeeBreakdown || []).map((r) => r.project_name).filter(Boolean)).size : 0) * 110),
@@ -5797,7 +5797,7 @@ const Visualization = () => {
                   <BarChart
                     data={workModeByDaysChartData}
                     margin={{ top: 10, right: 20, left: 10, bottom: 80 }}
-                    barCategoryGap="14%"
+                    barCategoryGap={workModeByDaysChartData.length <= 4 ? '38%' : '14%'}
                     barGap={0}
                     isAnimationActive={false}
                   >
