@@ -1303,7 +1303,7 @@ const Visualization2 = () => {
                 }`
               }
             >
-              <Briefcase className="w-4 h-4" /> Overall
+              <Briefcase className="w-4 h-4" /> Team view
             </NavLink>
           </div>
         </div>

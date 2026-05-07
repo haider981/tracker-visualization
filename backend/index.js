@@ -2995,7 +2995,15 @@ function buildWhereClause(req) {
   }
 
   if (req.query.team && req.query.team !== 'All') {
-    where.team = req.query.team;
+    const teams = String(req.query.team)
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean);
+    if (teams.length === 1) {
+      where.team = teams[0];
+    } else if (teams.length > 1) {
+      where.team = { in: teams };
+    }
     // Team is more specific than department; clear department OR guard
     if (where.OR) delete where.OR;
   }
@@ -3127,9 +3135,17 @@ app.get('/api/dashboard/filters/employees', async (req, res) => {
     
     let where = {};
     
-    // Filter by team
+    // Filter by team (supports comma-separated multi-select)
     if (team && team !== 'All') {
-      where.team = team;
+      const teams = String(team)
+        .split(',')
+        .map((t) => t.trim())
+        .filter(Boolean);
+      if (teams.length === 1) {
+        where.team = teams[0];
+      } else if (teams.length > 1) {
+        where.team = { in: teams };
+      }
     }
     
     // Search functionality
@@ -3337,6 +3353,9 @@ app.get('/api/dashboard/teams', async (req, res) => {
 app.get('/api/dashboard/timeline', async (req, res) => {
   try {
     const where = buildWhereClause(req);
+    const timelineStart = Math.max(0, parseInt(req.query.timelineStart, 10) || 0);
+    const timelineLimitRaw = parseInt(req.query.timelineLimit, 10);
+    const timelineLimit = Math.min(100, Math.max(1, Number.isFinite(timelineLimitRaw) ? timelineLimitRaw : 10));
 
     // Get date range based on period filter
     let dateFilter = {};
@@ -3406,10 +3425,10 @@ app.get('/api/dashboard/timeline', async (req, res) => {
       projectTotals[item.project_name] += item.hours_spent || 0;
     });
 
-    const topProjects = Object.entries(projectTotals)
+    const sortedProjects = Object.entries(projectTotals)
       .sort((a, b) => b[1] - a[1])
-      .slice(0, 10)
       .map(([name]) => name);
+    const topProjects = sortedProjects.slice(timelineStart, timelineStart + timelineLimit);
 
     // Group by date and project
     const groupedByDate = {};
@@ -3439,7 +3458,13 @@ app.get('/api/dashboard/timeline', async (req, res) => {
       new Date(a.date) - new Date(b.date)
     );
 
-    res.json(timeline);
+    res.json({
+      timeline,
+      totalProjects: sortedProjects.length,
+      timelineStart,
+      timelineLimit,
+      shownProjects: topProjects.length
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -3498,68 +3523,106 @@ app.get('/api/dashboard/workmode-by-days', async (req, res) => {
     // 1) Get records for distinct-day count and project aggregation
     const records = await prisma.masterDatabase.findMany({
       where: whereWithMode,
-      select: { name: true, work_mode: true, date: true, project_name: true, hours_spent: true }
+      select: { name: true, team: true, work_mode: true, date: true, project_name: true, hours_spent: true }
     });
 
-    const makeKey = (name, work_mode) => JSON.stringify([name, work_mode]);
+    const selectedDepartment = req.query.department || 'All';
+    const selectedTeam = req.query.team || 'All';
+    const selectedEmployee = req.query.employee || 'All';
 
-    // 2) Distinct days per (name, work_mode) - normalize date to date-only string
-    const daysByKey = {};
-    records.forEach(r => {
-      if (!r.date) return;
-      const key = makeKey(r.name, r.work_mode);
-      if (!daysByKey[key]) daysByKey[key] = new Set();
-      const dateStr = r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10);
-      daysByKey[key].add(dateStr);
-    });
+    const teamToDepartment = (teamName) => {
+      const t = String(teamName || '').trim();
+      if (!t) return null;
+      if (t.startsWith('DTP') || t.startsWith('Animation')) return 'DTP';
+      if (t.startsWith('Editorial') || t.startsWith('CSMA')) return 'Editorial';
+      if (t === 'Digital_Marketing') return 'Digital Marketing';
+      return null;
+    };
 
-    // 3) Hours per (name, work_mode, project_name) for top 5 projects
-    const projectHoursByKey = {};
-    records.forEach(r => {
-      if (!r.work_mode) return;
-      const proj = r.project_name && r.project_name.trim() ? r.project_name.trim() : 'Unspecified';
-      const key = makeKey(r.name, r.work_mode);
-      if (!projectHoursByKey[key]) projectHoursByKey[key] = {};
-      projectHoursByKey[key][proj] = (projectHoursByKey[key][proj] || 0) + (r.hours_spent || 0);
-    });
+    const resolveGroup = (row) => {
+      const name = String(row?.name || '').trim();
+      const team = String(row?.team || '').trim();
+      if (!name && !team) return null;
 
-    // 4) Build employee list and workModeProjects (top 5 per mode)
-    const employeeMap = {};
-    Object.keys(daysByKey).forEach(key => {
-      const [name, mode] = JSON.parse(key);
-      if (!employeeMap[name]) {
-        employeeMap[name] = { name, workModeProjects: {} };
-        ALL_WORK_MODES.forEach(m => {
-          employeeMap[name][m] = 0;
-          employeeMap[name].workModeProjects[m] = [];
+      // Employee-level view: specific team selected (or specific employee).
+      if (selectedEmployee !== 'All' || selectedTeam !== 'All') {
+        if (!name) return null;
+        return { id: `emp:${name}\t${team}`, name, team: team || null };
+      }
+
+      // Team-level view: department selected, team = All.
+      if (selectedDepartment !== 'All') {
+        if (!team) return null;
+        return { id: `team:${team}`, name: team, team };
+      }
+
+      // Department-level view: department = All, team = All.
+      const department = teamToDepartment(team);
+      if (!department) return null;
+      return { id: `dept:${department}`, name: department, team: department };
+    };
+
+    const makeModeDateKey = (groupId, mode) => `${groupId}\t${mode}`;
+    const makeModeProjKey = (groupId, mode) => `${groupId}\t${mode}`;
+
+    const grouped = {};
+    const daysByGroupMode = {};
+    const projByGroupMode = {};
+
+    for (const r of records) {
+      const mode = ALL_WORK_MODES.includes(r.work_mode) ? r.work_mode : null;
+      if (!mode) continue;
+      const group = resolveGroup(r);
+      if (!group) continue;
+
+      if (!grouped[group.id]) {
+        grouped[group.id] = { name: group.name, team: group.team, workModeProjects: {} };
+        ALL_WORK_MODES.forEach((m) => {
+          grouped[group.id][m] = 0;
+          grouped[group.id].workModeProjects[m] = [];
         });
       }
-      const days = daysByKey[key].size;
-      if (ALL_WORK_MODES.includes(mode)) employeeMap[name][mode] = days;
-      const projMap = projectHoursByKey[key] || {};
-      const sorted = Object.entries(projMap)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 5)
-        .map(([project_name, hours]) => ({ project_name, hours }));
-      employeeMap[name].workModeProjects[mode] = sorted;
-    });
 
-    // Ensure every employee has all work modes and workModeProjects entries
-    Object.keys(employeeMap).forEach(name => {
-      ALL_WORK_MODES.forEach(mode => {
-        if (employeeMap[name][mode] === undefined) employeeMap[name][mode] = 0;
-        if (!employeeMap[name].workModeProjects[mode]) employeeMap[name].workModeProjects[mode] = [];
+      if (r.date) {
+        const d = r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10);
+        const dk = makeModeDateKey(group.id, mode);
+        if (!daysByGroupMode[dk]) daysByGroupMode[dk] = new Set();
+        daysByGroupMode[dk].add(d);
+      }
+
+      const proj = r.project_name && String(r.project_name).trim() ? String(r.project_name).trim() : 'Unspecified';
+      const pk = makeModeProjKey(group.id, mode);
+      if (!projByGroupMode[pk]) projByGroupMode[pk] = {};
+      projByGroupMode[pk][proj] = (projByGroupMode[pk][proj] || 0) + (r.hours_spent || 0);
+    }
+
+    Object.keys(grouped).forEach((gid) => {
+      ALL_WORK_MODES.forEach((mode) => {
+        const dk = makeModeDateKey(gid, mode);
+        grouped[gid][mode] = daysByGroupMode[dk]?.size || 0;
+
+        const pk = makeModeProjKey(gid, mode);
+        const sortedProjects = Object.entries(projByGroupMode[pk] || {})
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5)
+          .map(([project_name, hours]) => ({ project_name, hours }));
+        grouped[gid].workModeProjects[mode] = sortedProjects;
       });
     });
 
-    const result = Object.values(employeeMap)
-      .map(emp => {
-        const { workModeProjects, ...rest } = emp;
-        const totalDays = ALL_WORK_MODES.reduce((s, m) => s + (rest[m] || 0), 0);
-        return { ...rest, workModeProjects, totalDays };
+    let result = Object.values(grouped)
+      .map((row) => {
+        const totalDays = ALL_WORK_MODES.reduce((s, m) => s + (row[m] || 0), 0);
+        return { ...row, totalDays };
       })
-      .filter(emp => emp.totalDays > 0)
-      .sort((a, b) => b.totalDays - a.totalDays);
+      .filter((row) => row.totalDays > 0);
+
+    if (selectedDepartment === 'All' && selectedTeam === 'All' && selectedEmployee === 'All') {
+      const order = ['DTP', 'Editorial', 'Digital Marketing'];
+      result.sort((a, b) => order.indexOf(a.name) - order.indexOf(b.name));
+    } else {
+      result.sort((a, b) => b.totalDays - a.totalDays);
+    }
 
     res.json(result);
   } catch (error) {
@@ -4217,7 +4280,7 @@ app.get('/api/dashboard/employee-task-breakdown', async (req, res) => {
     // Include project-name token filters (segment/class/series) so cards update together
     const where = applyProjectTokenFilters(buildWhereClause(req), req);
     const rows = await prisma.masterDatabase.groupBy({
-      by: ['name', 'task_name'],
+      by: ['team', 'name', 'task_name'],
       _sum: { hours_spent: true, number_of_units: true },
       where: {
         ...where,
@@ -4227,6 +4290,7 @@ app.get('/api/dashboard/employee-task-breakdown', async (req, res) => {
     });
     res.json(
       rows.map((r) => ({
+        team: r.team,
         employee: r.name,
         task: r.task_name,
         hours: r._sum.hours_spent || 0,
