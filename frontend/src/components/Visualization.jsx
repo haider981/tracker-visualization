@@ -4527,6 +4527,7 @@ const Visualization = () => {
   const [employeeTaskBreakdown, setEmployeeTaskBreakdown] = useState([]);
   const [projectTaskEffort, setProjectTaskEffort] = useState([]);
   const [projectEmployeeBreakdown, setProjectEmployeeBreakdown] = useState([]);
+  const [projectGanttRows, setProjectGanttRows] = useState([]);
   const [projectTreemapChunkStart, setProjectTreemapChunkStart] = useState(0);
   const [loading, setLoading] = useState(true);
   const [lastUpdate, setLastUpdate] = useState(new Date());
@@ -4561,6 +4562,9 @@ const Visualization = () => {
   // Modal states for project details
   const [showProjectModal, setShowProjectModal] = useState(false);
   const [selectedProject, setSelectedProject] = useState(null);
+  const [ganttHover, setGanttHover] = useState(null);
+  const ganttViewportRef = useRef(null);
+  const [ganttViewportWidth, setGanttViewportWidth] = useState(0);
 
   // Filter states
   const [allTeamsFromDB, setAllTeamsFromDB] = useState([]); // All teams from database
@@ -4989,6 +4993,132 @@ const Visualization = () => {
     return { rows, stackKeys, slugToEmp, breakdownByProjEmp };
   }, [projectEmployeeBreakdown]);
 
+  const projectGanttModel = useMemo(() => {
+    const rows = Array.isArray(projectGanttRows) ? projectGanttRows : [];
+    if (!rows.length) {
+      return { projects: [], dates: [], dayWidth: 42, chartWidth: 0, rowHeights: new Map(), employeeColor: {} };
+    }
+
+    const dateSet = new Set();
+    const byProject = new Map();
+    const employeeTotals = new Map();
+
+    for (const r of rows) {
+      const project = String(r?.project || r?.project_name || '').trim();
+      const employee = String(r?.employee || r?.name || '').trim();
+      const date = String(r?.date || '').slice(0, 10);
+      if (!project || !employee || !date) continue;
+      dateSet.add(date);
+      employeeTotals.set(employee, (employeeTotals.get(employee) || 0) + (Number(r?.hours) || 0));
+
+      if (!byProject.has(project)) byProject.set(project, new Map());
+      const empMap = byProject.get(project);
+      if (!empMap.has(employee)) empMap.set(employee, new Map());
+      const dayMap = empMap.get(employee);
+
+      const existing = dayMap.get(date) || { hours: 0, tasks: new Map() };
+      existing.hours += Number(r?.hours) || 0;
+      if (Array.isArray(r?.tasks)) {
+        for (const t of r.tasks) {
+          const taskName = String(t?.task || 'Unspecified').trim() || 'Unspecified';
+          existing.tasks.set(taskName, (existing.tasks.get(taskName) || 0) + (Number(t?.hours) || 0));
+        }
+      }
+      dayMap.set(date, existing);
+    }
+
+    // Newest date should appear on the left side of the gantt.
+    const dates = Array.from(dateSet).sort((a, b) => b.localeCompare(a));
+    const idxByDate = new Map(dates.map((d, i) => [d, i]));
+    const usableWidth = Math.max(320, (Number(ganttViewportWidth) || 0) - 260);
+    const dayWidth = dates.length > 0
+      ? Math.max(12, Math.min(120, usableWidth / dates.length))
+      : 42;
+    const chartWidth = Math.max(usableWidth, dates.length * dayWidth);
+
+    const employeesByTotal = Array.from(employeeTotals.entries())
+      .sort((a, b) => b[1] - a[1])
+      .map(([emp]) => emp);
+    const employeeColor = {};
+    employeesByTotal.forEach((emp, i) => {
+      employeeColor[emp] = COLORS[i % COLORS.length];
+    });
+
+    const projects = Array.from(byProject.entries())
+      .map(([project, empMap]) => {
+        const lanes = Array.from(empMap.entries())
+          .map(([employee, dayMap]) => {
+            const dayEntries = Array.from(dayMap.entries())
+              .map(([date, v]) => ({ date, idx: idxByDate.get(date), hours: v.hours, tasks: v.tasks }))
+              .filter((d) => Number.isInteger(d.idx))
+              .sort((a, b) => a.idx - b.idx);
+
+            const segments = [];
+            let run = null;
+            for (const d of dayEntries) {
+              if (!run) {
+                run = {
+                  employee,
+                  startIdx: d.idx,
+                  endIdx: d.idx,
+                  totalHours: d.hours || 0,
+                  tasks: new Map(d.tasks),
+                };
+                continue;
+              }
+              if (d.idx === run.endIdx + 1) {
+                run.endIdx = d.idx;
+                run.totalHours += d.hours || 0;
+                for (const [tk, h] of d.tasks.entries()) run.tasks.set(tk, (run.tasks.get(tk) || 0) + h);
+              } else {
+                segments.push(run);
+                run = {
+                  employee,
+                  startIdx: d.idx,
+                  endIdx: d.idx,
+                  totalHours: d.hours || 0,
+                  tasks: new Map(d.tasks),
+                };
+              }
+            }
+            if (run) segments.push(run);
+
+            const totalHours = segments.reduce((s, seg) => s + (seg.totalHours || 0), 0);
+            return { employee, totalHours, segments };
+          })
+          .filter((l) => l.totalHours > 0)
+          .sort((a, b) => b.totalHours - a.totalHours);
+
+        const totalHours = lanes.reduce((s, l) => s + l.totalHours, 0);
+        return { project, lanes, totalHours };
+      })
+      .filter((p) => p.totalHours > 0)
+      .sort((a, b) => b.totalHours - a.totalHours);
+
+    const rowHeights = new Map(
+      projects.map((p) => [p.project, Math.max(34, p.lanes.length * 18 + 8)])
+    );
+
+    return { projects, dates, dayWidth, chartWidth, rowHeights, employeeColor };
+  }, [projectGanttRows, ganttViewportWidth]);
+
+  useEffect(() => {
+    const node = ganttViewportRef.current;
+    if (!node) return undefined;
+
+    const update = () => setGanttViewportWidth(node.clientWidth || 0);
+    update();
+
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(() => update());
+      ro.observe(node);
+      return () => ro.disconnect();
+    }
+
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
+  }, [projectGanttRows.length, selectedPeriod]);
+
   const handleTasksByEmployeeBarClick = useCallback((data) => {
     if (!data?.activePayload?.[0]) return;
     const row = data.activePayload[0].payload;
@@ -5123,6 +5253,7 @@ const Visualization = () => {
       `${API_URL}/employee-task-breakdown${urlSuffix}`,
       `${API_URL}/project-task-effort${urlSuffix}`,
       `${API_URL}/project-employee-breakdown${urlSuffix}`,
+      `${API_URL}/project-gantt${urlSuffix}`,
     ];
 
     const settled = await Promise.allSettled(endpoints.map((u) => fetch(u)));
@@ -5142,6 +5273,7 @@ const Visualization = () => {
       jt1,
       jt2,
       jt3,
+      jt4,
     ] = await Promise.all([
       responses[0] ? parseOverviewJson(responses[0]) : Promise.resolve(null),
       responses[1] ? parseArrJson(responses[1]) : Promise.resolve([]),
@@ -5156,6 +5288,7 @@ const Visualization = () => {
       responses[10] ? parseArrJson(responses[10]) : Promise.resolve([]),
       responses[11] ? parseArrJson(responses[11]) : Promise.resolve([]),
       responses[12] ? parseArrJson(responses[12]) : Promise.resolve([]),
+      responses[13] ? parseArrJson(responses[13]) : Promise.resolve([]),
     ]);
 
     return {
@@ -5173,6 +5306,7 @@ const Visualization = () => {
       employeeTaskBreakdown: jt1,
       projectTaskEffort: jt2,
       projectEmployeeBreakdown: jt3,
+      projectGanttRows: jt4,
     };
   };
 
@@ -5191,6 +5325,7 @@ const Visualization = () => {
     setEmployeeTaskBreakdown(b.employeeTaskBreakdown || []);
     setProjectTaskEffort(b.projectTaskEffort || []);
     setProjectEmployeeBreakdown(b.projectEmployeeBreakdown || []);
+    setProjectGanttRows(b.projectGanttRows || []);
   };
 
   // Initial load
@@ -6066,74 +6201,162 @@ const Visualization = () => {
             </div>
           </section>
 
-          {/* Work Activity Timeline - Smooth Stacked Area Chart by Projects */}
+          {/* Project Gantt timeline (scrollable): dates x projects, colored by employees */}
           <div className="bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-xl p-6 shadow-2xl border border-gray-700">
-            <div className="mb-4 flex items-center justify-between gap-3">
+            <div className="mb-4 flex items-center justify-between gap-3 flex-wrap">
               <h2 className="text-2xl font-bold text-white flex items-center">
-                <TrendingUp className="mr-2 text-blue-400" /> Project Activity Timeline
+                <TrendingUp className="mr-2 text-blue-400" /> Project Gantt Chart
               </h2>
-              <div className="flex items-center gap-2">
-                <select
-                  value={String(timelineChunkStart)}
-                  onChange={(e) => setTimelineChunkStart(Number(e.target.value) || 0)}
-                  className="bg-gray-700 text-gray-200 border border-gray-600 rounded-md px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                >
-                  {Array.from(
-                    { length: Math.max(1, Math.ceil((timelineTotalProjects || TIMELINE_PROJECT_CHUNK) / TIMELINE_PROJECT_CHUNK)) },
-                    (_, i) => i * TIMELINE_PROJECT_CHUNK
-                  ).map((start) => {
-                    const end = Math.min(start + TIMELINE_PROJECT_CHUNK, Math.max(timelineTotalProjects, TIMELINE_PROJECT_CHUNK));
-                    return (
-                      <option key={start} value={String(start)}>
-                        {start + 1}-{end}
-                      </option>
-                    );
-                  })}
-                </select>
-                <div className="rounded-md border border-yellow-400 bg-yellow-500/10 px-3 py-1 text-sm font-semibold text-yellow-300 whitespace-nowrap">
-                  Showing: {timelineChunkStart + 1}-{Math.min(timelineChunkStart + TIMELINE_PROJECT_CHUNK, Math.max(timelineTotalProjects, timelineChunkStart + TIMELINE_PROJECT_CHUNK))} / {timelineTotalProjects || TIMELINE_PROJECT_CHUNK}
-                </div>
+              <div className="rounded-md border border-blue-400 bg-blue-500/10 px-3 py-1 text-sm font-semibold text-blue-200 whitespace-nowrap">
+                Projects: {projectGanttModel.projects.length} · Dates: {projectGanttModel.dates.length}
               </div>
             </div>
-            <ResponsiveContainer width="100%" height={300}>
-              <AreaChart data={timeline} isAnimationActive={false}>
-                <defs>
-                  {timeline.length > 0 && timeline[0].projects && 
-                    Object.keys(timeline[0].projects).slice(0, 10).map((projectName, idx) => (
-                      <linearGradient key={projectName} id={`color${idx}`} x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor={COLORS[idx % COLORS.length]} stopOpacity={0.8}/>
-                        <stop offset="95%" stopColor={COLORS[idx % COLORS.length]} stopOpacity={0.3}/>
-                      </linearGradient>
-                    ))
-                  }
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                <XAxis dataKey="date" stroke="#9ca3af" fontSize={12} />
-                <YAxis stroke="#9ca3af" />
-                <Tooltip 
-                  content={<CustomTooltip />}
-                  wrapperStyle={{ zIndex: 1000, outline: 'none' }}
-                  contentStyle={{ backgroundColor: 'rgb(17 24 39)', opacity: 1 }}
-                  allowEscapeViewBox={{ x: false, y: true }}
-                  position={{ y: 0 }}
-                />
-                <Legend wrapperStyle={{ paddingTop: '10px' }} />
-                {timeline.length > 0 && timeline[0].projects && 
-                  Object.keys(timeline[0].projects).slice(0, 10).map((projectName, idx) => (
-                    <Area
-                      key={projectName}
-                      type="monotone"
-                      dataKey={`projects.${projectName}`}
-                      stackId="1"
-                      stroke={COLORS[idx % COLORS.length]}
-                      fill={`url(#color${idx})`}
-                      name={projectName}
-                      isAnimationActive={false}
-                    />
-                  ))
-                }
-              </AreaChart>
-            </ResponsiveContainer>
+            <p className="text-gray-400 text-xs mb-3">
+              X-axis: dates · Y-axis: projects · segment colors: employees. Hover a segment for total hours and task breakdown.
+            </p>
+
+            {projectGanttModel.projects.length > 0 && projectGanttModel.dates.length > 0 ? (
+              <div ref={ganttViewportRef} className="overflow-auto max-h-[560px] rounded-lg border border-gray-700 bg-gray-900/50">
+                <div
+                  style={{
+                    minWidth: `${260 + projectGanttModel.chartWidth}px`,
+                  }}
+                >
+                  <div className="sticky top-0 z-20 flex border-b border-gray-700 bg-gray-900/95 backdrop-blur">
+                    <div className="sticky left-0 z-30 w-[260px] px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-300 border-r border-gray-700 bg-gray-900/95">
+                      Projects
+                    </div>
+                    <div className="relative" style={{ width: `${projectGanttModel.chartWidth}px` }}>
+                      <div className="flex">
+                        {projectGanttModel.dates.map((d) => (
+                          <div
+                            key={d}
+                            className="border-r border-gray-800 px-1 py-2 text-[10px] text-gray-400 text-center shrink-0"
+                            style={{ width: `${projectGanttModel.dayWidth}px` }}
+                          >
+                            {new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  {projectGanttModel.projects.map((proj) => {
+                    const rowHeight = projectGanttModel.rowHeights.get(proj.project) || 34;
+                    return (
+                      <div key={proj.project} className="flex border-b border-gray-800/80">
+                        <div
+                          className="sticky left-0 z-10 w-[260px] border-r border-gray-700 bg-gray-900/95 px-3 py-2 text-xs text-gray-200"
+                          style={{ minHeight: `${rowHeight}px` }}
+                          title={proj.project}
+                        >
+                          <div className="font-semibold truncate">{proj.project}</div>
+                          <div className="text-[10px] text-gray-400 mt-1">{proj.totalHours.toFixed(1)} hrs</div>
+                        </div>
+                        <div
+                          className="relative"
+                          style={{ width: `${projectGanttModel.chartWidth}px`, minHeight: `${rowHeight}px` }}
+                        >
+                          {projectGanttModel.dates.map((d, idx) => (
+                            <div
+                              key={`${proj.project}-${d}`}
+                              className="absolute top-0 bottom-0 border-r border-gray-800/70"
+                              style={{
+                                left: `${idx * projectGanttModel.dayWidth}px`,
+                                width: `${projectGanttModel.dayWidth}px`,
+                              }}
+                            />
+                          ))}
+
+                          {proj.lanes.map((lane, laneIdx) =>
+                            lane.segments.map((seg, segIdx) => {
+                              const left = seg.startIdx * projectGanttModel.dayWidth + 1;
+                              const width = (seg.endIdx - seg.startIdx + 1) * projectGanttModel.dayWidth - 2;
+                              const top = laneIdx * 18 + 4;
+                              const tasksArr = Array.from(seg.tasks.entries())
+                                .map(([task, hours]) => ({ task, hours }))
+                                .sort((a, b) => (b.hours || 0) - (a.hours || 0));
+                              return (
+                                <div
+                                  key={`${proj.project}-${lane.employee}-${segIdx}-${seg.startIdx}`}
+                                  className="absolute rounded-sm border border-black/20 cursor-pointer"
+                                  style={{
+                                    left: `${left}px`,
+                                    top: `${top}px`,
+                                    width: `${Math.max(10, width)}px`,
+                                    height: '14px',
+                                    backgroundColor: projectGanttModel.employeeColor[lane.employee] || '#8b5cf6',
+                                  }}
+                                  onMouseEnter={(e) =>
+                                    setGanttHover({
+                                      anchorX: e.currentTarget.getBoundingClientRect().right,
+                                      anchorY: e.currentTarget.getBoundingClientRect().top + (e.currentTarget.getBoundingClientRect().height / 2),
+                                      project: proj.project,
+                                      employee: lane.employee,
+                                      from: [projectGanttModel.dates[seg.startIdx], projectGanttModel.dates[seg.endIdx]].sort((a, b) => a.localeCompare(b))[0],
+                                      to: [projectGanttModel.dates[seg.startIdx], projectGanttModel.dates[seg.endIdx]].sort((a, b) => b.localeCompare(a))[0],
+                                      hours: seg.totalHours || 0,
+                                      tasks: tasksArr,
+                                    })
+                                  }
+                                  onMouseMove={(e) =>
+                                    {
+                                      const rect = e.currentTarget?.getBoundingClientRect?.();
+                                      if (!rect) return;
+                                      setGanttHover((prev) =>
+                                        prev
+                                          ? {
+                                              ...prev,
+                                              anchorX: rect.right,
+                                              anchorY: rect.top + (rect.height / 2),
+                                            }
+                                          : prev
+                                      );
+                                    }
+                                  }
+                                  onMouseLeave={() => setGanttHover(null)}
+                                  title={`${lane.employee} · ${(seg.totalHours || 0).toFixed(1)} hrs`}
+                                />
+                              );
+                            })
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : (
+              <div className="h-[220px] flex items-center justify-center text-gray-500 text-sm rounded-lg border border-gray-700">
+                No project timeline data for current filters.
+              </div>
+            )}
+
+            {ganttHover && (
+              <div
+                className="fixed z-[11000] max-w-sm rounded-lg border border-indigo-500 bg-gray-900 p-3 shadow-2xl text-xs"
+                style={{
+                  left: `${Math.min((ganttHover.anchorX || 0) + 10, window.innerWidth - 330)}px`,
+                  top: `${Math.max(8, Math.min((ganttHover.anchorY || 0) - 95, window.innerHeight - 240))}px`,
+                  pointerEvents: 'none',
+                }}
+              >
+                <p className="text-white font-semibold break-words">{ganttHover.project}</p>
+                <p className="text-indigo-300 mt-1">Employee: <span className="text-white">{ganttHover.employee}</span></p>
+                <p className="text-gray-300">Range: {ganttHover.from} to {ganttHover.to}</p>
+                <p className="text-purple-300 font-semibold mt-1">Total: {Number(ganttHover.hours || 0).toFixed(2)} hrs</p>
+                <div className="mt-2 border-t border-gray-700 pt-2 max-h-28 overflow-y-auto custom-scrollbar">
+                  {ganttHover.tasks?.slice(0, 8).map((t, i) => (
+                    <p key={`${t.task}-${i}`} className="text-gray-300">
+                      {t.task} = <span className="text-white font-semibold">{(Number(t.hours) || 0).toFixed(2)} hrs</span>
+                    </p>
+                  ))}
+                  {(ganttHover.tasks?.length || 0) > 8 && (
+                    <p className="text-gray-500 italic">+ {(ganttHover.tasks.length || 0) - 8} more tasks</p>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Project Contribution: effort treemap + project vs employee stacked */}

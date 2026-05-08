@@ -45,5 +45,6 @@ router.get('/employee-task-breakdown', controller.getEmployeeTaskBreakdown);
 router.get('/project-task-effort', controller.getProjectTaskEffort);
 router.get('/project-employee-breakdown', controller.getProjectEmployeeBreakdown);
 router.get('/employee-performance-over-time', controller.getEmployeePerformanceOverTime);
+router.get('/project-gantt', controller.getProjectGantt);
 
 module.exports = router;

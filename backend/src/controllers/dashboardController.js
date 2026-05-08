@@ -886,3 +886,58 @@ exports.getEmployeePerformanceOverTime = async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 };
+
+/** Day-level rows: project x employee x date with task-hour breakdown (for Gantt chart). */
+exports.getProjectGantt = async (req, res) => {
+  try {
+    const where = buildWhereClause(req);
+    const rows = await prisma.masterDatabase.groupBy({
+      by: ['project_name', 'name', 'date', 'task_name'],
+      _sum: { hours_spent: true },
+      where: {
+        ...where,
+        date: { not: null },
+        project_name: { not: null, notIn: ['', ' ', 'blank', 'Blank', 'BLANK'] },
+        name: { notIn: ['', ' '] }
+      },
+      orderBy: [{ project_name: 'asc' }, { date: 'asc' }, { name: 'asc' }]
+    });
+
+    const byDay = new Map();
+    for (const r of rows) {
+      const dateStr = r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10);
+      const key = `${r.project_name}\t${r.name}\t${dateStr}`;
+      if (!byDay.has(key)) {
+        byDay.set(key, {
+          project: r.project_name,
+          employee: r.name,
+          date: dateStr,
+          hours: 0,
+          tasks: []
+        });
+      }
+      const row = byDay.get(key);
+      const h = Number(r?._sum?.hours_spent) || 0;
+      row.hours += h;
+      row.tasks.push({
+        task: r.task_name,
+        hours: h
+      });
+    }
+
+    const payload = Array.from(byDay.values()).map((r) => ({
+      ...r,
+      tasks: r.tasks.sort((a, b) => (b.hours || 0) - (a.hours || 0))
+    }));
+
+    payload.sort((a, b) => {
+      if (a.project !== b.project) return String(a.project).localeCompare(String(b.project));
+      if (a.date !== b.date) return String(a.date).localeCompare(String(b.date));
+      return String(a.employee).localeCompare(String(b.employee));
+    });
+
+    res.json(payload);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};

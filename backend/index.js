@@ -2974,6 +2974,52 @@ app.use(cors());
 app.use(express.json());
 
 // Helper function to build where clause from query params
+function getPeriodDateRange(periodRaw) {
+  const raw = String(periodRaw || '').trim();
+  if (!raw || raw.toLowerCase() === 'all') return null;
+
+  const normalized = raw.toLowerCase().replace(/\s+/g, ' ');
+  const now = new Date();
+  const start = new Date(now);
+  const end = new Date(now);
+
+  switch (normalized) {
+    case 'last 7 days':
+    case 'last 7 day':
+    case '7d':
+      start.setDate(start.getDate() - 7);
+      break;
+    case 'last 30 days':
+    case 'last 30 day':
+    case '30d':
+      start.setDate(start.getDate() - 30);
+      break;
+    case 'last 3 months':
+    case '3m':
+      start.setMonth(start.getMonth() - 3);
+      break;
+    case 'last 6 months':
+    case '6m':
+      start.setMonth(start.getMonth() - 6);
+      break;
+    case 'last year':
+    case '12m':
+    case '1y':
+      start.setMonth(start.getMonth() - 12);
+      break;
+    case 'this year':
+      start.setFullYear(start.getFullYear(), 0, 1);
+      break;
+    default:
+      return null;
+  }
+
+  // Keep period day-aligned and bounded to "today".
+  start.setHours(0, 0, 0, 0);
+  end.setHours(23, 59, 59, 999);
+  return { start, end };
+}
+
 function buildWhereClause(req) {
   const where = {};
   
@@ -3011,35 +3057,13 @@ function buildWhereClause(req) {
     where.name = req.query.employee;
   }
   
-  // Period filter
-  if (req.query.period && req.query.period !== 'All') {
-    const now = new Date();
-    let startDate;
-    
-    switch(req.query.period) {
-      case 'Last 7 Days':
-        startDate = new Date(now.setDate(now.getDate() - 7));
-        break;
-      case 'Last 30 Days':
-        startDate = new Date(now.setDate(now.getDate() - 30));
-        break;
-      case 'Last 3 Months':
-        startDate = new Date(now.setMonth(now.getMonth() - 3));
-        break;
-      case 'Last 6 Months':
-        startDate = new Date(now.setMonth(now.getMonth() - 6));
-        break;
-      case 'Last Year':
-        startDate = new Date(now.setMonth(now.getMonth() - 12));
-        break;
-      case 'This Year':
-        startDate = new Date(now.getFullYear(), 0, 1);
-        break;
-    }
-    
-    if (startDate) {
-      where.date = { gte: startDate };
-    }
+  // Period filter (strictly bounded date range, case-insensitive values)
+  const periodRange = getPeriodDateRange(req.query.period);
+  if (periodRange) {
+    where.date = {
+      gte: periodRange.start,
+      lte: periodRange.end
+    };
   }
   
   return where;
@@ -4411,6 +4435,61 @@ app.get('/api/dashboard/employee-performance-over-time', async (req, res) => {
         };
       })
     );
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Project Gantt rows (project x employee x date with task-hour breakdown)
+app.get('/api/dashboard/project-gantt', async (req, res) => {
+  try {
+    // Include project-name token filters (segment/class/series)
+    const where = applyProjectTokenFilters(buildWhereClause(req), req);
+    const rows = await prisma.masterDatabase.groupBy({
+      by: ['project_name', 'name', 'date', 'task_name'],
+      _sum: { hours_spent: true },
+      where: {
+        ...where,
+        project_name: { not: null, notIn: ['', ' ', 'blank', 'Blank', 'BLANK'] },
+        name: { notIn: ['', ' '] }
+      },
+      orderBy: [{ project_name: 'asc' }, { date: 'asc' }, { name: 'asc' }]
+    });
+
+    const byDay = new Map();
+    for (const r of rows) {
+      const dateStr = r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10);
+      const key = `${r.project_name}\t${r.name}\t${dateStr}`;
+      if (!byDay.has(key)) {
+        byDay.set(key, {
+          project: r.project_name,
+          employee: r.name,
+          date: dateStr,
+          hours: 0,
+          tasks: []
+        });
+      }
+      const row = byDay.get(key);
+      const h = Number(r?._sum?.hours_spent) || 0;
+      row.hours += h;
+      row.tasks.push({
+        task: String(r.task_name || 'Unspecified'),
+        hours: h
+      });
+    }
+
+    const payload = Array.from(byDay.values()).map((r) => ({
+      ...r,
+      tasks: r.tasks.sort((a, b) => (b.hours || 0) - (a.hours || 0))
+    }));
+
+    payload.sort((a, b) => {
+      if (a.project !== b.project) return String(a.project).localeCompare(String(b.project));
+      if (a.date !== b.date) return String(a.date).localeCompare(String(b.date));
+      return String(a.employee).localeCompare(String(b.employee));
+    });
+
+    res.json(payload);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
