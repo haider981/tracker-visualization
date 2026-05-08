@@ -4042,6 +4042,8 @@ TaskPieTooltip.displayName = 'TaskPieTooltip';
 
 const PROJECT_TREEMAP_CHUNK = 7;
 const TIMELINE_PROJECT_CHUNK = 10;
+const GANTT_PROJECT_COL_W = 260;
+const GANTT_EMP_COL_W = 170;
 
 /** Interpolate blue scale: white (0) -> dark blue (high) */
 function purpleHeatAlpha(t) {
@@ -4563,6 +4565,7 @@ const Visualization = () => {
   const [showProjectModal, setShowProjectModal] = useState(false);
   const [selectedProject, setSelectedProject] = useState(null);
   const [ganttHover, setGanttHover] = useState(null);
+  const [ganttSortMode, setGanttSortMode] = useState('hours');
   const ganttViewportRef = useRef(null);
   const [ganttViewportWidth, setGanttViewportWidth] = useState(0);
 
@@ -4996,7 +4999,7 @@ const Visualization = () => {
   const projectGanttModel = useMemo(() => {
     const rows = Array.isArray(projectGanttRows) ? projectGanttRows : [];
     if (!rows.length) {
-      return { projects: [], dates: [], dayWidth: 42, chartWidth: 0, rowHeights: new Map(), employeeColor: {} };
+      return { projects: [], dates: [], dayWidth: 42, chartWidth: 0, rowHeights: new Map(), employeeColor: {}, taskColor: {} };
     }
 
     const dateSet = new Set();
@@ -5030,7 +5033,7 @@ const Visualization = () => {
     // Newest date should appear on the left side of the gantt.
     const dates = Array.from(dateSet).sort((a, b) => b.localeCompare(a));
     const idxByDate = new Map(dates.map((d, i) => [d, i]));
-    const usableWidth = Math.max(320, (Number(ganttViewportWidth) || 0) - 260);
+    const usableWidth = Math.max(320, (Number(ganttViewportWidth) || 0) - GANTT_PROJECT_COL_W - GANTT_EMP_COL_W);
     const dayWidth = dates.length > 0
       ? Math.max(12, Math.min(120, usableWidth / dates.length))
       : 42;
@@ -5043,6 +5046,20 @@ const Visualization = () => {
     employeesByTotal.forEach((emp, i) => {
       employeeColor[emp] = COLORS[i % COLORS.length];
     });
+    const taskTotals = new Map();
+    for (const r of rows) {
+      if (!Array.isArray(r?.tasks)) continue;
+      for (const t of r.tasks) {
+        const tk = String(t?.task || 'Unspecified').trim() || 'Unspecified';
+        taskTotals.set(tk, (taskTotals.get(tk) || 0) + (Number(t?.hours) || 0));
+      }
+    }
+    const taskColor = {};
+    Array.from(taskTotals.entries())
+      .sort((a, b) => b[1] - a[1])
+      .forEach(([task], i) => {
+        taskColor[task] = COLORS[i % COLORS.length];
+      });
 
     const projects = Array.from(byProject.entries())
       .map(([project, empMap]) => {
@@ -5084,23 +5101,33 @@ const Visualization = () => {
             if (run) segments.push(run);
 
             const totalHours = segments.reduce((s, seg) => s + (seg.totalHours || 0), 0);
-            return { employee, totalHours, segments };
+            const lastIdx = segments.length ? Math.max(...segments.map((seg) => seg.startIdx)) : -1;
+            return { employee, totalHours, segments, lastIdx };
           })
           .filter((l) => l.totalHours > 0)
           .sort((a, b) => b.totalHours - a.totalHours);
 
         const totalHours = lanes.reduce((s, l) => s + l.totalHours, 0);
-        return { project, lanes, totalHours };
+        const mostRecentIdx = lanes.length ? Math.max(...lanes.map((l) => l.lastIdx)) : -1;
+        return { project, lanes, totalHours, mostRecentIdx };
       })
-      .filter((p) => p.totalHours > 0)
-      .sort((a, b) => b.totalHours - a.totalHours);
+      .filter((p) => p.totalHours > 0);
+
+    projects.sort((a, b) => {
+      if (ganttSortMode === 'recent') {
+        if (b.mostRecentIdx !== a.mostRecentIdx) return b.mostRecentIdx - a.mostRecentIdx;
+        return b.totalHours - a.totalHours;
+      }
+      if (b.totalHours !== a.totalHours) return b.totalHours - a.totalHours;
+      return b.mostRecentIdx - a.mostRecentIdx;
+    });
 
     const rowHeights = new Map(
       projects.map((p) => [p.project, Math.max(34, p.lanes.length * 18 + 8)])
     );
 
-    return { projects, dates, dayWidth, chartWidth, rowHeights, employeeColor };
-  }, [projectGanttRows, ganttViewportWidth]);
+    return { projects, dates, dayWidth, chartWidth, rowHeights, employeeColor, taskColor };
+  }, [projectGanttRows, ganttViewportWidth, ganttSortMode]);
 
   useEffect(() => {
     const node = ganttViewportRef.current;
@@ -6207,8 +6234,26 @@ const Visualization = () => {
               <h2 className="text-2xl font-bold text-white flex items-center">
                 <TrendingUp className="mr-2 text-blue-400" /> Project Gantt Chart
               </h2>
-              <div className="rounded-md border border-blue-400 bg-blue-500/10 px-3 py-1 text-sm font-semibold text-blue-200 whitespace-nowrap">
-                Projects: {projectGanttModel.projects.length} · Dates: {projectGanttModel.dates.length}
+              <div className="flex items-center gap-3 flex-wrap">
+                <div className="inline-flex rounded-lg border border-gray-600 overflow-hidden text-xs font-semibold">
+                  <button
+                    type="button"
+                    className={`px-3 py-1.5 ${ganttSortMode === 'hours' ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+                    onClick={() => setGanttSortMode('hours')}
+                  >
+                    Sort: Hours
+                  </button>
+                  <button
+                    type="button"
+                    className={`px-3 py-1.5 border-l border-gray-600 ${ganttSortMode === 'recent' ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+                    onClick={() => setGanttSortMode('recent')}
+                  >
+                    Sort: Most recent
+                  </button>
+                </div>
+                <div className="rounded-md border border-blue-400 bg-blue-500/10 px-3 py-1 text-sm font-semibold text-blue-200 whitespace-nowrap">
+                  Projects: {projectGanttModel.projects.length} · Dates: {projectGanttModel.dates.length}
+                </div>
               </div>
             </div>
             <p className="text-gray-400 text-xs mb-3">
@@ -6219,12 +6264,15 @@ const Visualization = () => {
               <div ref={ganttViewportRef} className="overflow-auto max-h-[560px] rounded-lg border border-gray-700 bg-gray-900/50">
                 <div
                   style={{
-                    minWidth: `${260 + projectGanttModel.chartWidth}px`,
+                    minWidth: `${GANTT_PROJECT_COL_W + GANTT_EMP_COL_W + projectGanttModel.chartWidth}px`,
                   }}
                 >
-                  <div className="sticky top-0 z-20 flex border-b border-gray-700 bg-gray-900/95 backdrop-blur">
-                    <div className="sticky left-0 z-30 w-[260px] px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-300 border-r border-gray-700 bg-gray-900/95">
+                  <div className="sticky top-0 z-20 flex border-b-2 border-indigo-500/50 bg-gray-900/95 backdrop-blur">
+                    <div className="sticky left-0 z-30 w-[260px] px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-300 border-r-2 border-indigo-500/35 bg-gray-900/95">
                       Projects
+                    </div>
+                    <div className="sticky left-[260px] z-30 w-[170px] px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-300 border-r-2 border-indigo-500/35 bg-gray-900/95">
+                      Employee
                     </div>
                     <div className="relative" style={{ width: `${projectGanttModel.chartWidth}px` }}>
                       <div className="flex">
@@ -6244,14 +6292,29 @@ const Visualization = () => {
                   {projectGanttModel.projects.map((proj) => {
                     const rowHeight = projectGanttModel.rowHeights.get(proj.project) || 34;
                     return (
-                      <div key={proj.project} className="flex border-b border-gray-800/80">
+                      <div key={proj.project} className="flex border-b-2 border-indigo-600/45">
                         <div
-                          className="sticky left-0 z-10 w-[260px] border-r border-gray-700 bg-gray-900/95 px-3 py-2 text-xs text-gray-200"
+                          className="sticky left-0 z-10 w-[260px] border-r-2 border-indigo-500/35 bg-gray-900/95 px-3 py-2 text-xs text-gray-200"
                           style={{ minHeight: `${rowHeight}px` }}
                           title={proj.project}
                         >
                           <div className="font-semibold truncate">{proj.project}</div>
                           <div className="text-[10px] text-gray-400 mt-1">{proj.totalHours.toFixed(1)} hrs</div>
+                        </div>
+                        <div
+                          className="sticky left-[260px] z-10 w-[170px] border-r-2 border-indigo-500/35 bg-gray-900/95 px-2 text-[11px] text-gray-300 relative"
+                          style={{ minHeight: `${rowHeight}px` }}
+                        >
+                          {proj.lanes.map((lane, laneIdx) => (
+                            <div
+                              key={`${proj.project}-${lane.employee}-label`}
+                              className="absolute truncate pr-2"
+                              style={{ top: `${laneIdx * 18 + 2}px`, left: '8px', right: '8px', height: '16px' }}
+                              title={lane.employee}
+                            >
+                              {lane.employee}
+                            </div>
+                          ))}
                         </div>
                         <div
                           className="relative"
@@ -6279,13 +6342,13 @@ const Visualization = () => {
                               return (
                                 <div
                                   key={`${proj.project}-${lane.employee}-${segIdx}-${seg.startIdx}`}
-                                  className="absolute rounded-sm border border-black/20 cursor-pointer"
+                                  className="absolute border border-black/20 cursor-pointer overflow-hidden"
                                   style={{
                                     left: `${left}px`,
                                     top: `${top}px`,
                                     width: `${Math.max(10, width)}px`,
                                     height: '14px',
-                                    backgroundColor: projectGanttModel.employeeColor[lane.employee] || '#8b5cf6',
+                                    backgroundColor: 'rgba(30,41,59,0.95)',
                                   }}
                                   onMouseEnter={(e) =>
                                     setGanttHover({
@@ -6316,7 +6379,25 @@ const Visualization = () => {
                                   }
                                   onMouseLeave={() => setGanttHover(null)}
                                   title={`${lane.employee} · ${(seg.totalHours || 0).toFixed(1)} hrs`}
-                                />
+                                >
+                                  <div className="flex h-full w-full">
+                                    {tasksArr.map((taskPart, i) => {
+                                      const taskHours = Number(taskPart.hours) || 0;
+                                      const pct = (seg.totalHours || 0) > 0 ? (taskHours / seg.totalHours) * 100 : 0;
+                                      return (
+                                        <div
+                                          key={`${proj.project}-${lane.employee}-${segIdx}-${taskPart.task}-${i}`}
+                                          className="h-full"
+                                          style={{
+                                            width: `${Math.max(2, pct)}%`,
+                                            backgroundColor: projectGanttModel.taskColor[taskPart.task] || COLORS[i % COLORS.length],
+                                          }}
+                                          title={`${taskPart.task}: ${taskHours.toFixed(2)} hrs`}
+                                        />
+                                      );
+                                    })}
+                                  </div>
+                                </div>
                               );
                             })
                           )}
@@ -6335,11 +6416,22 @@ const Visualization = () => {
             {ganttHover && (
               <div
                 className="fixed z-[11000] max-w-sm rounded-lg border border-indigo-500 bg-gray-900 p-3 shadow-2xl text-xs"
-                style={{
-                  left: `${Math.min((ganttHover.anchorX || 0) + 10, window.innerWidth - 330)}px`,
-                  top: `${Math.max(8, Math.min((ganttHover.anchorY || 0) - 95, window.innerHeight - 240))}px`,
-                  pointerEvents: 'none',
-                }}
+                style={(() => {
+                  const tooltipW = 330;
+                  const tooltipH = 240;
+                  const anchorX = Number(ganttHover.anchorX || 0);
+                  const anchorY = Number(ganttHover.anchorY || 0);
+                  const preferRight = anchorX + 12 + tooltipW <= window.innerWidth - 8;
+                  const left = preferRight
+                    ? anchorX + 12
+                    : Math.max(8, anchorX - tooltipW - 12);
+                  const top = Math.max(8, Math.min(anchorY - tooltipH / 2, window.innerHeight - tooltipH - 8));
+                  return {
+                    left: `${left}px`,
+                    top: `${top}px`,
+                    pointerEvents: 'none',
+                  };
+                })()}
               >
                 <p className="text-white font-semibold break-words">{ganttHover.project}</p>
                 <p className="text-indigo-300 mt-1">Employee: <span className="text-white">{ganttHover.employee}</span></p>
