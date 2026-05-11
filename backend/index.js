@@ -3028,7 +3028,8 @@ function buildWhereClause(req) {
     if (req.query.department === 'DTP') {
       where.OR = [
         { team: { startsWith: 'DTP' } },
-        { team: { startsWith: 'Animation' } }
+        { team: { startsWith: 'Animation' } },
+        { team: 'Animation_Maths' }
       ];
     } else if (req.query.department === 'Editorial') {
       where.OR = [
@@ -4779,6 +4780,56 @@ app.get('/api/dashboard/project-view/timeline', async (req, res) => {
     const timeline = Object.values(dateMap).sort((a, b) => a.date.localeCompare(b.date));
 
     res.json({ timeline, tasks: allTasks });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Project Gantt: day-level rows for selected project(s) — task × employee hours (same filters as timeline)
+app.get('/api/dashboard/project-view/gantt', async (req, res) => {
+  try {
+    const where = buildProjectViewWhere(req);
+
+    let dateFilter = {};
+    let periodStartDate = null;
+    if (req.query.period && req.query.period !== 'All') {
+      const now = new Date();
+      let startDate;
+      switch (req.query.period) {
+        case 'Last 7 Days':   startDate = new Date(now); startDate.setDate(startDate.getDate() - 7); break;
+        case 'Last 30 Days':  startDate = new Date(now); startDate.setDate(startDate.getDate() - 30); break;
+        case 'Last 3 Months': startDate = new Date(now); startDate.setMonth(startDate.getMonth() - 3); break;
+        case 'Last 6 Months': startDate = new Date(now); startDate.setMonth(startDate.getMonth() - 6); break;
+        case 'Last Year':     startDate = new Date(now); startDate.setMonth(startDate.getMonth() - 12); break;
+        case 'This Year':     startDate = new Date(now.getFullYear(), 0, 1); break;
+      }
+      if (startDate) {
+        periodStartDate = new Date(startDate);
+        periodStartDate.setHours(0, 0, 0, 0);
+        dateFilter = { gte: periodStartDate };
+      }
+    }
+
+    const rows = await prisma.masterDatabase.groupBy({
+      by: ['project_name', 'date', 'task_name', 'name'],
+      _sum: { hours_spent: true },
+      where: {
+        ...where,
+        date: { ...dateFilter, not: null },
+        name: { notIn: ['', ' '] }
+      },
+      orderBy: [{ date: 'asc' }, { project_name: 'asc' }, { task_name: 'asc' }, { name: 'asc' }]
+    });
+
+    const payload = rows.map((r) => ({
+      project_name: r.project_name,
+      date: r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10),
+      task_name: r.task_name && String(r.task_name).trim() ? r.task_name : 'Unspecified',
+      employee: r.name && String(r.name).trim() ? r.name : 'Unassigned',
+      hours: Number(r._sum?.hours_spent) || 0
+    })).filter((x) => x.hours > 0);
+
+    res.json(payload);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

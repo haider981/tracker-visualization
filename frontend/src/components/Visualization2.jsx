@@ -627,10 +627,10 @@ const API_URL = `${BACKEND_URL}/api/dashboard`;
 
 // 30 distinct colours — enough to cover all task types without collisions
 const TASK_COLORS = [
-  '#8b5cf6','#ec4899','#f59e0b','#10b981','#3b82f6','#ef4444','#14b8a6','#f97316',
-  '#6366f1','#84cc16','#06b6d4','#e11d48','#d97706','#0891b2','#7c3aed','#059669',
-  '#dc2626','#2563eb','#ca8a04','#16a34a','#9333ea','#db2777','#ea580c','#0284c7',
-  '#4f46e5','#65a30d','#0e7490','#be123c','#b45309','#15803d'
+  '#8b5cf6', '#ec4899', '#f59e0b', '#10b981', '#3b82f6', '#ef4444', '#14b8a6', '#f97316',
+  '#6366f1', '#84cc16', '#06b6d4', '#e11d48', '#d97706', '#0891b2', '#7c3aed', '#059669',
+  '#dc2626', '#2563eb', '#ca8a04', '#16a34a', '#9333ea', '#db2777', '#ea580c', '#0284c7',
+  '#4f46e5', '#65a30d', '#0e7490', '#be123c', '#b45309', '#15803d'
 ];
 
 function projectDashTabFromPath(pathname) {
@@ -641,9 +641,9 @@ function projectDashTabFromPath(pathname) {
 
 // Department → team-name matcher  (same logic as Visualization.jsx)
 const DEPARTMENT_TEAM_MAPPING = {
-  DTP:              t => t.startsWith('DTP') || t.startsWith('Animation'),
-  Editorial:        t => t.startsWith('Editorial') || t.startsWith('CSMA'),
-  'Digital Marketing': t => t === 'Digital_Marketing'
+  'DTP': (teamName) => teamName.startsWith('DTP') || teamName.startsWith('Animation'),
+  'Editorial': (teamName) => teamName.startsWith('Editorial') || teamName.startsWith('CSMA') || teamName.startsWith('University'),
+  'Digital Marketing': (teamName) => teamName === 'Digital_Marketing'
 };
 
 // ─── helper: build a stable colour map from a task-name list ───
@@ -651,6 +651,162 @@ function buildColorMap(taskNames) {
   const map = {};
   taskNames.forEach((name, i) => { map[name] = TASK_COLORS[i % TASK_COLORS.length]; });
   return map;
+}
+
+function buildEmployeeColorMap(employeeNames) {
+  const map = {};
+  [...employeeNames].sort((a, b) => a.localeCompare(b)).forEach((name, i) => {
+    map[name] = TASK_COLORS[i % TASK_COLORS.length];
+  });
+  return map;
+}
+
+function tryParseJson(text) {
+  const t = String(text ?? '').trim();
+  if (!t) return null;
+  try {
+    return JSON.parse(t);
+  } catch {
+    return null;
+  }
+}
+
+/** Ensures dashboard list endpoints never assign a non-array to React state. */
+function asJsonArray(payload) {
+  return Array.isArray(payload) ? payload : [];
+}
+
+function getIsoDateKey(dateObj) {
+  return dateObj.toISOString().slice(0, 10);
+}
+
+function getWeekStartMonday(dateObj) {
+  const d = new Date(dateObj);
+  d.setHours(0, 0, 0, 0);
+  const day = d.getDay(); // 0 Sunday ... 6 Saturday
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diff);
+  return d;
+}
+
+function formatRangeLabel(start, end) {
+  const s = start.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const e = end.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  return `${s} - ${e}`;
+}
+
+/**
+ * Build descending X-axis buckets for gantt time scale.
+ * datesDesc contains ISO date keys sorted newest -> oldest.
+ */
+function buildGanttBuckets(datesDesc, timeScale) {
+  const uniqueDates = [...new Set(datesDesc)];
+  const asc = [...uniqueDates].sort((a, b) => a.localeCompare(b));
+
+  if (timeScale === 'Day') {
+    const buckets = uniqueDates.map((iso) => {
+      const [y, m, d] = iso.split('-').map(Number);
+      const dt = new Date(y, (m || 1) - 1, d || 1);
+      return {
+        key: iso,
+        label: dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+      };
+    });
+    const lookup = new Map(uniqueDates.map((d) => [d, d]));
+    return { buckets, dateToBucketKey: lookup };
+  }
+
+  if (timeScale === 'Month') {
+    const monthMap = new Map();
+    asc.forEach((iso) => {
+      const [y, m, d] = iso.split('-').map(Number);
+      const dt = new Date(y, (m || 1) - 1, d || 1);
+      const key = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`;
+      if (!monthMap.has(key)) {
+        const first = new Date(dt.getFullYear(), dt.getMonth(), 1);
+        monthMap.set(key, {
+          key,
+          start: first,
+          label: first.toLocaleDateString(undefined, { month: 'short', year: 'numeric' })
+        });
+      }
+    });
+    const buckets = [...monthMap.values()].sort((a, b) => b.key.localeCompare(a.key));
+    const lookup = new Map();
+    asc.forEach((iso) => {
+      const [y, m, d] = iso.split('-').map(Number);
+      const dt = new Date(y, (m || 1) - 1, d || 1);
+      const key = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`;
+      lookup.set(iso, key);
+    });
+    return { buckets, dateToBucketKey: lookup };
+  }
+
+  // Week
+  const weekMap = new Map();
+  asc.forEach((iso) => {
+    const [y, m, d] = iso.split('-').map(Number);
+    const dt = new Date(y, (m || 1) - 1, d || 1);
+    const start = getWeekStartMonday(dt);
+    const key = getIsoDateKey(start);
+    if (!weekMap.has(key)) {
+      const end = new Date(start);
+      end.setDate(end.getDate() + 6);
+      weekMap.set(key, {
+        key,
+        start,
+        end,
+        label: formatRangeLabel(start, end)
+      });
+    }
+  });
+  const buckets = [...weekMap.values()].sort((a, b) => b.key.localeCompare(a.key));
+  const lookup = new Map();
+  asc.forEach((iso) => {
+    const [y, m, d] = iso.split('-').map(Number);
+    const dt = new Date(y, (m || 1) - 1, d || 1);
+    const key = getIsoDateKey(getWeekStartMonday(dt));
+    lookup.set(iso, key);
+  });
+  return { buckets, dateToBucketKey: lookup };
+}
+
+/** Calendar day keys from period filter (ascending), aligned with project-view timeline API */
+function getPeriodDateKeysAscending(period) {
+  if (!period || period === 'All') return null;
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  let start = new Date(now);
+  switch (period) {
+    case 'Last 7 Days':
+      start.setDate(start.getDate() - 7);
+      break;
+    case 'Last 30 Days':
+      start.setDate(start.getDate() - 30);
+      break;
+    case 'Last 3 Months':
+      start.setMonth(start.getMonth() - 3);
+      break;
+    case 'Last 6 Months':
+      start.setMonth(start.getMonth() - 6);
+      break;
+    case 'Last Year':
+      start.setMonth(start.getMonth() - 12);
+      break;
+    case 'This Year':
+      start = new Date(now.getFullYear(), 0, 1);
+      break;
+    default:
+      return null;
+  }
+  start.setHours(0, 0, 0, 0);
+  const keys = [];
+  const cursor = new Date(start);
+  while (cursor <= now) {
+    keys.push(cursor.toISOString().slice(0, 10));
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return keys;
 }
 
 const CHART_COLORS = ['#8b5cf6', '#ec4899', '#f59e0b', '#10b981', '#3b82f6', '#ef4444', '#14b8a6', '#f97316'];
@@ -742,6 +898,8 @@ const Visualization2 = () => {
   const [selSeries, setSelSeries] = useState('All');
   const [selClass, setSelClass] = useState('All');
   const [selPeriod, setSelPeriod] = useState('All');
+  const [ganttTimeScale, setGanttTimeScale] = useState('Week');
+  const [ganttDepartment, setGanttDepartment] = useState('All');
   const [projectSearch, setProjectSearch] = useState('');
   const [selectedProjects, setSelectedProjects] = useState([]); // multi-select
   const [activeProject, setActiveProject] = useState(null); // drives timeline + deep dive
@@ -750,12 +908,17 @@ const Visualization2 = () => {
   const [showProjDrop, setShowProjDrop] = useState(false);
 
   // ── data ──
-  const [projects,        setProjects]        = useState([]);  // top-10 with task breakdown
-  const [projectNames,    setProjectNames]    = useState([]);  // for Project Name dropdown
-  const [taskNames,       setTaskNames]       = useState([]);  // for Task dropdown
-  const [elementNames,    setElementNames]    = useState([]);  // for Project Element dropdown
-  const [timeline,        setTimeline]        = useState([]);  // area chart rows
-  const [timelineTasks,   setTimelineTasks]   = useState([]);  // task keys present in timeline
+  const [projects, setProjects] = useState([]);  // top-10 with task breakdown
+  const [projectNames, setProjectNames] = useState([]);  // for Project Name dropdown
+  const [taskNames, setTaskNames] = useState([]);  // for Task dropdown
+  const [elementNames, setElementNames] = useState([]);  // for Project Element dropdown
+  const [timeline, setTimeline] = useState([]);  // area chart rows
+  const [timelineTasks, setTimelineTasks] = useState([]);  // task keys present in timeline
+  const [ganttRows, setGanttRows] = useState([]);
+  const [ganttLoading, setGanttLoading] = useState(false);
+  const [ganttTooltip, setGanttTooltip] = useState(null);
+  const ganttViewportRef = useRef(null);
+  const [ganttViewportWidth, setGanttViewportWidth] = useState(0);
   const [projectInsights, setProjectInsights] = useState(null);
   const [insightsLoading, setInsightsLoading] = useState(false);
   const [expandedTask, setExpandedTask] = useState(null);
@@ -776,7 +939,14 @@ const Visualization2 = () => {
   // ─── colour map: stable across renders, built from ALL tasks seen in projects data ──
   const globalTaskColorMap = useMemo(() => {
     const set = new Set();
-    projects.forEach(p => p.tasks.forEach(t => set.add(t.task)));
+    if (Array.isArray(projects)) {
+      projects.forEach((p) => {
+        if (!p || !Array.isArray(p.tasks)) return;
+        p.tasks.forEach((t) => {
+          if (t && t.task) set.add(t.task);
+        });
+      });
+    }
     return buildColorMap([...set]);
   }, [projects]);
 
@@ -788,9 +958,10 @@ const Visualization2 = () => {
       if (selPeriod !== 'All') params.append('period', selPeriod);
       const sfx = params.toString() ? `?${params.toString()}` : '';
       const projRes = await fetch(`${API_URL}/project-view/filter/project-names${sfx}`);
-      const names = await projRes.json();
+      const namesRaw = tryParseJson(await projRes.text());
+      const names = asJsonArray(namesRaw);
       setProjectNames(names);
-      
+
       // derive Segment / Class / Series from FULL list using heuristics
       const segSet = new Set();
       const classSet = new Set();
@@ -834,10 +1005,14 @@ const Visualization2 = () => {
       if (selectedProjects.length > 0) selectedProjects.forEach(p => params.append('project_name', p));
 
       const res = await fetch(`${API_URL}/project-view/projects?${params.toString()}`);
-      const data = await res.json();
-      setProjects(data);
+      const data = tryParseJson(await res.text());
+      setProjects(asJsonArray(data));
       setProjectsLoading(false);
-    } catch (e) { console.error('fetchProjects', e); setProjectsLoading(false); }
+    } catch (e) {
+      console.error('fetchProjects', e);
+      setProjects([]);
+      setProjectsLoading(false);
+    }
   };
 
   const buildAnalyticsQueryParams = () => {
@@ -914,10 +1089,16 @@ const Visualization2 = () => {
       if (selClass !== 'All') params.append('class', selClass);
 
       const res = await fetch(`${API_URL}/project-view/timeline?${params}`);
-      const { timeline: rows, tasks } = await res.json();
+      const body = tryParseJson(await res.text());
+      const rows = body && Array.isArray(body.timeline) ? body.timeline : [];
+      const tasks = body && Array.isArray(body.tasks) ? body.tasks : [];
       setTimeline(rows);
       setTimelineTasks(tasks);
-    } catch (e) { console.error('fetchTimeline', e); }
+    } catch (e) {
+      console.error('fetchTimeline', e);
+      setTimeline([]);
+      setTimelineTasks([]);
+    }
   };
 
   const fetchProjectInsights = async (projectNamesArray) => {
@@ -935,13 +1116,47 @@ const Visualization2 = () => {
       if (selClass !== 'All') params.append('class', selClass);
 
       const res = await fetch(`${API_URL}/project-view/project-insights?${params.toString()}`);
-      const data = await res.json();
-      setProjectInsights(data);
+      const data = tryParseJson(await res.text());
+      const ok =
+        data &&
+        typeof data === 'object' &&
+        !Array.isArray(data) &&
+        data.error == null;
+      setProjectInsights(ok ? data : null);
     } catch (e) {
       console.error('fetchProjectInsights', e);
       setProjectInsights(null);
     } finally {
       setInsightsLoading(false);
+    }
+  };
+
+  const fetchProjectGantt = async (projectNamesArray) => {
+    if (!projectNamesArray || projectNamesArray.length === 0) {
+      setGanttRows([]);
+      return;
+    }
+    setGanttLoading(true);
+    try {
+      const params = new URLSearchParams();
+      projectNamesArray.forEach((n) => params.append('project_name', n));
+      if (selPeriod !== 'All') params.append('period', selPeriod);
+      if (selSegment !== 'All') params.append('segment', selSegment);
+      if (selSeries !== 'All') params.append('series', selSeries);
+      if (selClass !== 'All') params.append('class', selClass);
+      if (ganttDepartment !== 'All') {
+        const deptApiValue = ganttDepartment === 'Digital_Marketing' ? 'Digital Marketing' : ganttDepartment;
+        params.append('department', deptApiValue);
+      }
+
+      const res = await fetch(`${API_URL}/project-view/gantt?${params.toString()}`);
+      const data = tryParseJson(await res.text());
+      setGanttRows(asJsonArray(data));
+    } catch (e) {
+      console.error('fetchProjectGantt', e);
+      setGanttRows([]);
+    } finally {
+      setGanttLoading(false);
     }
   };
 
@@ -954,6 +1169,7 @@ const Visualization2 = () => {
 
   // timeline + deep dive follow active project OR all selected projects
   useEffect(() => { fetchTimeline(displayedProjects); }, [displayedProjects, selPeriod, selSegment, selSeries, selClass]);
+  useEffect(() => { fetchProjectGantt(displayedProjects); }, [displayedProjects, selPeriod, selSegment, selSeries, selClass, ganttDepartment]);
   useEffect(() => { fetchProjectInsights(displayedProjects); }, [displayedProjects, selPeriod, selSegment, selSeries, selClass]);
   useEffect(() => {
     if (activeProject && !selectedProjects.includes(activeProject)) {
@@ -997,6 +1213,7 @@ const Visualization2 = () => {
     setSelSegment('All'); setSelSeries('All'); setSelClass('All');
     setProjectSearch(''); setSelectedProjects([]);
     setTimeline([]); setTimelineTasks([]);
+    setGanttRows([]);
     setActiveProject(null);
     setProjectInsights(null);
     setExpandedTask(null);
@@ -1020,7 +1237,7 @@ const Visualization2 = () => {
   // ─── derived: filtered project names for the search dropdown (respects segment/series/class + search) ─
   const filteredProjNames = useMemo(() => {
     let results = projectNames;
-    
+
     // filter by segment
     if (selSegment !== 'All') {
       results = results.filter(n => {
@@ -1028,7 +1245,7 @@ const Visualization2 = () => {
         return parts[0] === selSegment;
       });
     }
-    
+
     // filter by class
     if (selClass !== 'All') {
       results = results.filter(n => {
@@ -1036,7 +1253,7 @@ const Visualization2 = () => {
         return parts[1] === selClass;
       });
     }
-    
+
     // filter by series
     if (selSeries !== 'All') {
       results = results.filter(n => {
@@ -1047,12 +1264,12 @@ const Visualization2 = () => {
         return series === selSeries;
       });
     }
-    
+
     // filter by search text
     if (projectSearch.trim()) {
       results = results.filter(n => n.toLowerCase().includes(projectSearch.toLowerCase()));
     }
-    
+
     return results;
   }, [projectNames, selSegment, selClass, selSeries, projectSearch]);
 
@@ -1100,18 +1317,25 @@ const Visualization2 = () => {
   const LABEL_COL_WIDTH = 260; // px reserved for project names on the left
   const BAR_AREA_WIDTH = 900;  // px for the actual bars (will scale with container)
 
-  const maxTotalHours = useMemo(() => Math.max(...projects.map(p => p.totalHours), 1), [projects]);
+  const maxTotalHours = useMemo(() => {
+    if (!Array.isArray(projects) || projects.length === 0) return 1;
+    return Math.max(
+      ...projects.map((p) => (p && typeof p.totalHours === 'number' ? p.totalHours : 0)),
+      1
+    );
+  }, [projects]);
 
   // Hover state for bar tooltip
   const [barTooltip, setBarTooltip] = useState(null); // { x, y, task, hours, units, projectName, projectTotalHours, projectTotalUnits, taskSharePct }
 
   const renderBars = () => {
+    if (!Array.isArray(projects)) return null;
     return projects.map((project, pIdx) => {
       const y = pIdx * (BAR_HEIGHT + ROW_GAP);
       const barWidth = (project.totalHours / maxTotalHours) * BAR_AREA_WIDTH;
       let xOffset = 0;
 
-      const segments = project.tasks.map((t, tIdx) => {
+      const segments = (Array.isArray(project.tasks) ? project.tasks : []).map((t, tIdx) => {
         const segW = (t.hours / project.totalHours) * barWidth;
         const seg = (
           <g key={tIdx}>
@@ -1198,12 +1422,19 @@ const Visualization2 = () => {
   };
 
   // total SVG height
-  const svgHeight = projects.length * (BAR_HEIGHT + ROW_GAP) + 4;
+  const svgHeight = (Array.isArray(projects) ? projects.length : 0) * (BAR_HEIGHT + ROW_GAP) + 4;
 
   // ─── legend: all tasks present in current projects data ──────
   const legendTasks = useMemo(() => {
     const set = new Set();
-    projects.forEach(p => p.tasks.forEach(t => set.add(t.task)));
+    if (Array.isArray(projects)) {
+      projects.forEach((p) => {
+        if (!p || !Array.isArray(p.tasks)) return;
+        p.tasks.forEach((t) => {
+          if (t && t.task) set.add(t.task);
+        });
+      });
+    }
     return [...set];
   }, [projects]);
 
@@ -1250,6 +1481,152 @@ const Visualization2 = () => {
     };
   }, [timelineWithTotals, timelineTasks]);
 
+  const GANTT_LABEL_COL = 268;
+  const GANTT_DAY_COL_MIN = 36;
+  const GANTT_ROW_H = 40;
+
+  /** Same date window as timeline + API; single project → rows = tasks (segments = employees); multi → rows = projects (segments = tasks). */
+  const projectGanttModel = useMemo(() => {
+    if (!displayedProjects.length) return null;
+
+    const scope = new Set(displayedProjects);
+    const rows = ganttRows.filter((r) => scope.has(r.project_name));
+    const periodDates = getPeriodDateKeysAscending(selPeriod);
+    let dates = periodDates;
+    if (!dates) {
+      const dset = new Set(rows.map((r) => r.date));
+      dates = [...dset].sort((a, b) => b.localeCompare(a));
+    } else {
+      dates = [...dates].sort((a, b) => b.localeCompare(a));
+    }
+
+    const { buckets, dateToBucketKey } = buildGanttBuckets(dates, ganttTimeScale);
+    const mode = displayedProjects.length === 1 ? 'task' : 'project';
+
+    if (mode === 'task') {
+      const proj = displayedProjects[0];
+      const projRows = rows.filter((r) => r.project_name === proj);
+      const taskTotals = {};
+      projRows.forEach((r) => {
+        const t = r.task_name || 'Unspecified';
+        taskTotals[t] = (taskTotals[t] || 0) + r.hours;
+      });
+      const yKeys = Object.keys(taskTotals).sort((a, b) => taskTotals[b] - taskTotals[a]);
+
+      const cellMap = new Map();
+      for (const r of projRows) {
+        const task = r.task_name || 'Unspecified';
+        const bucketKey = dateToBucketKey.get(r.date);
+        if (!bucketKey) continue;
+        const key = `${task}\t${bucketKey}`;
+        if (!cellMap.has(key)) cellMap.set(key, new Map());
+        const m = cellMap.get(key);
+        const emp = r.employee || 'Unassigned';
+        m.set(emp, (m.get(emp) || 0) + r.hours);
+      }
+
+      const empSet = new Set();
+      projRows.forEach((r) => empSet.add(r.employee || 'Unassigned'));
+      const employeeColorMap = buildEmployeeColorMap(empSet);
+
+      const getCell = (yKey, bucketKey) => {
+        const m = cellMap.get(`${yKey}\t${bucketKey}`);
+        if (!m) return [];
+        return [...m.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .map(([employee, hours]) => ({
+            key: employee,
+            label: employee,
+            hours,
+            color: employeeColorMap[employee] || '#6b7280'
+          }));
+      };
+
+      return {
+        mode,
+        buckets,
+        yKeys,
+        rowLabel: (k) => k,
+        getCell,
+        legendTitle: 'Employees (bar colors)',
+        legendItems: [...empSet].sort((a, b) => a.localeCompare(b)).map((name) => ({
+          key: name,
+          label: name,
+          color: employeeColorMap[name]
+        })),
+        yAxisTitle: 'Task / stage',
+        scopeLabel: proj
+      };
+    }
+
+    const projTotals = {};
+    rows.forEach((r) => {
+      const p = r.project_name;
+      projTotals[p] = (projTotals[p] || 0) + r.hours;
+    });
+    const yKeys = [...displayedProjects].sort(
+      (a, b) => (projTotals[b] || 0) - (projTotals[a] || 0)
+    );
+
+    const cellMap = new Map();
+    for (const r of rows) {
+      const bucketKey = dateToBucketKey.get(r.date);
+      if (!bucketKey) continue;
+      const key = `${r.project_name}\t${bucketKey}`;
+      if (!cellMap.has(key)) cellMap.set(key, new Map());
+      const m = cellMap.get(key);
+      const task = r.task_name || 'Unspecified';
+      m.set(task, (m.get(task) || 0) + r.hours);
+    }
+
+    const taskSet = new Set();
+    rows.forEach((r) => taskSet.add(r.task_name || 'Unspecified'));
+    const fallbackTaskColors = buildColorMap([...taskSet]);
+
+    const getCell = (yKey, bucketKey) => {
+      const m = cellMap.get(`${yKey}\t${bucketKey}`);
+      if (!m) return [];
+      return [...m.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([task, hours]) => ({
+          key: task,
+          label: task,
+          hours,
+          color: globalTaskColorMap[task] || fallbackTaskColors[task] || '#6b7280'
+        }));
+    };
+
+    const legendItems = [...taskSet].sort((a, b) => a.localeCompare(b)).map((task) => ({
+      key: task,
+      label: task,
+      color: globalTaskColorMap[task] || fallbackTaskColors[task] || '#6b7280'
+    }));
+
+    return {
+      mode,
+      buckets,
+      yKeys,
+      rowLabel: (k) => k,
+      getCell,
+      legendTitle: 'Tasks (bar colors)',
+      legendItems,
+      yAxisTitle: 'Project',
+      scopeLabel: displayedProjects.length > 1 ? `${displayedProjects.length} projects` : displayedProjects[0]
+    };
+  }, [ganttRows, displayedProjects, selPeriod, ganttTimeScale, globalTaskColorMap]);
+
+  useEffect(() => {
+    if (dashTab !== 'projects' || projectsLoading) return undefined;
+    const el = ganttViewportRef.current;
+    if (!el) return undefined;
+    const ro = new ResizeObserver(() => {
+      setGanttViewportWidth(el.getBoundingClientRect().width);
+    });
+    ro.observe(el);
+    setGanttViewportWidth(el.getBoundingClientRect().width);
+    return () => ro.disconnect();
+  }, [dashTab, projectsLoading, selectedProjects.length]);
+
   // ─── render ──────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-gray-900">
@@ -1267,8 +1644,7 @@ const Visualization2 = () => {
               to="/"
               end
               className={({ isActive }) =>
-                `px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors ${
-                  isActive ? 'bg-purple-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                `px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors ${isActive ? 'bg-purple-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
                 }`
               }
             >
@@ -1277,8 +1653,7 @@ const Visualization2 = () => {
             <NavLink
               to="/night"
               className={({ isActive }) =>
-                `px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors ${
-                  isActive ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                `px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors ${isActive ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
                 }`
               }
             >
@@ -1287,8 +1662,7 @@ const Visualization2 = () => {
             <NavLink
               to="/books"
               className={({ isActive }) =>
-                `px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors ${
-                  isActive ? 'bg-teal-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                `px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors ${isActive ? 'bg-teal-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
                 }`
               }
             >
@@ -1298,8 +1672,7 @@ const Visualization2 = () => {
               to="/project"
               end
               className={({ isActive }) =>
-                `px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors ${
-                  isActive ? 'bg-fuchsia-700 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                `px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors ${isActive ? 'bg-fuchsia-700 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
                 }`
               }
             >
@@ -1427,397 +1800,588 @@ const Visualization2 = () => {
         )}
 
         {dashTab === 'projects' && !projectsLoading && (
-        <>
-        {/* ── PROJECT-WISE TASKS title ── */}
-        <h2 className="text-3xl font-bold text-white text-center mb-3">Project-wise Tasks</h2>
+          <>
+            {/* ── PROJECT-WISE TASKS title ── */}
+            <h2 className="text-3xl font-bold text-white text-center mb-3">Project-wise Tasks</h2>
 
-        {/* ── scrollable legend (task colours) ── */}
-        <div className="flex items-center gap-1.5 mb-3 overflow-x-auto pb-1" style={{ scrollbarWidth: 'thin' }}>
-          {legendTasks.map(t => (
-            <span key={t} className="flex items-center gap-1 text-gray-300 text-xs whitespace-nowrap">
-              <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, backgroundColor: globalTaskColorMap[t] || '#666' }} />
-              {t}
-            </span>
-          ))}
-        </div>
+            {/* ── scrollable legend (task colours) ── */}
+            <div className="flex items-center gap-1.5 mb-3 overflow-x-auto pb-1" style={{ scrollbarWidth: 'thin' }}>
+              {legendTasks.map(t => (
+                <span key={t} className="flex items-center gap-1 text-gray-300 text-xs whitespace-nowrap">
+                  <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, backgroundColor: globalTaskColorMap[t] || '#666' }} />
+                  {t}
+                </span>
+              ))}
+            </div>
 
-        {/* ── HORIZONTAL BAR CHART (custom SVG inside scrollable container) ── */}
-        <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl overflow-hidden mb-6">
-          <div className="overflow-auto max-h-[560px]" style={{ position: 'relative' }}>
-            <svg width={LABEL_COL_WIDTH + BAR_AREA_WIDTH + 20} height={svgHeight} style={{ display: 'block' }}>
-              {renderBars()}
-            </svg>
+            {/* ── HORIZONTAL BAR CHART (custom SVG inside scrollable container) ── */}
+            <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl overflow-hidden mb-6">
+              <div className="overflow-auto max-h-[560px]" style={{ position: 'relative' }}>
+                <svg width={LABEL_COL_WIDTH + BAR_AREA_WIDTH + 20} height={svgHeight} style={{ display: 'block' }}>
+                  {renderBars()}
+                </svg>
 
-            {/* floating tooltip on bar hover */}
-            {barTooltip && (
-              <div style={{
-                position: 'absolute',
-                left: barTooltip.x + LABEL_COL_WIDTH + 12,
-                top: barTooltip.y - 20,
-                pointerEvents: 'none',
-                zIndex: 100,
-                backgroundColor: 'rgb(17 24 39)',
-                border: '2px solid #8b5cf6',
-                borderRadius: 8,
-                padding: '10px 16px',
-                boxShadow: '0 4px 24px rgba(0,0,0,.6)',
-                minWidth: 250
-              }}>
-                <p style={{ color: '#fff', fontWeight: 700, fontSize: 14, marginBottom: 2 }}>{barTooltip.task}</p>
-                <p style={{ color: '#a5b4fc', fontSize: 12, marginBottom: 8 }}>
-                  {barTooltip.projectName}
-                </p>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                  <div>
-                    <p style={{ color: '#fff', fontSize: 20, fontWeight: 700 }}>{barTooltip.hours?.toFixed(2)}</p>
-                    <p style={{ color: '#a78bfa', fontSize: 12, fontWeight: 600 }}>Task Hours</p>
+                {/* floating tooltip on bar hover */}
+                {barTooltip && (
+                  <div style={{
+                    position: 'absolute',
+                    left: barTooltip.x + LABEL_COL_WIDTH + 12,
+                    top: barTooltip.y - 20,
+                    pointerEvents: 'none',
+                    zIndex: 100,
+                    backgroundColor: 'rgb(17 24 39)',
+                    border: '2px solid #8b5cf6',
+                    borderRadius: 8,
+                    padding: '10px 16px',
+                    boxShadow: '0 4px 24px rgba(0,0,0,.6)',
+                    minWidth: 250
+                  }}>
+                    <p style={{ color: '#fff', fontWeight: 700, fontSize: 14, marginBottom: 2 }}>{barTooltip.task}</p>
+                    <p style={{ color: '#a5b4fc', fontSize: 12, marginBottom: 8 }}>
+                      {barTooltip.projectName}
+                    </p>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                      <div>
+                        <p style={{ color: '#fff', fontSize: 20, fontWeight: 700 }}>{barTooltip.hours?.toFixed(2)}</p>
+                        <p style={{ color: '#a78bfa', fontSize: 12, fontWeight: 600 }}>Task Hours</p>
+                      </div>
+                      <div>
+                        <p style={{ color: '#fff', fontSize: 20, fontWeight: 700 }}>{barTooltip.units?.toLocaleString() || 0}</p>
+                        <p style={{ color: '#a78bfa', fontSize: 12, fontWeight: 600 }}>Task Units</p>
+                      </div>
+                    </div>
+                    <div style={{ marginTop: 8, borderTop: '1px solid #374151', paddingTop: 8 }}>
+                      <p style={{ color: '#d1d5db', fontSize: 12 }}>
+                        Task share: <span style={{ color: '#fff', fontWeight: 700 }}>{barTooltip.taskSharePct?.toFixed(1)}%</span>
+                      </p>
+                      <p style={{ color: '#d1d5db', fontSize: 12 }}>
+                        Project total: <span style={{ color: '#fff', fontWeight: 700 }}>{barTooltip.projectTotalHours?.toFixed(2)} hrs</span> |{' '}
+                        <span style={{ color: '#fff', fontWeight: 700 }}>{barTooltip.projectTotalUnits?.toLocaleString() || 0} units</span>
+                      </p>
+                    </div>
                   </div>
-                  <div>
-                    <p style={{ color: '#fff', fontSize: 20, fontWeight: 700 }}>{barTooltip.units?.toLocaleString() || 0}</p>
-                    <p style={{ color: '#a78bfa', fontSize: 12, fontWeight: 600 }}>Task Units</p>
-                  </div>
-                </div>
-                <div style={{ marginTop: 8, borderTop: '1px solid #374151', paddingTop: 8 }}>
-                  <p style={{ color: '#d1d5db', fontSize: 12 }}>
-                    Task share: <span style={{ color: '#fff', fontWeight: 700 }}>{barTooltip.taskSharePct?.toFixed(1)}%</span>
-                  </p>
-                  <p style={{ color: '#d1d5db', fontSize: 12 }}>
-                    Project total: <span style={{ color: '#fff', fontWeight: 700 }}>{barTooltip.projectTotalHours?.toFixed(2)} hrs</span> |{' '}
-                    <span style={{ color: '#fff', fontWeight: 700 }}>{barTooltip.projectTotalUnits?.toLocaleString() || 0} units</span>
-                  </p>
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* horizontal scroll handle hint */}
-          <div className="flex justify-between px-2 py-1">
-            <span className="text-gray-500 text-xs">←/→ horizontal scroll | ↑/↓ vertical scroll</span>
-            <span className="text-gray-500 text-xs">{projects.length} projects</span>
-          </div>
-        </div>
-
-        {/* ── PROJECT TIMELINE (area chart — shown when a project name is clicked) ── */}
-        <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6">
-          <h2 className="text-3xl font-bold text-white text-center mb-1">Project Timeline</h2>
-
-          {selectedProjects.length > 0 ? (
-            <>
-              {/* current scope */}
-              <div className="flex items-center justify-center gap-2 mb-3 flex-wrap">
-                {selectedProjects.length > 1 && (
-                  <button
-                    onClick={() => setActiveProject(null)}
-                    className="text-xs px-3 py-1 rounded-full bg-purple-600 hover:bg-purple-700 text-white"
-                  >
-                    Show All Selected
-                  </button>
-                )}
-                {selectedProjects.length > 1 && (
-                  <select
-                    value={activeProject || ''}
-                    onChange={(e) => setActiveProject(e.target.value || null)}
-                    className="bg-gray-700 text-white border border-gray-600 rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-purple-500"
-                  >
-                    <option value="">All Selected Projects</option>
-                    {selectedProjects.map(p => <option key={p} value={p}>{p}</option>)}
-                  </select>
                 )}
               </div>
-              <p className="text-center text-gray-300 text-sm mb-3">
-                <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', backgroundColor: '#10b981', marginRight: 6 }} />
-                {currentScopeLabel}
-              </p>
 
-              {timeline.length > 0 ? (
-                <>
-                  <div className="grid grid-cols-4 gap-3 mb-4">
-                    <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-3 text-center">
-                      <p className="text-gray-400 text-xs">Timeline Days</p>
-                      <p className="text-white text-lg font-bold">{timelineWithTotals.length}</p>
-                    </div>
-                    <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-3 text-center">
-                      <p className="text-gray-400 text-xs">Total Hours</p>
-                      <p className="text-white text-lg font-bold">{timelineSummary.totalHours.toFixed(2)}</p>
-                    </div>
-                    <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-3 text-center">
-                      <p className="text-gray-400 text-xs">Avg Hours / Day</p>
-                      <p className="text-white text-lg font-bold">{timelineSummary.avgHours.toFixed(2)}</p>
-                    </div>
-                    <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-3 text-center">
-                      <p className="text-gray-400 text-xs">Peak Day</p>
-                      <p className="text-white text-sm font-bold">{timelineSummary.peakDate}</p>
-                      <p className="text-purple-300 text-xs">{timelineSummary.peakHours.toFixed(2)} hrs</p>
-                    </div>
-                  </div>
-
-                  <p className="text-center text-gray-300 text-xs mb-2">
-                    Top timeline task: <span className="text-white font-semibold">{timelineSummary.topTask}</span>
-                  </p>
-
-                  <ResponsiveContainer width="100%" height={320}>
-                    <AreaChart data={timelineWithTotals} margin={{ top: 10, right: 40, left: 10, bottom: 40 }}>
-                      <defs>
-                        {timelineTasks.map((t, i) => (
-                          <linearGradient key={t} id={`grad_${i}`} x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="5%"  stopColor={timelineColorMap[t]} stopOpacity={0.7} />
-                            <stop offset="95%" stopColor={timelineColorMap[t]} stopOpacity={0.15} />
-                          </linearGradient>
-                        ))}
-                      </defs>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                      <XAxis dataKey="date" stroke="#9ca3af" fontSize={11} angle={-35} textAnchor="end" height={55} />
-                      <YAxis stroke="#9ca3af" fontSize={12} />
-                      <Tooltip content={<TimelineTooltip />}
-                        contentStyle={{ backgroundColor: 'rgb(17 24 39)', border: 'none', borderRadius: 8 }}
-                        wrapperStyle={{ zIndex: 10001, outline: 'none' }} />
-                      {timelineTasks.map((t, i) => (
-                        <Area key={t} type="monotone" dataKey={t} stackId="1"
-                          stroke={timelineColorMap[t]} fill={`url(#grad_${i})`}
-                          name={t} isAnimationActive={false} />
-                      ))}
-                      <Line
-                        type="monotone"
-                        dataKey="totalHours"
-                        name="Total Hours"
-                        stroke="#ffffff"
-                        strokeWidth={2}
-                        dot={false}
-                        isAnimationActive={false}
-                      />
-                    </AreaChart>
-                  </ResponsiveContainer>
-                </>
-              ) : (
-                <p className="text-gray-500 text-center py-20">No timeline data available for the selected projects.</p>
-              )}
-            </>
-          ) : (
-            <p className="text-gray-500 text-center py-20 text-sm">
-              👆 Click project names in the chart above (or select via Project filter) to load timelines.
-            </p>
-          )}
-        </div>
-
-        {/* ── PROJECT DEEP DIVE DASHBOARD ── */}
-        <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6 mt-6">
-          <h2 className="text-3xl font-bold text-white text-center mb-4">Project Deep Dive</h2>
-
-          {selectedProjects.length === 0 ? (
-            <p className="text-gray-500 text-center py-10 text-sm">
-              Select a project to view team contribution, task ownership, and hours spent.
-            </p>
-          ) : insightsLoading ? (
-            <p className="text-gray-300 text-center py-10">Loading detailed project insights...</p>
-          ) : projectInsights?.summary ? (
-            <>
-              {selectedProjects.length > 1 && (
-                <p className="text-yellow-300 text-xs mb-4 text-center">
-                  Showing details for: <span className="font-semibold">{currentScopeLabel}</span>
-                </p>
-              )}
-
-              <div className="grid grid-cols-4 gap-4 mb-6">
-                <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
-                  <p className="text-gray-400 text-xs">Total Projects</p>
-                  <p className="text-white text-2xl font-bold">{projectInsights.summary.totalProjects || 1}</p>
-                </div>
-                <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
-                  <p className="text-gray-400 text-xs">Total Employees</p>
-                  <p className="text-white text-2xl font-bold">{projectInsights.summary.totalEmployees}</p>
-                </div>
-                <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
-                  <p className="text-gray-400 text-xs">Total Tasks</p>
-                  <p className="text-white text-2xl font-bold">{projectInsights.summary.totalTasks}</p>
-                </div>
-                <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
-                  <p className="text-gray-400 text-xs">Total Hours</p>
-                  <p className="text-white text-2xl font-bold">{projectInsights.summary.totalHours.toFixed(2)}</p>
-                </div>
+              {/* horizontal scroll handle hint */}
+              <div className="flex justify-between px-2 py-1">
+                <span className="text-gray-500 text-xs">←/→ horizontal scroll | ↑/↓ vertical scroll</span>
+                <span className="text-gray-500 text-xs">{projects.length} projects</span>
               </div>
+            </div>
 
-              {projectInsights.insights?.health && (
-                <div className="grid grid-cols-4 gap-4 mb-6">
-                  <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
-                    <p className="text-gray-400 text-xs">Active Days</p>
-                    <p className="text-white text-2xl font-bold">{projectInsights.insights.health.activeDays}</p>
-                    <p className="text-gray-400 text-xs mt-1">of {projectInsights.insights.health.spanDays} days</p>
-                  </div>
-                  <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
-                    <p className="text-gray-400 text-xs">Activity Rate</p>
-                    <p className="text-white text-2xl font-bold">{projectInsights.insights.health.activityRatePct.toFixed(1)}%</p>
-                  </div>
-                  <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
-                    <p className="text-gray-400 text-xs">Avg Hours / Active Day</p>
-                    <p className="text-white text-2xl font-bold">{projectInsights.insights.health.avgHoursPerActiveDay.toFixed(2)}</p>
-                  </div>
-                  <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
-                    <p className="text-gray-400 text-xs">Velocity (Recent 7D)</p>
-                    <p className={`text-2xl font-bold ${projectInsights.insights.health.velocityTrendPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                      {projectInsights.insights.health.velocityTrendPct >= 0 ? '+' : ''}{projectInsights.insights.health.velocityTrendPct.toFixed(1)}%
+            {/* ── PROJECT GANTT (day columns — same scope & filters as Project Timeline) ── */}
+            {selectedProjects.length > 0 && (
+              <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6 mb-6">
+                <div className="flex flex-wrap items-start justify-between gap-3 mb-2">
+                  <div>
+                    <h2 className="text-2xl font-bold text-white">Project timeline (Gantt)</h2>
+                    <p className="text-gray-400 text-sm mt-1">
+                      {projectGanttModel?.mode === 'task'
+                        ? `One project: each row is a task; ${ganttTimeScale.toLowerCase()} cells show hours split by employee (same period as the timeline below).`
+                        : `Multiple projects: each row is a project; ${ganttTimeScale.toLowerCase()} cells show hours split by task.`}
                     </p>
                   </div>
+                  <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-2">
+                      <span className="text-gray-400 text-xs font-semibold">Department:</span>
+                      <select
+                        value={ganttDepartment}
+                        onChange={(e) => setGanttDepartment(e.target.value)}
+                        className="bg-gray-700 text-white border border-gray-600 rounded-md px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-purple-500"
+                      >
+                        <option value="All">All</option>
+                        <option value="DTP">DTP</option>
+                        <option value="Editorial">Editorial</option>
+                        <option value="Digital_Marketing">Digital_Marketing</option>
+                      </select>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-gray-400 text-xs font-semibold">Time Scale:</span>
+                      <select
+                        value={ganttTimeScale}
+                        onChange={(e) => setGanttTimeScale(e.target.value)}
+                        className="bg-gray-700 text-white border border-gray-600 rounded-md px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-purple-500"
+                      >
+                        <option value="Day">Day</option>
+                        <option value="Week">Week</option>
+                        <option value="Month">Month</option>
+                      </select>
+                    </div>
+                    {ganttLoading && (
+                      <span className="text-purple-300 text-sm animate-pulse">Loading Gantt…</span>
+                    )}
+                  </div>
                 </div>
-              )}
+                {projectGanttModel && (
+                  <>
+                    <p className="text-center text-gray-300 text-xs mb-2">
+                      Scope: <span className="text-white font-semibold">{currentScopeLabel}</span>
+                      {' · '}
+                      Period: <span className="text-white font-semibold">{selPeriod}</span>
+                    </p>
+                    <div className="flex items-center gap-1.5 mb-3 overflow-x-auto pb-1 max-h-24 flex-wrap" style={{ scrollbarWidth: 'thin' }}>
+                      <span className="text-gray-500 text-xs shrink-0">{projectGanttModel.legendTitle}:</span>
+                      {projectGanttModel.legendItems.map((item) => (
+                        <span key={item.key} className="flex items-center gap-1 text-gray-300 text-xs whitespace-nowrap">
+                          <span
+                            className="inline-block w-2.5 h-2.5 rounded-none shrink-0"
+                            style={{ backgroundColor: item.color }}
+                          />
+                          {item.label}
+                        </span>
+                      ))}
+                    </div>
+                    <div
+                      ref={ganttViewportRef}
+                      className="overflow-x-auto border border-gray-700 rounded-lg bg-gray-900/40 relative"
+                      onMouseLeave={() => setGanttTooltip(null)}
+                    >
+                      {(() => {
+                        const { buckets, yKeys, rowLabel, getCell, yAxisTitle } = projectGanttModel;
+                        const innerW = Math.max(360, ganttViewportWidth || 720);
+                        const minColWidth = ganttTimeScale === 'Month' ? 86 : (ganttTimeScale === 'Week' ? 112 : GANTT_DAY_COL_MIN);
+                        const chartArea = Math.max(innerW - 32 - GANTT_LABEL_COL, buckets.length * minColWidth);
+                        const dayColW = Math.max(minColWidth, chartArea / Math.max(buckets.length, 1));
+                        const gridMinW = GANTT_LABEL_COL + buckets.length * dayColW;
 
-              {projectInsights.insights?.concentration && (
-                <div className="grid grid-cols-3 gap-4 mb-6">
-                  <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4">
-                    <p className="text-gray-400 text-xs mb-1">Top 3 Task Concentration</p>
-                    <p className="text-white text-xl font-bold">{projectInsights.insights.concentration.topThreeTaskSharePct.toFixed(1)}%</p>
-                    <p className="text-gray-500 text-xs">Higher value means work is concentrated in fewer tasks.</p>
-                  </div>
-                  <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4">
-                    <p className="text-gray-400 text-xs mb-1">Top Contributor Share</p>
-                    <p className="text-white text-xl font-bold">{projectInsights.insights.concentration.topContributorSharePct.toFixed(1)}%</p>
-                    <p className="text-gray-500 text-xs">Indicates dependency risk on one employee.</p>
-                  </div>
-                  <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4">
-                    <p className="text-gray-400 text-xs mb-1">Single-owner Tasks</p>
-                    <p className="text-white text-xl font-bold">{projectInsights.insights.concentration.highlyOwnedTasksPct.toFixed(1)}%</p>
-                    <p className="text-gray-500 text-xs">Tasks where one owner handles ~80%+ of hours.</p>
-                  </div>
-                </div>
-              )}
+                        return (
+                          <div style={{ minWidth: gridMinW }} className="pb-1">
+                            <div className="flex border-b border-gray-600 bg-gray-900/80 sticky top-0 z-10">
+                              <div
+                                style={{ width: GANTT_LABEL_COL, minWidth: GANTT_LABEL_COL }}
+                                className="shrink-0 px-2 py-2 text-gray-400 text-xs font-semibold border-r border-gray-700"
+                              >
+                                {yAxisTitle}
+                              </div>
+                              {buckets.map((bucket) => (
+                                <div
+                                  key={bucket.key}
+                                  style={{ width: dayColW, minWidth: dayColW }}
+                                  className="shrink-0 border-l border-gray-700 text-center text-[10px] text-gray-300 py-2 leading-tight font-medium"
+                                >
+                                  {bucket.label}
+                                </div>
+                              ))}
+                            </div>
 
-              <div className="grid grid-cols-2 gap-4">
-                {projectInsights.projectBreakdown && projectInsights.projectBreakdown.length > 1 && (
-                  <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4">
-                    <h3 className="text-white text-lg font-semibold mb-3">Project Contribution</h3>
-                    <div className="max-h-72 overflow-y-auto">
-                      <table className="w-full text-sm">
-                        <thead>
-                          <tr className="text-gray-400 border-b border-gray-700">
-                            <th className="text-left py-2">Project</th>
-                            <th className="text-right py-2">Hours</th>
-                            <th className="text-right py-2">Avg Hrs/Day</th>
-                            <th className="text-right py-2">Share</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {projectInsights.projectBreakdown.map((row) => (
-                            <tr key={row.project} className="border-b border-gray-800 text-gray-200">
-                              <td className="py-2 pr-2">{row.project}</td>
-                              <td className="py-2 text-right">{row.hours.toFixed(2)}</td>
-                              <td className="py-2 text-right">{row.avgHoursPerActiveDay.toFixed(2)}</td>
-                              <td className="py-2 text-right">{row.contributionPct.toFixed(1)}%</td>
-                            </tr>
+                            {yKeys.length === 0 && !ganttLoading ? (
+                              <p className="text-gray-500 text-sm text-center py-10 px-4">
+                                No day-level hours in this scope for the Gantt. Try another period or project selection.
+                              </p>
+                            ) : (
+                              yKeys.map((yKey) => (
+                                <div
+                                  key={yKey}
+                                  className="flex border-b-2 border-gray-600 hover:bg-gray-800/30"
+                                  style={{ minHeight: GANTT_ROW_H }}
+                                >
+                                  <div
+                                    style={{ width: GANTT_LABEL_COL, minWidth: GANTT_LABEL_COL }}
+                                    className="shrink-0 px-2 py-2 text-gray-200 text-xs font-medium border-r border-gray-700 flex items-center truncate"
+                                    title={rowLabel(yKey)}
+                                  >
+                                    {rowLabel(yKey)}
+                                  </div>
+                                  {buckets.map((bucket) => {
+                                    const segs = getCell(yKey, bucket.key);
+                                    const total = segs.reduce((s, x) => s + x.hours, 0);
+                                    return (
+                                      <div
+                                        key={`${yKey}-${bucket.key}`}
+                                        style={{ width: dayColW, minWidth: dayColW }}
+                                        className="shrink-0 border-l border-gray-800 p-px flex items-stretch bg-gray-950/50"
+                                      >
+                                        <div className="flex w-full h-8 my-auto overflow-hidden bg-gray-900/60">
+                                          {total <= 0 ? (
+                                            <div className="w-full h-full bg-gray-900/40" />
+                                          ) : (
+                                            segs.map((seg) => {
+                                              const share = seg.hours / total;
+                                              return (
+                                                <div
+                                                  key={seg.key}
+                                                  className="h-full flex items-center justify-center min-w-0 rounded-none border-0 outline-none cursor-default"
+                                                  style={{
+                                                    flex: Math.max(seg.hours, 0.001),
+                                                    backgroundColor: seg.color
+                                                  }}
+                                                  onMouseMove={(e) => {
+                                                    setGanttTooltip({
+                                                      x: e.clientX,
+                                                      y: e.clientY,
+                                                      row: rowLabel(yKey),
+                                                      date: bucket.label,
+                                                      name: seg.label,
+                                                      hours: seg.hours,
+                                                      total
+                                                    });
+                                                  }}
+                                                >
+                                                </div>
+                                              );
+                                            })
+                                          )}
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              ))
+                            )}
+                          </div>
+                        );
+                      })()}
+                    </div>
+                    {ganttTooltip && (
+                      <div
+                        className="pointer-events-none fixed z-[10003] rounded-lg border border-purple-500/70 bg-gray-900 px-3 py-2 text-xs shadow-xl"
+                        style={{
+                          left: Math.min(Math.max(ganttTooltip.x + 12, 8), (typeof window !== 'undefined' ? window.innerWidth : 800) - 200),
+                          top: Math.min(Math.max(ganttTooltip.y + 12, 8), (typeof window !== 'undefined' ? window.innerHeight : 600) - 120)
+                        }}
+                      >
+                        <p className="text-white font-semibold">{ganttTooltip.name}</p>
+                        <p className="text-gray-400">{ganttTooltip.row}</p>
+                        <p className="text-gray-400">{ganttTooltip.date}</p>
+                        <p className="text-purple-200 mt-1">
+                          {ganttTooltip.hours.toFixed(2)} hrs
+                          {ganttTooltip.total > 0 && (
+                            <span className="text-gray-500">
+                              {' '}
+                              ({((ganttTooltip.hours / ganttTooltip.total) * 100).toFixed(0)}% of day cell)
+                            </span>
+                          )}
+                        </p>
+                      </div>
+                    )}
+                    <p className="text-gray-600 text-[10px] text-right mt-2">Uses the same filters and date range as Project Timeline.</p>
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* ── PROJECT TIMELINE (area chart — shown when a project name is clicked) ── */}
+            <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6">
+              <h2 className="text-3xl font-bold text-white text-center mb-1">Project Timeline</h2>
+
+              {selectedProjects.length > 0 ? (
+                <>
+                  {/* current scope */}
+                  <div className="flex items-center justify-center gap-2 mb-3 flex-wrap">
+                    {selectedProjects.length > 1 && (
+                      <button
+                        onClick={() => setActiveProject(null)}
+                        className="text-xs px-3 py-1 rounded-full bg-purple-600 hover:bg-purple-700 text-white"
+                      >
+                        Show All Selected
+                      </button>
+                    )}
+                    {selectedProjects.length > 1 && (
+                      <select
+                        value={activeProject || ''}
+                        onChange={(e) => setActiveProject(e.target.value || null)}
+                        className="bg-gray-700 text-white border border-gray-600 rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-purple-500"
+                      >
+                        <option value="">All Selected Projects</option>
+                        {selectedProjects.map(p => <option key={p} value={p}>{p}</option>)}
+                      </select>
+                    )}
+                  </div>
+                  <p className="text-center text-gray-300 text-sm mb-3">
+                    <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', backgroundColor: '#10b981', marginRight: 6 }} />
+                    {currentScopeLabel}
+                  </p>
+
+                  {timeline.length > 0 ? (
+                    <>
+                      <div className="grid grid-cols-4 gap-3 mb-4">
+                        <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-3 text-center">
+                          <p className="text-gray-400 text-xs">Timeline Days</p>
+                          <p className="text-white text-lg font-bold">{timelineWithTotals.length}</p>
+                        </div>
+                        <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-3 text-center">
+                          <p className="text-gray-400 text-xs">Total Hours</p>
+                          <p className="text-white text-lg font-bold">{timelineSummary.totalHours.toFixed(2)}</p>
+                        </div>
+                        <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-3 text-center">
+                          <p className="text-gray-400 text-xs">Avg Hours / Day</p>
+                          <p className="text-white text-lg font-bold">{timelineSummary.avgHours.toFixed(2)}</p>
+                        </div>
+                        <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-3 text-center">
+                          <p className="text-gray-400 text-xs">Peak Day</p>
+                          <p className="text-white text-sm font-bold">{timelineSummary.peakDate}</p>
+                          <p className="text-purple-300 text-xs">{timelineSummary.peakHours.toFixed(2)} hrs</p>
+                        </div>
+                      </div>
+
+                      <p className="text-center text-gray-300 text-xs mb-2">
+                        Top timeline task: <span className="text-white font-semibold">{timelineSummary.topTask}</span>
+                      </p>
+
+                      <ResponsiveContainer width="100%" height={320}>
+                        <AreaChart data={timelineWithTotals} margin={{ top: 10, right: 40, left: 10, bottom: 40 }}>
+                          <defs>
+                            {timelineTasks.map((t, i) => (
+                              <linearGradient key={t} id={`grad_${i}`} x1="0" y1="0" x2="0" y2="1">
+                                <stop offset="5%" stopColor={timelineColorMap[t]} stopOpacity={0.7} />
+                                <stop offset="95%" stopColor={timelineColorMap[t]} stopOpacity={0.15} />
+                              </linearGradient>
+                            ))}
+                          </defs>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                          <XAxis dataKey="date" stroke="#9ca3af" fontSize={11} angle={-35} textAnchor="end" height={55} />
+                          <YAxis stroke="#9ca3af" fontSize={12} />
+                          <Tooltip content={<TimelineTooltip />}
+                            contentStyle={{ backgroundColor: 'rgb(17 24 39)', border: 'none', borderRadius: 8 }}
+                            wrapperStyle={{ zIndex: 10001, outline: 'none' }} />
+                          {timelineTasks.map((t, i) => (
+                            <Area key={t} type="monotone" dataKey={t} stackId="1"
+                              stroke={timelineColorMap[t]} fill={`url(#grad_${i})`}
+                              name={t} isAnimationActive={false} />
                           ))}
-                        </tbody>
-                      </table>
+                          <Line
+                            type="monotone"
+                            dataKey="totalHours"
+                            name="Total Hours"
+                            stroke="#ffffff"
+                            strokeWidth={2}
+                            dot={false}
+                            isAnimationActive={false}
+                          />
+                        </AreaChart>
+                      </ResponsiveContainer>
+                    </>
+                  ) : (
+                    <p className="text-gray-500 text-center py-20">No timeline data available for the selected projects.</p>
+                  )}
+                </>
+              ) : (
+                <p className="text-gray-500 text-center py-20 text-sm">
+                  👆 Click project names in the chart above (or select via Project filter) to load timelines.
+                </p>
+              )}
+            </div>
+
+            {/* ── PROJECT DEEP DIVE DASHBOARD ── */}
+            <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6 mt-6">
+              <h2 className="text-3xl font-bold text-white text-center mb-4">Project Deep Dive</h2>
+
+              {selectedProjects.length === 0 ? (
+                <p className="text-gray-500 text-center py-10 text-sm">
+                  Select a project to view team contribution, task ownership, and hours spent.
+                </p>
+              ) : insightsLoading ? (
+                <p className="text-gray-300 text-center py-10">Loading detailed project insights...</p>
+              ) : projectInsights?.summary ? (
+                <>
+                  {selectedProjects.length > 1 && (
+                    <p className="text-yellow-300 text-xs mb-4 text-center">
+                      Showing details for: <span className="font-semibold">{currentScopeLabel}</span>
+                    </p>
+                  )}
+
+                  <div className="grid grid-cols-4 gap-4 mb-6">
+                    <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
+                      <p className="text-gray-400 text-xs">Total Projects</p>
+                      <p className="text-white text-2xl font-bold">{projectInsights.summary.totalProjects || 1}</p>
+                    </div>
+                    <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
+                      <p className="text-gray-400 text-xs">Total Employees</p>
+                      <p className="text-white text-2xl font-bold">{projectInsights.summary.totalEmployees}</p>
+                    </div>
+                    <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
+                      <p className="text-gray-400 text-xs">Total Tasks</p>
+                      <p className="text-white text-2xl font-bold">{projectInsights.summary.totalTasks}</p>
+                    </div>
+                    <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
+                      <p className="text-gray-400 text-xs">Total Hours</p>
+                      <p className="text-white text-2xl font-bold">{projectInsights.summary.totalHours.toFixed(2)}</p>
                     </div>
                   </div>
-                )}
 
-                <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4">
-                  <h3 className="text-white text-lg font-semibold mb-3">Employee Contribution</h3>
-                  <div className="max-h-72 overflow-y-auto">
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr className="text-gray-400 border-b border-gray-700">
-                          <th className="text-left py-2">Employee</th>
-                          <th className="text-right py-2">Hours</th>
-                          <th className="text-right py-2">Active Days</th>
-                          <th className="text-right py-2">Avg Hrs/Day</th>
-                          <th className="text-right py-2">Contribution</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {projectInsights.employeeContribution.map((row) => (
-                          <tr key={row.employee} className="border-b border-gray-800 text-gray-200">
-                            <td className="py-2 pr-2">{row.employee}</td>
-                            <td className="py-2 text-right">{row.hours.toFixed(2)}</td>
-                            <td className="py-2 text-right">{row.activeDays || 0}</td>
-                            <td className="py-2 text-right">{(row.avgHoursPerActiveDay || 0).toFixed(2)}</td>
-                            <td className="py-2 text-right">{row.contributionPct.toFixed(1)}%</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
+                  {projectInsights.insights?.health && (
+                    <div className="grid grid-cols-4 gap-4 mb-6">
+                      <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
+                        <p className="text-gray-400 text-xs">Active Days</p>
+                        <p className="text-white text-2xl font-bold">{projectInsights.insights.health.activeDays}</p>
+                        <p className="text-gray-400 text-xs mt-1">of {projectInsights.insights.health.spanDays} days</p>
+                      </div>
+                      <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
+                        <p className="text-gray-400 text-xs">Activity Rate</p>
+                        <p className="text-white text-2xl font-bold">{projectInsights.insights.health.activityRatePct.toFixed(1)}%</p>
+                      </div>
+                      <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
+                        <p className="text-gray-400 text-xs">Avg Hours / Active Day</p>
+                        <p className="text-white text-2xl font-bold">{projectInsights.insights.health.avgHoursPerActiveDay.toFixed(2)}</p>
+                      </div>
+                      <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-center">
+                        <p className="text-gray-400 text-xs">Velocity (Recent 7D)</p>
+                        <p className={`text-2xl font-bold ${projectInsights.insights.health.velocityTrendPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                          {projectInsights.insights.health.velocityTrendPct >= 0 ? '+' : ''}{projectInsights.insights.health.velocityTrendPct.toFixed(1)}%
+                        </p>
+                      </div>
+                    </div>
+                  )}
 
-                <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4 col-span-2">
-                  <h3 className="text-white text-lg font-semibold mb-3">Task Ownership & Hours</h3>
-                  <p className="text-gray-400 text-xs mb-2">Click a task row to expand employee-wise chapter and element split.</p>
-                  <div className="max-h-72 overflow-y-auto">
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr className="text-gray-400 border-b border-gray-700">
-                          <th className="text-left py-2">Task</th>
-                          <th className="text-left py-2">Context (Element / Chapter)</th>
-                          <th className="text-left py-2">Owner</th>
-                          <th className="text-right py-2">Hours</th>
-                          <th className="text-right py-2">Owner Share</th>
-                          <th className="text-right py-2">Collaborators</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {projectInsights.taskBreakdown.map((row) => (
-                          <React.Fragment key={row.task}>
-                            <tr
-                              className="border-b border-gray-800 text-gray-200 cursor-pointer hover:bg-gray-800/40"
-                              onClick={() => setExpandedTask(prev => prev === row.task ? null : row.task)}
-                            >
-                              <td className="py-2 pr-2">
-                                <span className="text-purple-300 mr-1">{expandedTask === row.task ? '▼' : '▶'}</span>
-                                {row.task}
-                              </td>
-                              <td className="py-2 pr-2">
-                                <p className="text-gray-200 text-xs">
-                                  {row.topElement && row.topElement !== '-' ? row.topElement : '-'}
-                                </p>
-                                <p className="text-gray-400 text-xs">
-                                  Ch: {row.topChapter && row.topChapter !== '-' ? row.topChapter : '-'}
-                                </p>
-                              </td>
-                              <td className="py-2 pr-2">{row.primaryOwner}</td>
-                              <td className="py-2 text-right">{row.totalHours.toFixed(2)}</td>
-                              <td className="py-2 text-right">{(row.primaryOwnerSharePct || 0).toFixed(1)}%</td>
-                              <td className="py-2 text-right">{row.collaborationCount || 0}</td>
-                            </tr>
-                            {expandedTask === row.task && (
-                              <tr className="border-b border-gray-800 bg-gray-900/70">
-                                <td colSpan={6} className="py-2 px-2">
-                                  <div className="grid grid-cols-2 gap-3">
-                                    {(row.ownerContext || []).map((owner) => (
-                                      <div key={`${row.task}_${owner.employee}`} className="bg-gray-800/70 border border-gray-700 rounded-md p-2">
-                                        <div className="flex justify-between items-center mb-1">
-                                          <span className="text-sm text-white font-semibold">{owner.employee}</span>
-                                          <span className="text-xs text-purple-300">{owner.hours.toFixed(2)} hrs</span>
-                                        </div>
-                                        <p className="text-xs text-gray-400">
-                                          Elements: {(owner.topElements || []).length > 0
-                                            ? owner.topElements.map(e => `${e.name} (${e.hours.toFixed(1)}h)`).join(', ')
-                                            : '-'}
-                                        </p>
-                                        <p className="text-xs text-gray-400">
-                                          Chapters: {(owner.topChapters || []).length > 0
-                                            ? owner.topChapters.map(c => `${c.name} (${c.hours.toFixed(1)}h)`).join(', ')
-                                            : '-'}
-                                        </p>
-                                      </div>
-                                    ))}
-                                  </div>
-                                </td>
+                  {projectInsights.insights?.concentration && (
+                    <div className="grid grid-cols-3 gap-4 mb-6">
+                      <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4">
+                        <p className="text-gray-400 text-xs mb-1">Top 3 Task Concentration</p>
+                        <p className="text-white text-xl font-bold">{projectInsights.insights.concentration.topThreeTaskSharePct.toFixed(1)}%</p>
+                        <p className="text-gray-500 text-xs">Higher value means work is concentrated in fewer tasks.</p>
+                      </div>
+                      <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4">
+                        <p className="text-gray-400 text-xs mb-1">Top Contributor Share</p>
+                        <p className="text-white text-xl font-bold">{projectInsights.insights.concentration.topContributorSharePct.toFixed(1)}%</p>
+                        <p className="text-gray-500 text-xs">Indicates dependency risk on one employee.</p>
+                      </div>
+                      <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4">
+                        <p className="text-gray-400 text-xs mb-1">Single-owner Tasks</p>
+                        <p className="text-white text-xl font-bold">{projectInsights.insights.concentration.highlyOwnedTasksPct.toFixed(1)}%</p>
+                        <p className="text-gray-500 text-xs">Tasks where one owner handles ~80%+ of hours.</p>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-2 gap-4">
+                    {projectInsights.projectBreakdown && projectInsights.projectBreakdown.length > 1 && (
+                      <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4">
+                        <h3 className="text-white text-lg font-semibold mb-3">Project Contribution</h3>
+                        <div className="max-h-72 overflow-y-auto">
+                          <table className="w-full text-sm">
+                            <thead>
+                              <tr className="text-gray-400 border-b border-gray-700">
+                                <th className="text-left py-2">Project</th>
+                                <th className="text-right py-2">Hours</th>
+                                <th className="text-right py-2">Avg Hrs/Day</th>
+                                <th className="text-right py-2">Share</th>
                               </tr>
-                            )}
-                          </React.Fragment>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              </div>
+                            </thead>
+                            <tbody>
+                              {projectInsights.projectBreakdown.map((row) => (
+                                <tr key={row.project} className="border-b border-gray-800 text-gray-200">
+                                  <td className="py-2 pr-2">{row.project}</td>
+                                  <td className="py-2 text-right">{row.hours.toFixed(2)}</td>
+                                  <td className="py-2 text-right">{row.avgHoursPerActiveDay.toFixed(2)}</td>
+                                  <td className="py-2 text-right">{row.contributionPct.toFixed(1)}%</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
 
-            </>
-          ) : (
-            <p className="text-gray-500 text-center py-10 text-sm">
-              No detailed data available for the selected project.
-            </p>
-          )}
-        </div>
-        </>
+                    <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4">
+                      <h3 className="text-white text-lg font-semibold mb-3">Employee Contribution</h3>
+                      <div className="max-h-72 overflow-y-auto">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="text-gray-400 border-b border-gray-700">
+                              <th className="text-left py-2">Employee</th>
+                              <th className="text-right py-2">Hours</th>
+                              <th className="text-right py-2">Active Days</th>
+                              <th className="text-right py-2">Avg Hrs/Day</th>
+                              <th className="text-right py-2">Contribution</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {projectInsights.employeeContribution.map((row) => (
+                              <tr key={row.employee} className="border-b border-gray-800 text-gray-200">
+                                <td className="py-2 pr-2">{row.employee}</td>
+                                <td className="py-2 text-right">{row.hours.toFixed(2)}</td>
+                                <td className="py-2 text-right">{row.activeDays || 0}</td>
+                                <td className="py-2 text-right">{(row.avgHoursPerActiveDay || 0).toFixed(2)}</td>
+                                <td className="py-2 text-right">{row.contributionPct.toFixed(1)}%</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4 col-span-2">
+                      <h3 className="text-white text-lg font-semibold mb-3">Task Ownership & Hours</h3>
+                      <p className="text-gray-400 text-xs mb-2">Click a task row to expand employee-wise chapter and element split.</p>
+                      <div className="max-h-72 overflow-y-auto">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="text-gray-400 border-b border-gray-700">
+                              <th className="text-left py-2">Task</th>
+                              <th className="text-left py-2">Context (Element / Chapter)</th>
+                              <th className="text-left py-2">Owner</th>
+                              <th className="text-right py-2">Hours</th>
+                              <th className="text-right py-2">Owner Share</th>
+                              <th className="text-right py-2">Collaborators</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {projectInsights.taskBreakdown.map((row) => (
+                              <React.Fragment key={row.task}>
+                                <tr
+                                  className="border-b border-gray-800 text-gray-200 cursor-pointer hover:bg-gray-800/40"
+                                  onClick={() => setExpandedTask(prev => prev === row.task ? null : row.task)}
+                                >
+                                  <td className="py-2 pr-2">
+                                    <span className="text-purple-300 mr-1">{expandedTask === row.task ? '▼' : '▶'}</span>
+                                    {row.task}
+                                  </td>
+                                  <td className="py-2 pr-2">
+                                    <p className="text-gray-200 text-xs">
+                                      {row.topElement && row.topElement !== '-' ? row.topElement : '-'}
+                                    </p>
+                                    <p className="text-gray-400 text-xs">
+                                      Ch: {row.topChapter && row.topChapter !== '-' ? row.topChapter : '-'}
+                                    </p>
+                                  </td>
+                                  <td className="py-2 pr-2">{row.primaryOwner}</td>
+                                  <td className="py-2 text-right">{row.totalHours.toFixed(2)}</td>
+                                  <td className="py-2 text-right">{(row.primaryOwnerSharePct || 0).toFixed(1)}%</td>
+                                  <td className="py-2 text-right">{row.collaborationCount || 0}</td>
+                                </tr>
+                                {expandedTask === row.task && (
+                                  <tr className="border-b border-gray-800 bg-gray-900/70">
+                                    <td colSpan={6} className="py-2 px-2">
+                                      <div className="grid grid-cols-2 gap-3">
+                                        {(row.ownerContext || []).map((owner) => (
+                                          <div key={`${row.task}_${owner.employee}`} className="bg-gray-800/70 border border-gray-700 rounded-md p-2">
+                                            <div className="flex justify-between items-center mb-1">
+                                              <span className="text-sm text-white font-semibold">{owner.employee}</span>
+                                              <span className="text-xs text-purple-300">{owner.hours.toFixed(2)} hrs</span>
+                                            </div>
+                                            <p className="text-xs text-gray-400">
+                                              Elements: {(owner.topElements || []).length > 0
+                                                ? owner.topElements.map(e => `${e.name} (${e.hours.toFixed(1)}h)`).join(', ')
+                                                : '-'}
+                                            </p>
+                                            <p className="text-xs text-gray-400">
+                                              Chapters: {(owner.topChapters || []).length > 0
+                                                ? owner.topChapters.map(c => `${c.name} (${c.hours.toFixed(1)}h)`).join(', ')
+                                                : '-'}
+                                            </p>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </td>
+                                  </tr>
+                                )}
+                              </React.Fragment>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+
+                </>
+              ) : (
+                <p className="text-gray-500 text-center py-10 text-sm">
+                  No detailed data available for the selected project.
+                </p>
+              )}
+            </div>
+          </>
         )}
 
         {dashTab === 'night' && (
