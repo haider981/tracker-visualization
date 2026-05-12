@@ -3589,7 +3589,7 @@ function mainDashTabFromPath(pathname) {
 
 // Work mode colors matching PowerBI style - ALL 8 work modes
 const WORK_MODE_COLORS = {
-  'WFH': '#8b5cf6',           // Purple
+  'WFH': '#8b5cf6',           // Purple color
   'In Office': '#3b82f6',     // Blue
   'OT Office': '#ec4899',     // Pink
   'OT Home': '#f59e0b',       // Orange
