@@ -802,7 +802,10 @@ function asJsonArray(payload) {
 }
 
 function getIsoDateKey(dateObj) {
-  return dateObj.toISOString().slice(0, 10);
+  const y = dateObj.getFullYear();
+  const m = String(dateObj.getMonth() + 1).padStart(2, '0');
+  const d = String(dateObj.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
 }
 
 function getWeekStartMonday(dateObj) {
@@ -942,7 +945,7 @@ function getPeriodDateKeysAscending(period) {
   const keys = [];
   const cursor = new Date(start);
   while (cursor <= now) {
-    keys.push(cursor.toISOString().slice(0, 10));
+    keys.push(getIsoDateKey(cursor));
     cursor.setDate(cursor.getDate() + 1);
   }
   return keys;
