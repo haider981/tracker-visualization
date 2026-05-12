@@ -661,6 +661,131 @@ function buildEmployeeColorMap(employeeNames) {
   return map;
 }
 
+/** Canonical task order for single-project Gantt rows (unknown tasks sort after, tie-break by hours). */
+const PROJECT_TASK_STAGE_ORDER = [
+  'DRF',
+  'CMPL-MS',
+  'VRF-MS',
+  'COM',
+  'R1',
+  'CR1',
+  'R2',
+  'CR2',
+  'R3',
+  'CR3',
+  'R4',
+  'CR4',
+  'R5',
+  'CR5',
+  'FINAL',
+  'FER',
+  'GLANCE',
+  'JCR',
+  'Coord',
+  'MEET',
+  'TAL',
+  'SET',
+  'Development',
+  'Research',
+  'Analysis',
+  'Rα',
+  'CRα',
+  'Rβ',
+  'CRβ',
+  'PLAN',
+  'MKT Content',
+  'Miscellaneous',
+  'UPL',
+  'SCAN',
+  'Interview',
+  'Training',
+  'KT',
+  'Book keeping',
+  'ISBN',
+  'Design',
+  'Testing',
+  'REV',
+  'QRY',
+  'Code',
+  'EDIT',
+  'Order generation',
+  'Stakeholder management',
+  'Webinar',
+  'Listing',
+  'Creative update',
+  'Campaign',
+  'Shipment',
+  'Website design/check',
+  'Briefing',
+  'Stock updation',
+  'REC',
+  'Report generation',
+  'Customer support',
+  'Compiling',
+  'Generation',
+  'Update',
+  'QR Gen',
+  'Sketch',
+  'Flat colour',
+  'Final Colour',
+  'Final Output',
+  'Visit',
+  'Practice',
+  'Internet/System Issue'
+];
+
+function taskStageOrderIndex(taskName) {
+  const raw = String(taskName || '').trim();
+  if (!raw) return 99999;
+  const lower = raw.toLowerCase();
+  const idx = PROJECT_TASK_STAGE_ORDER.findIndex((label) => label.toLowerCase() === lower);
+  if (idx >= 0) return idx;
+  return 99999;
+}
+
+/** Map a DB task name to the canonical label from PROJECT_TASK_STAGE_ORDER (case-insensitive), or null. */
+function canonicalStageFromRaw(raw) {
+  const r = String(raw || '').trim();
+  if (!r) return null;
+  return PROJECT_TASK_STAGE_ORDER.find((label) => label.toLowerCase() === r.toLowerCase()) || null;
+}
+
+/** Strict heatmap pipeline order (only these stages are shown in heatmap). */
+const HEATMAP_TASK_STAGE_ORDER = [
+  'DRF',
+  'CMPL-MS',
+  'VRF-MS',
+  'COM',
+  'R1',
+  'CR1',
+  'R2',
+  'CR2',
+  'R3',
+  'CR3',
+  'R4',
+  'CR4',
+  'R5',
+  'CR5',
+  'FINAL',
+  'FER',
+  'GLANCE'
+];
+
+function heatmapStageOrderIndex(taskName) {
+  const raw = String(taskName || '').trim();
+  if (!raw) return 99999;
+  const lower = raw.toLowerCase();
+  const idx = HEATMAP_TASK_STAGE_ORDER.findIndex((label) => label.toLowerCase() === lower);
+  if (idx >= 0) return idx;
+  return 99999;
+}
+
+function canonicalHeatmapStageFromRaw(raw) {
+  const r = String(raw || '').trim();
+  if (!r) return null;
+  return HEATMAP_TASK_STAGE_ORDER.find((label) => label.toLowerCase() === r.toLowerCase()) || null;
+}
+
 function tryParseJson(text) {
   const t = String(text ?? '').trim();
   if (!t) return null;
@@ -702,6 +827,8 @@ function formatRangeLabel(start, end) {
 function buildGanttBuckets(datesDesc, timeScale) {
   const uniqueDates = [...new Set(datesDesc)];
   const asc = [...uniqueDates].sort((a, b) => a.localeCompare(b));
+  const minIso = asc[0] || null;
+  const maxIso = asc[asc.length - 1] || null;
 
   if (timeScale === 'Day') {
     const buckets = uniqueDates.map((iso) => {
@@ -752,11 +879,23 @@ function buildGanttBuckets(datesDesc, timeScale) {
     if (!weekMap.has(key)) {
       const end = new Date(start);
       end.setDate(end.getDate() + 6);
+      const visibleStart = minIso && getIsoDateKey(start) < minIso
+        ? (() => {
+          const [y, m, d] = minIso.split('-').map(Number);
+          return new Date(y, (m || 1) - 1, d || 1);
+        })()
+        : new Date(start);
+      const visibleEnd = maxIso && getIsoDateKey(end) > maxIso
+        ? (() => {
+          const [y, m, d] = maxIso.split('-').map(Number);
+          return new Date(y, (m || 1) - 1, d || 1);
+        })()
+        : new Date(end);
       weekMap.set(key, {
         key,
         start,
         end,
-        label: formatRangeLabel(start, end)
+        label: formatRangeLabel(visibleStart, visibleEnd)
       });
     }
   });
@@ -897,7 +1036,7 @@ const Visualization2 = () => {
   const [selSegment, setSelSegment] = useState('All');
   const [selSeries, setSelSeries] = useState('All');
   const [selClass, setSelClass] = useState('All');
-  const [selPeriod, setSelPeriod] = useState('All');
+  const [selPeriod, setSelPeriod] = useState('Last 7 Days');
   const [ganttTimeScale, setGanttTimeScale] = useState('Week');
   const [ganttDepartment, setGanttDepartment] = useState('All');
   const [projectSearch, setProjectSearch] = useState('');
@@ -1074,8 +1213,26 @@ const Visualization2 = () => {
     return selectedProjects;
   }, [activeProject, selectedProjects]);
 
+  /** Timeline + deep dive only for a single explicit scope (one filter pick or focused row). */
+  const timelineInsightProjects = useMemo(() => {
+    if (activeProject) return [activeProject];
+    if (selectedProjects.length === 1) return selectedProjects;
+    return [];
+  }, [activeProject, selectedProjects]);
+
+  /** null = fetch Gantt for all projects matching period + segment filters (no project_name). */
+  const ganttFetchTarget = useMemo(() => {
+    if (selectedProjects.length === 0) return null;
+    return displayedProjects;
+  }, [selectedProjects.length, displayedProjects]);
+
   const isAllSelectedMode = !activeProject && selectedProjects.length > 1;
-  const currentScopeLabel = isAllSelectedMode ? 'All Selected Projects' : (activeProject || selectedProjects[0] || '');
+  const currentScopeLabel =
+    selectedProjects.length === 0
+      ? 'All projects in scope'
+      : isAllSelectedMode
+        ? 'All Selected Projects'
+        : activeProject || selectedProjects[0] || '';
 
   // ─── fetch timeline for selected projects (single or multiple) ──────────────────────────
   const fetchTimeline = async (projectNamesArray) => {
@@ -1132,14 +1289,12 @@ const Visualization2 = () => {
   };
 
   const fetchProjectGantt = async (projectNamesArray) => {
-    if (!projectNamesArray || projectNamesArray.length === 0) {
-      setGanttRows([]);
-      return;
-    }
     setGanttLoading(true);
     try {
       const params = new URLSearchParams();
-      projectNamesArray.forEach((n) => params.append('project_name', n));
+      if (Array.isArray(projectNamesArray) && projectNamesArray.length > 0) {
+        projectNamesArray.forEach((n) => params.append('project_name', n));
+      }
       if (selPeriod !== 'All') params.append('period', selPeriod);
       if (selSegment !== 'All') params.append('segment', selSegment);
       if (selSeries !== 'All') params.append('series', selSeries);
@@ -1161,16 +1316,16 @@ const Visualization2 = () => {
   };
 
   // ─── effects ─────────────────────────────────────────────────
-  // initial load: fetch filters (ALL project names) and initial projects
-  useEffect(() => { fetchFilters(); fetchProjects(); }, []);
+  // initial + whenever period changes: project-name list for filters (respects period)
+  useEffect(() => { fetchFilters(); }, [selPeriod]);
 
   // refetch projects automatically when filter selections change
   useEffect(() => { fetchProjects(); }, [selSegment, selSeries, selClass, selPeriod, selectedProjects]);
 
   // timeline + deep dive follow active project OR all selected projects
-  useEffect(() => { fetchTimeline(displayedProjects); }, [displayedProjects, selPeriod, selSegment, selSeries, selClass]);
-  useEffect(() => { fetchProjectGantt(displayedProjects); }, [displayedProjects, selPeriod, selSegment, selSeries, selClass, ganttDepartment]);
-  useEffect(() => { fetchProjectInsights(displayedProjects); }, [displayedProjects, selPeriod, selSegment, selSeries, selClass]);
+  useEffect(() => { fetchTimeline(timelineInsightProjects); }, [timelineInsightProjects, selPeriod, selSegment, selSeries, selClass]);
+  useEffect(() => { fetchProjectGantt(ganttFetchTarget); }, [ganttFetchTarget, selPeriod, selSegment, selSeries, selClass, ganttDepartment]);
+  useEffect(() => { fetchProjectInsights(timelineInsightProjects); }, [timelineInsightProjects, selPeriod, selSegment, selSeries, selClass]);
   useEffect(() => {
     if (activeProject && !selectedProjects.includes(activeProject)) {
       setActiveProject(null);
@@ -1211,6 +1366,7 @@ const Visualization2 = () => {
   // ─── clear all ───────────────────────────────────────────────
   const clearAll = () => {
     setSelSegment('All'); setSelSeries('All'); setSelClass('All');
+    setSelPeriod('Last 7 Days');
     setProjectSearch(''); setSelectedProjects([]);
     setTimeline([]); setTimelineTasks([]);
     setGanttRows([]);
@@ -1487,10 +1643,17 @@ const Visualization2 = () => {
 
   /** Same date window as timeline + API; single project → rows = tasks (segments = employees); multi → rows = projects (segments = tasks). */
   const projectGanttModel = useMemo(() => {
-    if (!displayedProjects.length) return null;
+    const rowsAll = Array.isArray(ganttRows) ? ganttRows : [];
+    const useAllProjects = selectedProjects.length === 0;
+    const rows = useAllProjects
+      ? rowsAll
+      : rowsAll.filter((r) => displayedProjects.includes(r.project_name));
 
-    const scope = new Set(displayedProjects);
-    const rows = ganttRows.filter((r) => scope.has(r.project_name));
+    if (!rows.length) return null;
+
+    const scopeProjects = useAllProjects
+      ? [...new Set(rows.map((r) => r.project_name).filter(Boolean))]
+      : [...displayedProjects];
     const periodDates = getPeriodDateKeysAscending(selPeriod);
     let dates = periodDates;
     if (!dates) {
@@ -1501,19 +1664,25 @@ const Visualization2 = () => {
     }
 
     const { buckets, dateToBucketKey } = buildGanttBuckets(dates, ganttTimeScale);
-    const mode = displayedProjects.length === 1 ? 'task' : 'project';
+    const mode = scopeProjects.length === 1 ? 'task' : 'project';
 
     if (mode === 'task') {
-      const proj = displayedProjects[0];
+      const proj = scopeProjects[0];
       const projRows = rows.filter((r) => r.project_name === proj);
       const taskTotals = {};
       projRows.forEach((r) => {
         const t = r.task_name || 'Unspecified';
         taskTotals[t] = (taskTotals[t] || 0) + r.hours;
       });
-      const yKeys = Object.keys(taskTotals).sort((a, b) => taskTotals[b] - taskTotals[a]);
+      const yKeys = Object.keys(taskTotals).sort((a, b) => {
+        const ai = taskStageOrderIndex(a);
+        const bi = taskStageOrderIndex(b);
+        if (ai !== bi) return ai - bi;
+        return (taskTotals[b] || 0) - (taskTotals[a] || 0);
+      });
 
       const cellMap = new Map();
+      const chapterBreakdownMap = new Map();
       for (const r of projRows) {
         const task = r.task_name || 'Unspecified';
         const bucketKey = dateToBucketKey.get(r.date);
@@ -1523,6 +1692,12 @@ const Visualization2 = () => {
         const m = cellMap.get(key);
         const emp = r.employee || 'Unassigned';
         m.set(emp, (m.get(emp) || 0) + r.hours);
+
+        const chRaw = r.chapter_number != null && String(r.chapter_number).trim() ? String(r.chapter_number).trim() : '—';
+        const ck = `${task}\t${bucketKey}\t${emp}`;
+        if (!chapterBreakdownMap.has(ck)) chapterBreakdownMap.set(ck, new Map());
+        const chm = chapterBreakdownMap.get(ck);
+        chm.set(chRaw, (chm.get(chRaw) || 0) + r.hours);
       }
 
       const empSet = new Set();
@@ -1542,12 +1717,22 @@ const Visualization2 = () => {
           }));
       };
 
+      const getTaskChapterBreakdown = (task, bucketKey, employee) => {
+        const m = chapterBreakdownMap.get(`${task}\t${bucketKey}\t${employee}`);
+        if (!m) return [];
+        return [...m.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .map(([chapter, hours]) => ({ key: chapter, label: chapter === '—' ? 'No chapter' : `Ch. ${chapter}`, hours }));
+      };
+
       return {
         mode,
         buckets,
         yKeys,
         rowLabel: (k) => k,
         getCell,
+        getTaskChapterBreakdown,
+        getProjectEmployeeBreakdown: null,
         legendTitle: 'Employees (bar colors)',
         legendItems: [...empSet].sort((a, b) => a.localeCompare(b)).map((name) => ({
           key: name,
@@ -1564,11 +1749,12 @@ const Visualization2 = () => {
       const p = r.project_name;
       projTotals[p] = (projTotals[p] || 0) + r.hours;
     });
-    const yKeys = [...displayedProjects].sort(
+    const yKeys = [...scopeProjects].sort(
       (a, b) => (projTotals[b] || 0) - (projTotals[a] || 0)
     );
 
     const cellMap = new Map();
+    const projectTaskEmployeeMap = new Map();
     for (const r of rows) {
       const bucketKey = dateToBucketKey.get(r.date);
       if (!bucketKey) continue;
@@ -1577,6 +1763,12 @@ const Visualization2 = () => {
       const m = cellMap.get(key);
       const task = r.task_name || 'Unspecified';
       m.set(task, (m.get(task) || 0) + r.hours);
+
+      const emp = r.employee || 'Unassigned';
+      const ptk = `${r.project_name}\t${bucketKey}\t${task}`;
+      if (!projectTaskEmployeeMap.has(ptk)) projectTaskEmployeeMap.set(ptk, new Map());
+      const em = projectTaskEmployeeMap.get(ptk);
+      em.set(emp, (em.get(emp) || 0) + r.hours);
     }
 
     const taskSet = new Set();
@@ -1596,6 +1788,14 @@ const Visualization2 = () => {
         }));
     };
 
+    const getProjectEmployeeBreakdown = (project, bucketKey, task) => {
+      const m = projectTaskEmployeeMap.get(`${project}\t${bucketKey}\t${task}`);
+      if (!m) return [];
+      return [...m.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([employee, hours]) => ({ key: employee, label: employee, hours }));
+    };
+
     const legendItems = [...taskSet].sort((a, b) => a.localeCompare(b)).map((task) => ({
       key: task,
       label: task,
@@ -1608,12 +1808,115 @@ const Visualization2 = () => {
       yKeys,
       rowLabel: (k) => k,
       getCell,
+      getTaskChapterBreakdown: null,
+      getProjectEmployeeBreakdown,
       legendTitle: 'Tasks (bar colors)',
       legendItems,
       yAxisTitle: 'Project',
-      scopeLabel: displayedProjects.length > 1 ? `${displayedProjects.length} projects` : displayedProjects[0]
+      scopeLabel: scopeProjects.length > 1 ? `${scopeProjects.length} projects` : scopeProjects[0]
     };
-  }, [ganttRows, displayedProjects, selPeriod, ganttTimeScale, globalTaskColorMap]);
+  }, [ganttRows, displayedProjects, selPeriod, ganttTimeScale, globalTaskColorMap, selectedProjects.length]);
+
+  /** Y = projects in scope with hours; X = canonical task sequence; green = task has DB entry, blue = current active stage. */
+  const taskStageHeatmapModel = useMemo(() => {
+    const rowsAll = Array.isArray(ganttRows) ? ganttRows : [];
+    const filtered =
+      selectedProjects.length === 0
+        ? rowsAll
+        : rowsAll.filter((r) => displayedProjects.includes(r.project_name));
+    const projTotals = {};
+    filtered.forEach((r) => {
+      const p = r.project_name;
+      projTotals[p] = (projTotals[p] || 0) + (Number(r.hours) || 0);
+    });
+    const projectNames = [...new Set(filtered.map((r) => r.project_name))].sort(
+      (a, b) => (projTotals[b] || 0) - (projTotals[a] || 0)
+    );
+
+    const xTasks = HEATMAP_TASK_STAGE_ORDER;
+    const currentStageByProject = {};
+    const lastDateByProject = {};
+    const currentCanonicalByProject = {};
+    const currentStageIndexByProject = {};
+    const seenCanonicalSetByProject = {};
+    const hasCurrentCanonicalByProject = {};
+
+    for (const p of projectNames) {
+      const rp = filtered.filter((r) => r.project_name === p && (Number(r.hours) || 0) > 0);
+      if (!rp.length) {
+        currentStageByProject[p] = null;
+        lastDateByProject[p] = null;
+        currentCanonicalByProject[p] = null;
+        currentStageIndexByProject[p] = -1;
+        seenCanonicalSetByProject[p] = new Set();
+        hasCurrentCanonicalByProject[p] = false;
+        continue;
+      }
+      const maxDate = rp.reduce((m, r) => (String(r.date) > String(m) ? r.date : m), rp[0].date);
+      lastDateByProject[p] = maxDate;
+      const seenSet = new Set();
+      rp.forEach((row) => {
+        if ((Number(row.hours) || 0) <= 0) return;
+        const c = canonicalHeatmapStageFromRaw(row.task_name || '');
+        if (c) seenSet.add(c);
+      });
+      seenCanonicalSetByProject[p] = seenSet;
+
+      // Current active stage = latest date's highest pipeline stage (hours tie-breaker).
+      const dayRows = rp.filter((r) => r.date === maxDate);
+      let currentCanonical = null;
+      let currentIdx = -1;
+      let bestHours = -1;
+      for (const row of dayRows) {
+        if ((Number(row.hours) || 0) <= 0) continue;
+        const c = canonicalHeatmapStageFromRaw(row.task_name || '');
+        if (!c) continue;
+        const idx = heatmapStageOrderIndex(c);
+        const h = Number(row.hours) || 0;
+        if (idx > currentIdx || (idx === currentIdx && h > bestHours)) {
+          currentCanonical = c;
+          currentIdx = idx;
+          bestHours = h;
+        }
+      }
+
+      // If latest day has no listed stage, pick most advanced seen listed stage.
+      if (currentCanonical == null && seenSet.size > 0) {
+        let bestSeen = null;
+        let bestSeenIdx = -1;
+        seenSet.forEach((c) => {
+          const idx = heatmapStageOrderIndex(c);
+          if (idx > bestSeenIdx) {
+            bestSeen = c;
+            bestSeenIdx = idx;
+          }
+        });
+        currentCanonical = bestSeen;
+        currentIdx = bestSeenIdx;
+      }
+
+      const rawCurrentLabel = dayRows
+        .filter((row) => (Number(row.hours) || 0) > 0)
+        .sort((a, b) => (String(b.date || '').localeCompare(String(a.date || '')) || ((Number(b.hours) || 0) - (Number(a.hours) || 0))))[0]?.task_name || null;
+
+      currentStageByProject[p] = rawCurrentLabel;
+      currentCanonicalByProject[p] = currentCanonical;
+      currentStageIndexByProject[p] = currentIdx;
+      hasCurrentCanonicalByProject[p] = currentCanonical != null;
+    }
+
+    return {
+      projects: projectNames,
+      xTasks,
+      currentStageByProject,
+      currentCanonicalByProject,
+      currentStageIndexByProject,
+      seenCanonicalSetByProject,
+      hasCurrentCanonicalByProject,
+      lastDateByProject,
+      projTotals
+    };
+  }, [ganttRows, displayedProjects, selectedProjects.length]);
 
   useEffect(() => {
     if (dashTab !== 'projects' || projectsLoading) return undefined;
@@ -1870,9 +2173,8 @@ const Visualization2 = () => {
               </div>
             </div>
 
-            {/* ── PROJECT GANTT (day columns — same scope & filters as Project Timeline) ── */}
-            {selectedProjects.length > 0 && (
-              <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6 mb-6">
+            {/* ── PROJECT GANTT (day columns — period + filters; project scope from filter or all projects when none selected) ── */}
+            <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6 mb-6">
                 <div className="flex flex-wrap items-start justify-between gap-3 mb-2">
                   <div>
                     <h2 className="text-2xl font-bold text-white">Project timeline (Gantt)</h2>
@@ -1934,11 +2236,21 @@ const Visualization2 = () => {
                     </div>
                     <div
                       ref={ganttViewportRef}
-                      className="overflow-x-auto border border-gray-700 rounded-lg bg-gray-900/40 relative"
+                      className="max-h-[560px] overflow-x-auto overflow-y-auto border border-gray-700 rounded-lg bg-gray-900/40 relative overscroll-contain"
+                      style={{ scrollbarWidth: 'thin' }}
                       onMouseLeave={() => setGanttTooltip(null)}
                     >
                       {(() => {
-                        const { buckets, yKeys, rowLabel, getCell, yAxisTitle } = projectGanttModel;
+                        const {
+                          buckets,
+                          yKeys,
+                          rowLabel,
+                          getCell,
+                          yAxisTitle,
+                          mode,
+                          getTaskChapterBreakdown,
+                          getProjectEmployeeBreakdown
+                        } = projectGanttModel;
                         const innerW = Math.max(360, ganttViewportWidth || 720);
                         const minColWidth = ganttTimeScale === 'Month' ? 86 : (ganttTimeScale === 'Week' ? 112 : GANTT_DAY_COL_MIN);
                         const chartArea = Math.max(innerW - 32 - GANTT_LABEL_COL, buckets.length * minColWidth);
@@ -1947,10 +2259,10 @@ const Visualization2 = () => {
 
                         return (
                           <div style={{ minWidth: gridMinW }} className="pb-1">
-                            <div className="flex border-b border-gray-600 bg-gray-900/80 sticky top-0 z-10">
+                            <div className="flex border-b border-gray-600 bg-gray-900/95 sticky top-0 z-20 shadow-[0_1px_0_rgba(0,0,0,0.4)]">
                               <div
                                 style={{ width: GANTT_LABEL_COL, minWidth: GANTT_LABEL_COL }}
-                                className="shrink-0 px-2 py-2 text-gray-400 text-xs font-semibold border-r border-gray-700"
+                                className="shrink-0 sticky left-0 z-30 px-2 py-2 text-gray-400 text-xs font-semibold border-r border-gray-700 bg-gray-900/95"
                               >
                                 {yAxisTitle}
                               </div>
@@ -1978,7 +2290,7 @@ const Visualization2 = () => {
                                 >
                                   <div
                                     style={{ width: GANTT_LABEL_COL, minWidth: GANTT_LABEL_COL }}
-                                    className="shrink-0 px-2 py-2 text-gray-200 text-xs font-medium border-r border-gray-700 flex items-center truncate"
+                                    className="shrink-0 sticky left-0 z-10 px-2 py-2 text-gray-200 text-xs font-medium border-r border-gray-700 flex items-center truncate bg-gray-900/95"
                                     title={rowLabel(yKey)}
                                   >
                                     {rowLabel(yKey)}
@@ -1997,7 +2309,6 @@ const Visualization2 = () => {
                                             <div className="w-full h-full bg-gray-900/40" />
                                           ) : (
                                             segs.map((seg) => {
-                                              const share = seg.hours / total;
                                               return (
                                                 <div
                                                   key={seg.key}
@@ -2007,14 +2318,24 @@ const Visualization2 = () => {
                                                     backgroundColor: seg.color
                                                   }}
                                                   onMouseMove={(e) => {
+                                                    const breakdown =
+                                                      mode === 'task' && typeof getTaskChapterBreakdown === 'function'
+                                                        ? getTaskChapterBreakdown(yKey, bucket.key, seg.key)
+                                                        : mode === 'project' && typeof getProjectEmployeeBreakdown === 'function'
+                                                          ? getProjectEmployeeBreakdown(yKey, bucket.key, seg.key)
+                                                          : [];
                                                     setGanttTooltip({
                                                       x: e.clientX,
                                                       y: e.clientY,
+                                                      mode,
                                                       row: rowLabel(yKey),
                                                       date: bucket.label,
                                                       name: seg.label,
                                                       hours: seg.hours,
-                                                      total
+                                                      total,
+                                                      breakdownTitle:
+                                                        mode === 'task' ? 'Chapter breakdown' : 'Employee breakdown',
+                                                      breakdown
                                                     });
                                                   }}
                                                 >
@@ -2041,40 +2362,159 @@ const Visualization2 = () => {
                           top: Math.min(Math.max(ganttTooltip.y + 12, 8), (typeof window !== 'undefined' ? window.innerHeight : 600) - 120)
                         }}
                       >
-                        <p className="text-white font-semibold">{ganttTooltip.name}</p>
-                        <p className="text-gray-400">{ganttTooltip.row}</p>
+                        <p className="text-white font-semibold">{ganttTooltip.row}</p>
+                        <p className="text-indigo-300 mt-0.5">
+                          {ganttTooltip.mode === 'task' ? (
+                            <>Employee: <span className="text-white">{ganttTooltip.name}</span></>
+                          ) : (
+                            <>Task: <span className="text-white">{ganttTooltip.name}</span></>
+                          )}
+                        </p>
                         <p className="text-gray-400">{ganttTooltip.date}</p>
                         <p className="text-purple-200 mt-1">
                           {ganttTooltip.hours.toFixed(2)} hrs
                           {ganttTooltip.total > 0 && (
                             <span className="text-gray-500">
                               {' '}
-                              ({((ganttTooltip.hours / ganttTooltip.total) * 100).toFixed(0)}% of day cell)
+                              ({((ganttTooltip.hours / ganttTooltip.total) * 100).toFixed(0)}% of cell)
                             </span>
                           )}
                         </p>
+                        {Array.isArray(ganttTooltip.breakdown) && ganttTooltip.breakdown.length > 0 && (
+                          <div className="mt-2 border-t border-gray-700 pt-2">
+                            <p className="text-gray-400 text-[10px] font-semibold uppercase tracking-wide mb-1">
+                              {ganttTooltip.breakdownTitle || 'Breakdown'}
+                            </p>
+                            <div className="max-h-32 overflow-y-auto space-y-0.5 pr-1">
+                              {ganttTooltip.breakdown.map((line) => (
+                                <div key={String(line.key)} className="flex justify-between gap-3 text-gray-300">
+                                  <span className="truncate">{line.label}</span>
+                                  <span className="text-white font-semibold shrink-0">{Number(line.hours || 0).toFixed(2)}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )}
-                    <p className="text-gray-600 text-[10px] text-right mt-2">Uses the same filters and date range as Project Timeline.</p>
+                    <p className="text-gray-600 text-[10px] text-right mt-2">Uses the same filters and date range as the area chart timeline (when a single project is in scope).</p>
                   </>
                 )}
+                {!ganttLoading && !projectGanttModel && (
+                  <p className="text-gray-500 text-sm py-10 text-center border border-gray-700 rounded-lg">
+                    No Gantt rows for this period and filter set — widen the period or relax segment / series / class filters.
+                  </p>
+                )}
               </div>
-            )}
 
-            {/* ── PROJECT TIMELINE (area chart — shown when a project name is clicked) ── */}
+            {/* ── TASK STAGE HEATMAP (latest stage per project vs full task sequence; same period as Gantt) ── */}
+            <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6 mb-6">
+                <h2 className="text-2xl font-bold text-white mb-1">Task stage heatmap</h2>
+                <p className="text-gray-400 text-sm mb-3 max-w-4xl">
+                  Rows are projects in the current scope with logged hours. Columns follow your task sequence.{' '}
+                  <span className="text-emerald-400 font-semibold">Green</span> shows completed stages in sequence and{' '}
+                  <span className="text-sky-400 font-semibold">Blue</span> marks the current stage from the{' '}
+                  <strong className="text-gray-200">most recent calendar day</strong> in the period.
+                </p>
+                {taskStageHeatmapModel.projects.length === 0 ? (
+                  <p className="text-gray-500 text-sm py-8 text-center border border-gray-700 rounded-lg">
+                    No Gantt data for this period — select projects and ensure the period includes worklogs.
+                  </p>
+                ) : (
+                  <div className="max-h-[480px] overflow-y-auto overflow-x-auto rounded-lg border border-gray-700 bg-gray-950/80 w-full">
+                    <table className="border-collapse text-[10px] w-full table-fixed">
+                      <thead>
+                        <tr className="bg-gray-900/95 sticky top-0 z-20">
+                          <th
+                            className="sticky left-0 z-30 bg-gray-900/95 border border-gray-700 px-2 py-2 text-left text-gray-300 font-semibold min-w-[12rem] w-[18rem]"
+                            scope="col"
+                          >
+                            Project
+                          </th>
+                          {taskStageHeatmapModel.xTasks.map((t) => (
+                            <th
+                              key={t}
+                              className="border border-gray-700 px-0.5 py-1 text-gray-400 font-medium text-center align-bottom whitespace-nowrap"
+                              style={{ minWidth: '22px', writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}
+                              title={t}
+                            >
+                              <span className="inline-block max-h-[140px] truncate">{t}</span>
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {taskStageHeatmapModel.projects.map((proj) => {
+                          const canon = taskStageHeatmapModel.currentCanonicalByProject[proj];
+                          const currentIdx = taskStageHeatmapModel.currentStageIndexByProject[proj] ?? -1;
+                          const seenSet = taskStageHeatmapModel.seenCanonicalSetByProject[proj] || new Set();
+                          const hasCurrentCanonical = taskStageHeatmapModel.hasCurrentCanonicalByProject[proj] === true;
+                          const raw = taskStageHeatmapModel.currentStageByProject[proj];
+                          const lastD = taskStageHeatmapModel.lastDateByProject[proj];
+                          return (
+                            <tr key={proj} className="border-b border-gray-800 hover:bg-gray-900/40">
+                              <td
+                                className="sticky left-0 z-10 bg-gray-950/95 border border-gray-700 px-2 py-1.5 text-gray-200 font-medium truncate w-[18rem] max-w-[18rem]"
+                                title={proj}
+                              >
+                                <div className="truncate">{proj}</div>
+                                {lastD && (
+                                  <div className="text-[9px] text-gray-500 font-normal mt-0.5">
+                                    Last day: {lastD}
+                                    {raw && canon === null && (
+                                      <span className="text-amber-500/90"> · {raw}</span>
+                                    )}
+                                  </div>
+                                )}
+                              </td>
+                              {taskStageHeatmapModel.xTasks.map((colTask) => {
+                                const colIdx = heatmapStageOrderIndex(colTask);
+                                const isCurrent = hasCurrentCanonical && canon != null && colTask === canon && currentIdx >= 0;
+                                const isSeen = !isCurrent && seenSet.has(colTask) && colIdx >= 0;
+                                return (
+                                  <td
+                                    key={`${proj}-${colTask}`}
+                                    className={`border border-gray-800 p-0 text-center ${
+                                      isCurrent
+                                        ? 'bg-sky-500 shadow-[inset_0_0_0_1px_rgba(14,165,233,0.65)]'
+                                        : isSeen
+                                          ? 'bg-emerald-500 shadow-[inset_0_0_0_1px_rgba(16,185,129,0.6)]'
+                                          : 'bg-black'
+                                    }`}
+                                    title={
+                                      isCurrent
+                                        ? `Current stage: ${colTask} (from ${lastD})`
+                                        : isSeen
+                                          ? `Has DB entry: ${colTask}`
+                                        : `${proj} · ${colTask}`
+                                    }
+                                  >
+                                    <div className="h-7 w-full min-w-[20px]" />
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+            {/* ── PROJECT TIMELINE (area chart — single-project scope only) ── */}
             <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6">
               <h2 className="text-3xl font-bold text-white text-center mb-1">Project Timeline</h2>
 
-              {selectedProjects.length > 0 ? (
+              {timelineInsightProjects.length > 0 ? (
                 <>
-                  {/* current scope */}
                   <div className="flex items-center justify-center gap-2 mb-3 flex-wrap">
                     {selectedProjects.length > 1 && (
                       <button
                         onClick={() => setActiveProject(null)}
                         className="text-xs px-3 py-1 rounded-full bg-purple-600 hover:bg-purple-700 text-white"
                       >
-                        Show All Selected
+                        Clear focus
                       </button>
                     )}
                     {selectedProjects.length > 1 && (
@@ -2083,7 +2523,7 @@ const Visualization2 = () => {
                         onChange={(e) => setActiveProject(e.target.value || null)}
                         className="bg-gray-700 text-white border border-gray-600 rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-purple-500"
                       >
-                        <option value="">All Selected Projects</option>
+                        <option value="">Select a project…</option>
                         {selectedProjects.map(p => <option key={p} value={p}>{p}</option>)}
                       </select>
                     )}
@@ -2153,12 +2593,32 @@ const Visualization2 = () => {
                       </ResponsiveContainer>
                     </>
                   ) : (
-                    <p className="text-gray-500 text-center py-20">No timeline data available for the selected projects.</p>
+                    <p className="text-gray-500 text-center py-20">No timeline data for this project in the current period.</p>
                   )}
                 </>
+              ) : selectedProjects.length > 1 ? (
+                <div className="text-center py-16 space-y-4">
+                  <p className="text-gray-400 text-sm max-w-lg mx-auto">
+                    Multiple projects are selected. Focus one project to load the timeline and deep dive.
+                  </p>
+                  <div className="flex justify-center gap-2 flex-wrap">
+                    <select
+                      value={activeProject || ''}
+                      onChange={(e) => setActiveProject(e.target.value || null)}
+                      className="bg-gray-700 text-white border border-gray-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 max-w-full"
+                    >
+                      <option value="">Select a project…</option>
+                      {selectedProjects.map((p) => (
+                        <option key={p} value={p}>
+                          {p}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
               ) : (
                 <p className="text-gray-500 text-center py-20 text-sm">
-                  👆 Click project names in the chart above (or select via Project filter) to load timelines.
+                  👆 Click a project name in the chart above (or pick a single project in the filter) to load this timeline.
                 </p>
               )}
             </div>
@@ -2167,9 +2627,11 @@ const Visualization2 = () => {
             <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6 mt-6">
               <h2 className="text-3xl font-bold text-white text-center mb-4">Project Deep Dive</h2>
 
-              {selectedProjects.length === 0 ? (
+              {timelineInsightProjects.length === 0 ? (
                 <p className="text-gray-500 text-center py-10 text-sm">
-                  Select a project to view team contribution, task ownership, and hours spent.
+                  {selectedProjects.length > 1
+                    ? 'Focus one project in the timeline section above to view team contribution, task ownership, and hours.'
+                    : 'Select or focus a project to view team contribution, task ownership, and hours.'}
                 </p>
               ) : insightsLoading ? (
                 <p className="text-gray-300 text-center py-10">Loading detailed project insights...</p>

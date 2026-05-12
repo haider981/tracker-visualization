@@ -4042,8 +4042,110 @@ TaskPieTooltip.displayName = 'TaskPieTooltip';
 
 const PROJECT_TREEMAP_CHUNK = 7;
 const TIMELINE_PROJECT_CHUNK = 10;
-const GANTT_PROJECT_COL_W = 260;
-const GANTT_EMP_COL_W = 170;
+/** Employee timeline Gantt: sticky name column width */
+const GANTT_TEAM_EMPLOYEE_COL = 232;
+
+function teamGanttIsoKey(d) {
+  return d.toISOString().slice(0, 10);
+}
+
+function teamGanttWeekStartMonday(dateObj) {
+  const d = new Date(dateObj);
+  d.setHours(0, 0, 0, 0);
+  const day = d.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diff);
+  return d;
+}
+
+function teamGanttFormatRangeLabel(start, end) {
+  const s = start.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const e = end.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  return `${s} - ${e}`;
+}
+
+/** datesDesc: ISO day keys, newest first. Returns buckets (newest-left order) + date→bucketKey */
+function buildTeamGanttBuckets(datesDesc, timeScale) {
+  const uniqueDates = [...new Set(datesDesc)];
+  const asc = [...uniqueDates].sort((a, b) => a.localeCompare(b));
+
+  if (timeScale === 'Day') {
+    const buckets = uniqueDates.map((iso) => {
+      const [y, m, d] = iso.split('-').map(Number);
+      const dt = new Date(y, (m || 1) - 1, d || 1);
+      return {
+        key: iso,
+        label: dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+      };
+    });
+    const lookup = new Map(uniqueDates.map((d) => [d, d]));
+    return { buckets, dateToBucketKey: lookup };
+  }
+
+  if (timeScale === 'Month') {
+    const monthMap = new Map();
+    asc.forEach((iso) => {
+      const [y, m, d] = iso.split('-').map(Number);
+      const dt = new Date(y, (m || 1) - 1, d || 1);
+      const key = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`;
+      if (!monthMap.has(key)) {
+        const first = new Date(dt.getFullYear(), dt.getMonth(), 1);
+        monthMap.set(key, {
+          key,
+          start: first,
+          label: first.toLocaleDateString(undefined, { month: 'short', year: 'numeric' }),
+        });
+      }
+    });
+    const buckets = [...monthMap.values()].sort((a, b) => b.key.localeCompare(a.key));
+    const lookup = new Map();
+    asc.forEach((iso) => {
+      const [y, m, d] = iso.split('-').map(Number);
+      const dt = new Date(y, (m || 1) - 1, d || 1);
+      const key = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`;
+      lookup.set(iso, key);
+    });
+    return { buckets, dateToBucketKey: lookup };
+  }
+
+  const weekMap = new Map();
+  asc.forEach((iso) => {
+    const [y, m, d] = iso.split('-').map(Number);
+    const dt = new Date(y, (m || 1) - 1, d || 1);
+    const start = teamGanttWeekStartMonday(dt);
+    const key = teamGanttIsoKey(start);
+    if (!weekMap.has(key)) {
+      const end = new Date(start);
+      end.setDate(end.getDate() + 6);
+      weekMap.set(key, {
+        key,
+        start,
+        end,
+        label: teamGanttFormatRangeLabel(start, end),
+      });
+    }
+  });
+  const buckets = [...weekMap.values()].sort((a, b) => b.key.localeCompare(a.key));
+  const lookup = new Map();
+  asc.forEach((iso) => {
+    const [y, m, d] = iso.split('-').map(Number);
+    const dt = new Date(y, (m || 1) - 1, d || 1);
+    const key = teamGanttIsoKey(teamGanttWeekStartMonday(dt));
+    lookup.set(iso, key);
+  });
+  return { buckets, dateToBucketKey: lookup };
+}
+
+function employeeNameInitials(name) {
+  const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) {
+    const a = parts[0][0] || '';
+    const b = parts[parts.length - 1][0] || '';
+    return `${a}${b}`.toUpperCase();
+  }
+  if (parts.length === 1 && parts[0].length >= 2) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0] || '?').slice(0, 2).toUpperCase();
+}
 
 /** Interpolate blue scale: white (0) -> dark blue (high) */
 function purpleHeatAlpha(t) {
@@ -4566,6 +4668,7 @@ const Visualization = () => {
   const [selectedProject, setSelectedProject] = useState(null);
   const [ganttHover, setGanttHover] = useState(null);
   const [ganttSortMode, setGanttSortMode] = useState('hours');
+  const [teamGanttTimeScale, setTeamGanttTimeScale] = useState('Week');
   const ganttViewportRef = useRef(null);
   const [ganttViewportWidth, setGanttViewportWidth] = useState(0);
 
@@ -4996,14 +5099,24 @@ const Visualization = () => {
     return { rows, stackKeys, slugToEmp, breakdownByProjEmp };
   }, [projectEmployeeBreakdown]);
 
-  const projectGanttModel = useMemo(() => {
+  /** Employee × time Gantt: rows = employees, lanes = projects, bar fill = tasks (same /project-gantt payload). */
+  const employeeGanttModel = useMemo(() => {
     const rows = Array.isArray(projectGanttRows) ? projectGanttRows : [];
     if (!rows.length) {
-      return { projects: [], dates: [], dayWidth: 42, chartWidth: 0, rowHeights: new Map(), employeeColor: {}, taskColor: {} };
+      return {
+        employees: [],
+        buckets: [],
+        colWidth: 42,
+        chartWidth: 0,
+        rowHeights: new Map(),
+        taskColor: {},
+        dateRangeLabel: '',
+        empColW: GANTT_TEAM_EMPLOYEE_COL,
+      };
     }
 
     const dateSet = new Set();
-    const byProject = new Map();
+    const byEmployee = new Map();
     const employeeTotals = new Map();
 
     for (const r of rows) {
@@ -5014,10 +5127,10 @@ const Visualization = () => {
       dateSet.add(date);
       employeeTotals.set(employee, (employeeTotals.get(employee) || 0) + (Number(r?.hours) || 0));
 
-      if (!byProject.has(project)) byProject.set(project, new Map());
-      const empMap = byProject.get(project);
-      if (!empMap.has(employee)) empMap.set(employee, new Map());
-      const dayMap = empMap.get(employee);
+      if (!byEmployee.has(employee)) byEmployee.set(employee, new Map());
+      const projMap = byEmployee.get(employee);
+      if (!projMap.has(project)) projMap.set(project, new Map());
+      const dayMap = projMap.get(project);
 
       const existing = dayMap.get(date) || { hours: 0, tasks: new Map() };
       existing.hours += Number(r?.hours) || 0;
@@ -5030,28 +5143,30 @@ const Visualization = () => {
       dayMap.set(date, existing);
     }
 
-    // Newest date should appear on the left side of the gantt.
     const dates = Array.from(dateSet).sort((a, b) => b.localeCompare(a));
-    const idxByDate = new Map(dates.map((d, i) => [d, i]));
-    const usableWidth = Math.max(320, (Number(ganttViewportWidth) || 0) - GANTT_PROJECT_COL_W - GANTT_EMP_COL_W);
-    const dayWidth = dates.length > 0
-      ? Math.max(12, Math.min(120, usableWidth / dates.length))
-      : 42;
-    const chartWidth = Math.max(usableWidth, dates.length * dayWidth);
+    const { buckets, dateToBucketKey } = buildTeamGanttBuckets(dates, teamGanttTimeScale);
 
-    const employeesByTotal = Array.from(employeeTotals.entries())
-      .sort((a, b) => b[1] - a[1])
-      .map(([emp]) => emp);
-    const employeeColor = {};
-    employeesByTotal.forEach((emp, i) => {
-      employeeColor[emp] = COLORS[i % COLORS.length];
-    });
+    const cellMap = new Map();
+    for (const [employee, projMap] of byEmployee.entries()) {
+      for (const [project, dayMap] of projMap.entries()) {
+        for (const [dateStr, v] of dayMap.entries()) {
+          const bk = dateToBucketKey.get(dateStr);
+          if (!bk) continue;
+          const key = `${employee}\t${project}\t${bk}`;
+          if (!cellMap.has(key)) cellMap.set(key, { hours: 0, tasks: new Map() });
+          const cell = cellMap.get(key);
+          cell.hours += v.hours || 0;
+          for (const [tk, h] of v.tasks.entries()) {
+            cell.tasks.set(tk, (cell.tasks.get(tk) || 0) + h);
+          }
+        }
+      }
+    }
+
     const taskTotals = new Map();
-    for (const r of rows) {
-      if (!Array.isArray(r?.tasks)) continue;
-      for (const t of r.tasks) {
-        const tk = String(t?.task || 'Unspecified').trim() || 'Unspecified';
-        taskTotals.set(tk, (taskTotals.get(tk) || 0) + (Number(t?.hours) || 0));
+    for (const cell of cellMap.values()) {
+      for (const [tk, h] of cell.tasks.entries()) {
+        taskTotals.set(tk, (taskTotals.get(tk) || 0) + h);
       }
     }
     const taskColor = {};
@@ -5061,21 +5176,48 @@ const Visualization = () => {
         taskColor[task] = COLORS[i % COLORS.length];
       });
 
-    const projects = Array.from(byProject.entries())
-      .map(([project, empMap]) => {
-        const lanes = Array.from(empMap.entries())
-          .map(([employee, dayMap]) => {
-            const dayEntries = Array.from(dayMap.entries())
-              .map(([date, v]) => ({ date, idx: idxByDate.get(date), hours: v.hours, tasks: v.tasks }))
-              .filter((d) => Number.isInteger(d.idx))
-              .sort((a, b) => a.idx - b.idx);
+    const ascDates = [...dates].sort((a, b) => a.localeCompare(b));
+    const minD = ascDates[0];
+    const maxD = ascDates[ascDates.length - 1];
+    let dateRangeLabel = '';
+    if (minD && maxD) {
+      const [y1, m1, d1] = minD.split('-').map(Number);
+      const [y2, m2, d2] = maxD.split('-').map(Number);
+      const dt1 = new Date(y1, m1 - 1, d1);
+      const dt2 = new Date(y2, m2 - 1, d2);
+      dateRangeLabel = `${dt1.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} – ${dt2.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}`;
+    }
+
+    const usableWidth = Math.max(320, (Number(ganttViewportWidth) || 0) - GANTT_TEAM_EMPLOYEE_COL);
+    const minColW = teamGanttTimeScale === 'Month' ? 88 : teamGanttTimeScale === 'Week' ? 108 : 28;
+    const colWidth = buckets.length > 0
+      ? Math.max(minColW, Math.min(140, usableWidth / buckets.length))
+      : 42;
+    const chartWidth = Math.max(usableWidth, buckets.length * colWidth);
+
+    const employees = Array.from(byEmployee.entries())
+      .map(([employee, projMap]) => {
+        const lanes = Array.from(projMap.entries())
+          .map(([project, dayMap]) => {
+            const withData = [];
+            for (let bi = 0; bi < buckets.length; bi += 1) {
+              const b = buckets[bi];
+              const cell = cellMap.get(`${employee}\t${project}\t${b.key}`);
+              if (!cell || !(cell.hours > 0)) continue;
+              withData.push({
+                idx: bi,
+                bucketKey: b.key,
+                hours: cell.hours,
+                tasks: cell.tasks,
+              });
+            }
 
             const segments = [];
             let run = null;
-            for (const d of dayEntries) {
+            for (const d of withData) {
               if (!run) {
                 run = {
-                  employee,
+                  project,
                   startIdx: d.idx,
                   endIdx: d.idx,
                   totalHours: d.hours || 0,
@@ -5090,7 +5232,7 @@ const Visualization = () => {
               } else {
                 segments.push(run);
                 run = {
-                  employee,
+                  project,
                   startIdx: d.idx,
                   endIdx: d.idx,
                   totalHours: d.hours || 0,
@@ -5102,18 +5244,18 @@ const Visualization = () => {
 
             const totalHours = segments.reduce((s, seg) => s + (seg.totalHours || 0), 0);
             const lastIdx = segments.length ? Math.max(...segments.map((seg) => seg.startIdx)) : -1;
-            return { employee, totalHours, segments, lastIdx };
+            return { project, totalHours, segments, lastIdx };
           })
           .filter((l) => l.totalHours > 0)
           .sort((a, b) => b.totalHours - a.totalHours);
 
         const totalHours = lanes.reduce((s, l) => s + l.totalHours, 0);
         const mostRecentIdx = lanes.length ? Math.max(...lanes.map((l) => l.lastIdx)) : -1;
-        return { project, lanes, totalHours, mostRecentIdx };
+        return { employee, lanes, totalHours, mostRecentIdx };
       })
-      .filter((p) => p.totalHours > 0);
+      .filter((e) => e.totalHours > 0);
 
-    projects.sort((a, b) => {
+    employees.sort((a, b) => {
       if (ganttSortMode === 'recent') {
         if (b.mostRecentIdx !== a.mostRecentIdx) return b.mostRecentIdx - a.mostRecentIdx;
         return b.totalHours - a.totalHours;
@@ -5122,12 +5264,23 @@ const Visualization = () => {
       return b.mostRecentIdx - a.mostRecentIdx;
     });
 
+    const LANE_H = 30;
     const rowHeights = new Map(
-      projects.map((p) => [p.project, Math.max(34, p.lanes.length * 18 + 8)])
+      employees.map((e) => [e.employee, Math.max(40, e.lanes.length * LANE_H + 10)])
     );
 
-    return { projects, dates, dayWidth, chartWidth, rowHeights, employeeColor, taskColor };
-  }, [projectGanttRows, ganttViewportWidth, ganttSortMode]);
+    return {
+      employees,
+      buckets,
+      colWidth,
+      chartWidth,
+      rowHeights,
+      taskColor,
+      dateRangeLabel,
+      empColW: GANTT_TEAM_EMPLOYEE_COL,
+      laneHeight: LANE_H,
+    };
+  }, [projectGanttRows, ganttViewportWidth, ganttSortMode, teamGanttTimeScale]);
 
   useEffect(() => {
     const node = ganttViewportRef.current;
@@ -6228,13 +6381,35 @@ const Visualization = () => {
             </div>
           </section>
 
-          {/* Project Gantt timeline (scrollable): dates x projects, colored by employees */}
+          {/* Employee timeline Gantt (scrollable): time buckets × employees; bars = projects, stacks = tasks */}
           <div className="bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-xl p-6 shadow-2xl border border-gray-700">
             <div className="mb-4 flex items-center justify-between gap-3 flex-wrap">
-              <h2 className="text-2xl font-bold text-white flex items-center">
-                <TrendingUp className="mr-2 text-blue-400" /> Project Gantt Chart
-              </h2>
-              <div className="flex items-center gap-3 flex-wrap">
+              <div>
+                <h2 className="text-2xl font-bold text-white flex items-center">
+                  <TrendingUp className="mr-2 text-blue-400" /> Employee timeline Gantt chart
+                </h2>
+                <p className="text-gray-400 text-sm mt-1 max-w-3xl">
+                  Shows what each employee is working on across projects. Bars are projects; colored stacks inside each bar are tasks (same filters as the dashboard).
+                </p>
+              </div>
+              <div className="flex items-center gap-3 flex-wrap justify-end">
+                <div className="flex items-center gap-2">
+                  <span className="text-gray-400 text-xs font-semibold">Time scale:</span>
+                  <select
+                    value={teamGanttTimeScale}
+                    onChange={(e) => setTeamGanttTimeScale(e.target.value)}
+                    className="bg-gray-700 text-white border border-gray-600 rounded-md px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  >
+                    <option value="Day">Day</option>
+                    <option value="Week">Week</option>
+                    <option value="Month">Month</option>
+                  </select>
+                </div>
+                {employeeGanttModel.dateRangeLabel ? (
+                  <div className="rounded-md border border-gray-600 bg-gray-900/60 px-3 py-1.5 text-xs font-medium text-gray-200 whitespace-nowrap">
+                    {employeeGanttModel.dateRangeLabel}
+                  </div>
+                ) : null}
                 <div className="inline-flex rounded-lg border border-gray-600 overflow-hidden text-xs font-semibold">
                   <button
                     type="button"
@@ -6252,145 +6427,142 @@ const Visualization = () => {
                   </button>
                 </div>
                 <div className="rounded-md border border-blue-400 bg-blue-500/10 px-3 py-1 text-sm font-semibold text-blue-200 whitespace-nowrap">
-                  Projects: {projectGanttModel.projects.length} · Dates: {projectGanttModel.dates.length}
+                  Employees: {employeeGanttModel.employees.length} · Columns: {employeeGanttModel.buckets.length}
                 </div>
               </div>
             </div>
             <p className="text-gray-400 text-xs mb-3">
-              X-axis: dates · Y-axis: projects · segment colors: employees. Hover a segment for total hours and task breakdown.
+              X-axis: {teamGanttTimeScale.toLowerCase()} buckets (newest on the left) · Y-axis: employees · bar border: accent · bar fill: task mix.
             </p>
 
-            {projectGanttModel.projects.length > 0 && projectGanttModel.dates.length > 0 ? (
+            {employeeGanttModel.employees.length > 0 && employeeGanttModel.buckets.length > 0 ? (
               <div ref={ganttViewportRef} className="overflow-auto max-h-[560px] rounded-lg border border-gray-700 bg-gray-900/50">
                 <div
                   style={{
-                    minWidth: `${GANTT_PROJECT_COL_W + GANTT_EMP_COL_W + projectGanttModel.chartWidth}px`,
+                    minWidth: `${employeeGanttModel.empColW + employeeGanttModel.chartWidth}px`,
                   }}
                 >
                   <div className="sticky top-0 z-20 flex border-b-2 border-indigo-500/50 bg-gray-900/95 backdrop-blur">
-                    <div className="sticky left-0 z-30 w-[260px] px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-300 border-r-2 border-indigo-500/35 bg-gray-900/95">
-                      Projects
-                    </div>
-                    <div className="sticky left-[260px] z-30 w-[170px] px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-300 border-r-2 border-indigo-500/35 bg-gray-900/95">
+                    <div
+                      className="sticky left-0 z-30 shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-300 border-r-2 border-indigo-500/35 bg-gray-900/95"
+                      style={{ width: employeeGanttModel.empColW, minWidth: employeeGanttModel.empColW }}
+                    >
                       Employee
                     </div>
-                    <div className="relative" style={{ width: `${projectGanttModel.chartWidth}px` }}>
+                    <div className="relative" style={{ width: `${employeeGanttModel.chartWidth}px` }}>
                       <div className="flex">
-                        {projectGanttModel.dates.map((d) => (
+                        {employeeGanttModel.buckets.map((b) => (
                           <div
-                            key={d}
-                            className="border-r border-gray-800 px-1 py-2 text-[10px] text-gray-400 text-center shrink-0"
-                            style={{ width: `${projectGanttModel.dayWidth}px` }}
+                            key={b.key}
+                            className="border-r border-gray-800 px-1 py-2 text-[10px] text-gray-400 text-center shrink-0 leading-tight"
+                            style={{ width: `${employeeGanttModel.colWidth}px` }}
                           >
-                            {new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                            {b.label}
                           </div>
                         ))}
                       </div>
                     </div>
                   </div>
 
-                  {projectGanttModel.projects.map((proj) => {
-                    const rowHeight = projectGanttModel.rowHeights.get(proj.project) || 34;
+                  {employeeGanttModel.employees.map((row) => {
+                    const rowHeight = employeeGanttModel.rowHeights.get(row.employee) || 44;
+                    const laneH = employeeGanttModel.laneHeight || 30;
                     return (
-                      <div key={proj.project} className="flex border-b-2 border-indigo-600/45">
+                      <div key={row.employee} className="flex border-b-2 border-indigo-600/45">
                         <div
-                          className="sticky left-0 z-10 w-[260px] border-r-2 border-indigo-500/35 bg-gray-900/95 px-3 py-2 text-xs text-gray-200"
-                          style={{ minHeight: `${rowHeight}px` }}
-                          title={proj.project}
+                          className="sticky left-0 z-10 shrink-0 border-r-2 border-indigo-500/35 bg-gray-900/95 px-2 py-2 flex items-center gap-2"
+                          style={{ width: employeeGanttModel.empColW, minWidth: employeeGanttModel.empColW, minHeight: `${rowHeight}px` }}
+                          title={row.employee}
                         >
-                          <div className="font-semibold truncate">{proj.project}</div>
-                          <div className="text-[10px] text-gray-400 mt-1">{proj.totalHours.toFixed(1)} hrs</div>
-                        </div>
-                        <div
-                          className="sticky left-[260px] z-10 w-[170px] border-r-2 border-indigo-500/35 bg-gray-900/95 px-2 text-[11px] text-gray-300 relative"
-                          style={{ minHeight: `${rowHeight}px` }}
-                        >
-                          {proj.lanes.map((lane, laneIdx) => (
-                            <div
-                              key={`${proj.project}-${lane.employee}-label`}
-                              className="absolute truncate pr-2"
-                              style={{ top: `${laneIdx * 18 + 2}px`, left: '8px', right: '8px', height: '16px' }}
-                              title={lane.employee}
-                            >
-                              {lane.employee}
-                            </div>
-                          ))}
+                          <div className="h-9 w-9 rounded-full bg-indigo-600 text-white text-[11px] font-bold flex items-center justify-center shrink-0">
+                            {employeeNameInitials(row.employee)}
+                          </div>
+                          <div className="min-w-0">
+                            <div className="text-xs font-semibold text-gray-100 truncate">{row.employee}</div>
+                            <div className="text-[10px] text-gray-400">{row.totalHours.toFixed(1)} hrs</div>
+                          </div>
                         </div>
                         <div
                           className="relative"
-                          style={{ width: `${projectGanttModel.chartWidth}px`, minHeight: `${rowHeight}px` }}
+                          style={{ width: `${employeeGanttModel.chartWidth}px`, minHeight: `${rowHeight}px` }}
                         >
-                          {projectGanttModel.dates.map((d, idx) => (
+                          {employeeGanttModel.buckets.map((b, idx) => (
                             <div
-                              key={`${proj.project}-${d}`}
+                              key={`${row.employee}-${b.key}`}
                               className="absolute top-0 bottom-0 border-r border-gray-800/70"
                               style={{
-                                left: `${idx * projectGanttModel.dayWidth}px`,
-                                width: `${projectGanttModel.dayWidth}px`,
+                                left: `${idx * employeeGanttModel.colWidth}px`,
+                                width: `${employeeGanttModel.colWidth}px`,
                               }}
                             />
                           ))}
 
-                          {proj.lanes.map((lane, laneIdx) =>
+                          {row.lanes.map((lane, laneIdx) =>
                             lane.segments.map((seg, segIdx) => {
-                              const left = seg.startIdx * projectGanttModel.dayWidth + 1;
-                              const width = (seg.endIdx - seg.startIdx + 1) * projectGanttModel.dayWidth - 2;
-                              const top = laneIdx * 18 + 4;
+                              const left = seg.startIdx * employeeGanttModel.colWidth + 1;
+                              const width = (seg.endIdx - seg.startIdx + 1) * employeeGanttModel.colWidth - 2;
+                              const top = laneIdx * laneH + 6;
                               const tasksArr = Array.from(seg.tasks.entries())
                                 .map(([task, hours]) => ({ task, hours }))
                                 .sort((a, b) => (b.hours || 0) - (a.hours || 0));
+                              const fromLabel = employeeGanttModel.buckets[seg.startIdx]?.label || '';
+                              const toLabel = employeeGanttModel.buckets[seg.endIdx]?.label || '';
                               return (
                                 <div
-                                  key={`${proj.project}-${lane.employee}-${segIdx}-${seg.startIdx}`}
-                                  className="absolute border border-black/20 cursor-pointer overflow-hidden"
+                                  key={`${row.employee}-${lane.project}-${segIdx}-${seg.startIdx}`}
+                                  className="absolute cursor-pointer overflow-hidden rounded-md border-2 border-blue-400/75 bg-slate-900/90 shadow-sm"
                                   style={{
                                     left: `${left}px`,
                                     top: `${top}px`,
                                     width: `${Math.max(10, width)}px`,
-                                    height: '14px',
-                                    backgroundColor: 'rgba(30,41,59,0.95)',
+                                    height: `${laneH - 8}px`,
                                   }}
                                   onMouseEnter={(e) =>
                                     setGanttHover({
                                       anchorX: e.currentTarget.getBoundingClientRect().right,
                                       anchorY: e.currentTarget.getBoundingClientRect().top + (e.currentTarget.getBoundingClientRect().height / 2),
-                                      project: proj.project,
-                                      employee: lane.employee,
-                                      from: [projectGanttModel.dates[seg.startIdx], projectGanttModel.dates[seg.endIdx]].sort((a, b) => a.localeCompare(b))[0],
-                                      to: [projectGanttModel.dates[seg.startIdx], projectGanttModel.dates[seg.endIdx]].sort((a, b) => b.localeCompare(a))[0],
+                                      project: lane.project,
+                                      employee: row.employee,
+                                      from: fromLabel,
+                                      to: toLabel,
                                       hours: seg.totalHours || 0,
                                       tasks: tasksArr,
                                     })
                                   }
-                                  onMouseMove={(e) =>
-                                    {
-                                      const rect = e.currentTarget?.getBoundingClientRect?.();
-                                      if (!rect) return;
-                                      setGanttHover((prev) =>
-                                        prev
-                                          ? {
-                                              ...prev,
-                                              anchorX: rect.right,
-                                              anchorY: rect.top + (rect.height / 2),
-                                            }
-                                          : prev
-                                      );
-                                    }
-                                  }
+                                  onMouseMove={(e) => {
+                                    const rect = e.currentTarget?.getBoundingClientRect?.();
+                                    if (!rect) return;
+                                    setGanttHover((prev) =>
+                                      prev
+                                        ? {
+                                            ...prev,
+                                            anchorX: rect.right,
+                                            anchorY: rect.top + (rect.height / 2),
+                                          }
+                                        : prev
+                                    );
+                                  }}
                                   onMouseLeave={() => setGanttHover(null)}
-                                  title={`${lane.employee} · ${(seg.totalHours || 0).toFixed(1)} hrs`}
+                                  title={`${lane.project} · ${(seg.totalHours || 0).toFixed(1)} hrs`}
                                 >
-                                  <div className="flex h-full w-full">
+                                  {width >= 72 && (
+                                    <div className="absolute inset-x-0 top-0.5 px-1 pointer-events-none z-[1]">
+                                      <div className="text-[8px] font-bold text-white/95 truncate text-center drop-shadow-sm">
+                                        {lane.project}
+                                      </div>
+                                    </div>
+                                  )}
+                                  <div className="flex h-full w-full items-stretch pt-3 min-h-0">
                                     {tasksArr.map((taskPart, i) => {
                                       const taskHours = Number(taskPart.hours) || 0;
                                       const pct = (seg.totalHours || 0) > 0 ? (taskHours / seg.totalHours) * 100 : 0;
                                       return (
                                         <div
-                                          key={`${proj.project}-${lane.employee}-${segIdx}-${taskPart.task}-${i}`}
-                                          className="h-full"
+                                          key={`${row.employee}-${lane.project}-${segIdx}-${taskPart.task}-${i}`}
+                                          className="h-full min-h-0"
                                           style={{
                                             width: `${Math.max(2, pct)}%`,
-                                            backgroundColor: projectGanttModel.taskColor[taskPart.task] || COLORS[i % COLORS.length],
+                                            backgroundColor: employeeGanttModel.taskColor[taskPart.task] || COLORS[i % COLORS.length],
                                           }}
                                           title={`${taskPart.task}: ${taskHours.toFixed(2)} hrs`}
                                         />
@@ -6409,7 +6581,33 @@ const Visualization = () => {
               </div>
             ) : (
               <div className="h-[220px] flex items-center justify-center text-gray-500 text-sm rounded-lg border border-gray-700">
-                No project timeline data for current filters.
+                No employee timeline data for current filters.
+              </div>
+            )}
+
+            {Object.keys(employeeGanttModel.taskColor || {}).length > 0 && (
+              <div className="mt-4 flex flex-wrap gap-x-4 gap-y-2 border-t border-gray-700 pt-3">
+                <div className="text-[11px] text-gray-400">
+                  <span className="font-semibold text-gray-300">Task types (stacked segments):</span>{' '}
+                  {Object.entries(employeeGanttModel.taskColor)
+                    .slice(0, 14)
+                    .map(([task, color]) => (
+                      <span key={task} className="inline-flex items-center gap-1 mx-1">
+                        <span className="inline-block w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: color }} />
+                        <span className="text-gray-300">{task}</span>
+                      </span>
+                    ))}
+                  {Object.keys(employeeGanttModel.taskColor).length > 14 && (
+                    <span className="text-gray-500">+ more</span>
+                  )}
+                </div>
+                <div className="text-[11px] text-gray-400">
+                  <span className="font-semibold text-gray-300">Bar border:</span>{' '}
+                  <span className="inline-flex items-center gap-1 mx-1">
+                    <span className="inline-block w-4 h-2 rounded-sm border-2 border-blue-400/75 bg-slate-800" />
+                    accent (project lifecycle status is not in this dataset)
+                  </span>
+                </div>
               </div>
             )}
 
@@ -6435,7 +6633,7 @@ const Visualization = () => {
               >
                 <p className="text-white font-semibold break-words">{ganttHover.project}</p>
                 <p className="text-indigo-300 mt-1">Employee: <span className="text-white">{ganttHover.employee}</span></p>
-                <p className="text-gray-300">Range: {ganttHover.from} to {ganttHover.to}</p>
+                <p className="text-gray-300">Range: {ganttHover.from} → {ganttHover.to}</p>
                 <p className="text-purple-300 font-semibold mt-1">Total: {Number(ganttHover.hours || 0).toFixed(2)} hrs</p>
                 <div className="mt-2 border-t border-gray-700 pt-2 max-h-28 overflow-y-auto custom-scrollbar">
                   {ganttHover.tasks?.slice(0, 8).map((t, i) => (

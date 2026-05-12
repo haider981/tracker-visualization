@@ -4811,7 +4811,7 @@ app.get('/api/dashboard/project-view/gantt', async (req, res) => {
     }
 
     const rows = await prisma.masterDatabase.groupBy({
-      by: ['project_name', 'date', 'task_name', 'name'],
+      by: ['project_name', 'date', 'task_name', 'name', 'chapter_number'],
       _sum: { hours_spent: true },
       where: {
         ...where,
@@ -4826,6 +4826,10 @@ app.get('/api/dashboard/project-view/gantt', async (req, res) => {
       date: r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10),
       task_name: r.task_name && String(r.task_name).trim() ? r.task_name : 'Unspecified',
       employee: r.name && String(r.name).trim() ? r.name : 'Unassigned',
+      chapter_number:
+        r.chapter_number != null && String(r.chapter_number).trim()
+          ? String(r.chapter_number).trim()
+          : null,
       hours: Number(r._sum?.hours_spent) || 0
     })).filter((x) => x.hours > 0);
 
