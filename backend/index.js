@@ -4569,6 +4569,10 @@ function buildProjectViewWhere(req) {
     where.project_name = { not: null, notIn: ['', ' ', 'blank', 'Blank', 'BLANK'] };
   }
 
+  // Keep project-view cards in sync with top filters:
+  // segment / class / series should affect timeline, gantt, heatmap, insights too.
+  applyProjectTokenFilters(where, req);
+
   return where;
 }
 
