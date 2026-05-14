@@ -3571,7 +3571,7 @@ import React, { useState, useEffect, useMemo, memo, useRef, useCallback } from '
 import { NavLink, useLocation } from 'react-router-dom';
 import { createPortal } from 'react-dom';
 import { BarChart, Bar, LineChart, Line, PieChart, Pie, AreaChart, Area, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Treemap, LabelList } from 'recharts';
-import { TrendingUp, Users, Clock, Briefcase, Activity, Zap, Target, CheckCircle, Filter, X, Search, Moon, BookMarked, AlertTriangle, LayoutDashboard } from 'lucide-react';
+import { TrendingUp, Users, Clock, Briefcase, Activity, Zap, Target, CheckCircle, Filter, X, Search, Moon, BookMarked, AlertTriangle, LayoutDashboard, LayoutGrid } from 'lucide-react';
 
 const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL || '').replace(/\/$/, '');
 const API_URL = `${BACKEND_URL}/api/dashboard`;
@@ -4136,6 +4136,28 @@ function buildTeamGanttBuckets(datesDesc, timeScale) {
   return { buckets, dateToBucketKey: lookup };
 }
 
+/** Merge per-task chapter hour maps into dest (Map<task, Map<chapter, hours>>). */
+function mergeGanttTaskChapterMaps(dest, src) {
+  if (!src || !dest) return;
+  for (const [task, sm] of src.entries()) {
+    if (!dest.has(task)) dest.set(task, new Map());
+    const dm = dest.get(task);
+    for (const [ch, h] of sm.entries()) {
+      dm.set(ch, (dm.get(ch) || 0) + h);
+    }
+  }
+}
+
+/** Deep-clone Map<task, Map<chapter, hours>>. */
+function cloneGanttTaskChapterMaps(src) {
+  const out = new Map();
+  if (!src) return out;
+  for (const [task, m] of src.entries()) {
+    out.set(task, new Map(m));
+  }
+  return out;
+}
+
 function employeeNameInitials(name) {
   const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
   if (parts.length >= 2) {
@@ -4669,6 +4691,8 @@ const Visualization = () => {
   const [ganttHover, setGanttHover] = useState(null);
   const [ganttSortMode, setGanttSortMode] = useState('hours');
   const [teamGanttTimeScale, setTeamGanttTimeScale] = useState('Week');
+  /** Employee × time heatmap columns (independent from Gantt time scale) */
+  const [teamHoursHeatmapScale, setTeamHoursHeatmapScale] = useState('Week');
   const ganttViewportRef = useRef(null);
   const [ganttViewportWidth, setGanttViewportWidth] = useState(0);
 
@@ -5132,12 +5156,25 @@ const Visualization = () => {
       if (!projMap.has(project)) projMap.set(project, new Map());
       const dayMap = projMap.get(project);
 
-      const existing = dayMap.get(date) || { hours: 0, tasks: new Map() };
+      const existing = dayMap.get(date) || { hours: 0, tasks: new Map(), taskChapters: new Map() };
       existing.hours += Number(r?.hours) || 0;
       if (Array.isArray(r?.tasks)) {
         for (const t of r.tasks) {
           const taskName = String(t?.task || 'Unspecified').trim() || 'Unspecified';
-          existing.tasks.set(taskName, (existing.tasks.get(taskName) || 0) + (Number(t?.hours) || 0));
+          const th = Number(t?.hours) || 0;
+          existing.tasks.set(taskName, (existing.tasks.get(taskName) || 0) + th);
+          if (!existing.taskChapters.has(taskName)) existing.taskChapters.set(taskName, new Map());
+          const chm = existing.taskChapters.get(taskName);
+          if (Array.isArray(t.chapters) && t.chapters.length > 0) {
+            for (const c of t.chapters) {
+              const ckey =
+                c.chapter != null && String(c.chapter).trim() !== '' ? String(c.chapter).trim() : '—';
+              const hh = Number(c.hours) || 0;
+              chm.set(ckey, (chm.get(ckey) || 0) + hh);
+            }
+          } else if (th > 0) {
+            chm.set('—', (chm.get('—') || 0) + th);
+          }
         }
       }
       dayMap.set(date, existing);
@@ -5153,12 +5190,13 @@ const Visualization = () => {
           const bk = dateToBucketKey.get(dateStr);
           if (!bk) continue;
           const key = `${employee}\t${project}\t${bk}`;
-          if (!cellMap.has(key)) cellMap.set(key, { hours: 0, tasks: new Map() });
+          if (!cellMap.has(key)) cellMap.set(key, { hours: 0, tasks: new Map(), taskChapters: new Map() });
           const cell = cellMap.get(key);
           cell.hours += v.hours || 0;
           for (const [tk, h] of v.tasks.entries()) {
             cell.tasks.set(tk, (cell.tasks.get(tk) || 0) + h);
           }
+          mergeGanttTaskChapterMaps(cell.taskChapters, v.taskChapters);
         }
       }
     }
@@ -5209,6 +5247,7 @@ const Visualization = () => {
                 bucketKey: b.key,
                 hours: cell.hours,
                 tasks: cell.tasks,
+                taskChapters: cell.taskChapters,
               });
             }
 
@@ -5222,6 +5261,7 @@ const Visualization = () => {
                   endIdx: d.idx,
                   totalHours: d.hours || 0,
                   tasks: new Map(d.tasks),
+                  taskChapters: cloneGanttTaskChapterMaps(d.taskChapters),
                 };
                 continue;
               }
@@ -5229,6 +5269,7 @@ const Visualization = () => {
                 run.endIdx = d.idx;
                 run.totalHours += d.hours || 0;
                 for (const [tk, h] of d.tasks.entries()) run.tasks.set(tk, (run.tasks.get(tk) || 0) + h);
+                mergeGanttTaskChapterMaps(run.taskChapters, d.taskChapters);
               } else {
                 segments.push(run);
                 run = {
@@ -5237,6 +5278,7 @@ const Visualization = () => {
                   endIdx: d.idx,
                   totalHours: d.hours || 0,
                   tasks: new Map(d.tasks),
+                  taskChapters: cloneGanttTaskChapterMaps(d.taskChapters),
                 };
               }
             }
@@ -5264,9 +5306,9 @@ const Visualization = () => {
       return b.mostRecentIdx - a.mostRecentIdx;
     });
 
-    const LANE_H = 30;
+    const LANE_H = 42;
     const rowHeights = new Map(
-      employees.map((e) => [e.employee, Math.max(40, e.lanes.length * LANE_H + 10)])
+      employees.map((e) => [e.employee, Math.max(48, e.lanes.length * LANE_H + 12)])
     );
 
     return {
@@ -5281,6 +5323,76 @@ const Visualization = () => {
       laneHeight: LANE_H,
     };
   }, [projectGanttRows, ganttViewportWidth, ganttSortMode, teamGanttTimeScale]);
+
+  /** Rows = employees, columns = week or month; cell = total hours in that bucket (all projects). */
+  const employeeHoursHeatmapModel = useMemo(() => {
+    const rows = Array.isArray(projectGanttRows) ? projectGanttRows : [];
+    if (!rows.length) {
+      return {
+        employees: [],
+        buckets: [],
+        cellMap: new Map(),
+        hMin: 0,
+        hMax: 1,
+        empColW: 160,
+        timeScale: teamHoursHeatmapScale,
+      };
+    }
+
+    const dateSet = new Set();
+    const employeeTotals = new Map();
+    const dayHoursByEmp = new Map();
+
+    for (const r of rows) {
+      const employee = String(r?.employee || r?.name || '').trim();
+      const date = String(r?.date || '').slice(0, 10);
+      if (!employee || !date) continue;
+      dateSet.add(date);
+      const h = Number(r?.hours) || 0;
+      employeeTotals.set(employee, (employeeTotals.get(employee) || 0) + h);
+      if (!dayHoursByEmp.has(employee)) dayHoursByEmp.set(employee, new Map());
+      const dm = dayHoursByEmp.get(employee);
+      dm.set(date, (dm.get(date) || 0) + h);
+    }
+
+    const dates = Array.from(dateSet).sort((a, b) => b.localeCompare(a));
+    const { buckets, dateToBucketKey } = buildTeamGanttBuckets(dates, teamHoursHeatmapScale);
+
+    const cellMap = new Map();
+    for (const [employee, dm] of dayHoursByEmp.entries()) {
+      for (const [dateStr, h] of dm.entries()) {
+        const bk = dateToBucketKey.get(dateStr);
+        if (!bk) continue;
+        const key = `${employee}\t${bk}`;
+        cellMap.set(key, (cellMap.get(key) || 0) + h);
+      }
+    }
+
+    let hMin = Infinity;
+    let hMax = 0;
+    for (const v of cellMap.values()) {
+      if (v > 0) {
+        hMin = Math.min(hMin, v);
+        hMax = Math.max(hMax, v);
+      }
+    }
+    if (!Number.isFinite(hMin)) hMin = 0;
+
+    const employees = Array.from(employeeTotals.entries())
+      .filter(([, t]) => t > 0)
+      .sort((a, b) => b[1] - a[1])
+      .map(([name]) => name);
+
+    return {
+      employees,
+      buckets,
+      cellMap,
+      hMin,
+      hMax: Math.max(hMax, 1e-9),
+      empColW: 160,
+      timeScale: teamHoursHeatmapScale,
+    };
+  }, [projectGanttRows, teamHoursHeatmapScale]);
 
   useEffect(() => {
     const node = ganttViewportRef.current;
@@ -6436,7 +6548,7 @@ const Visualization = () => {
             </p>
 
             {employeeGanttModel.employees.length > 0 && employeeGanttModel.buckets.length > 0 ? (
-              <div ref={ganttViewportRef} className="overflow-auto max-h-[560px] rounded-lg border border-gray-700 bg-gray-900/50">
+              <div ref={ganttViewportRef} className="overflow-auto max-h-[640px] rounded-lg border border-gray-700 bg-gray-900/50">
                 <div
                   style={{
                     minWidth: `${employeeGanttModel.empColW + employeeGanttModel.chartWidth}px`,
@@ -6501,7 +6613,7 @@ const Visualization = () => {
                             lane.segments.map((seg, segIdx) => {
                               const left = seg.startIdx * employeeGanttModel.colWidth + 1;
                               const width = (seg.endIdx - seg.startIdx + 1) * employeeGanttModel.colWidth - 2;
-                              const top = laneIdx * laneH + 6;
+                              const top = laneIdx * laneH + 5;
                               const tasksArr = Array.from(seg.tasks.entries())
                                 .map(([task, hours]) => ({ task, hours }))
                                 .sort((a, b) => (b.hours || 0) - (a.hours || 0));
@@ -6510,61 +6622,67 @@ const Visualization = () => {
                               return (
                                 <div
                                   key={`${row.employee}-${lane.project}-${segIdx}-${seg.startIdx}`}
-                                  className="absolute cursor-pointer overflow-hidden rounded-md border-2 border-blue-400/75 bg-slate-900/90 shadow-sm"
+                                  className="absolute overflow-hidden rounded-md border-2 border-blue-400/75 bg-slate-900/90 shadow-sm"
                                   style={{
                                     left: `${left}px`,
                                     top: `${top}px`,
                                     width: `${Math.max(10, width)}px`,
-                                    height: `${laneH - 8}px`,
+                                    height: `${laneH - 10}px`,
                                   }}
-                                  onMouseEnter={(e) =>
-                                    setGanttHover({
-                                      anchorX: e.currentTarget.getBoundingClientRect().right,
-                                      anchorY: e.currentTarget.getBoundingClientRect().top + (e.currentTarget.getBoundingClientRect().height / 2),
-                                      project: lane.project,
-                                      employee: row.employee,
-                                      from: fromLabel,
-                                      to: toLabel,
-                                      hours: seg.totalHours || 0,
-                                      tasks: tasksArr,
-                                    })
-                                  }
-                                  onMouseMove={(e) => {
-                                    const rect = e.currentTarget?.getBoundingClientRect?.();
-                                    if (!rect) return;
-                                    setGanttHover((prev) =>
-                                      prev
-                                        ? {
-                                            ...prev,
-                                            anchorX: rect.right,
-                                            anchorY: rect.top + (rect.height / 2),
-                                          }
-                                        : prev
-                                    );
-                                  }}
-                                  onMouseLeave={() => setGanttHover(null)}
-                                  title={`${lane.project} · ${(seg.totalHours || 0).toFixed(1)} hrs`}
                                 >
-                                  {width >= 72 && (
-                                    <div className="absolute inset-x-0 top-0.5 px-1 pointer-events-none z-[1]">
-                                      <div className="text-[8px] font-bold text-white/95 truncate text-center drop-shadow-sm">
+                                  {width >= 56 && (
+                                    <div className="absolute inset-x-0 top-1 px-1 pointer-events-none z-[1]">
+                                      <div className="text-[11px] font-normal text-white/95 truncate text-center drop-shadow-sm leading-tight">
                                         {lane.project}
                                       </div>
                                     </div>
                                   )}
-                                  <div className="flex h-full w-full items-stretch pt-3 min-h-0">
+                                  <div className="flex h-full w-full items-stretch pt-[22px] min-h-0">
                                     {tasksArr.map((taskPart, i) => {
                                       const taskHours = Number(taskPart.hours) || 0;
                                       const pct = (seg.totalHours || 0) > 0 ? (taskHours / seg.totalHours) * 100 : 0;
+                                      const chm = seg.taskChapters?.get(taskPart.task);
+                                      const breakdown =
+                                        chm && chm.size > 0
+                                          ? [...chm.entries()]
+                                              .sort((a, b) => b[1] - a[1])
+                                              .map(([chapter, hours]) => ({
+                                                key: chapter,
+                                                label: chapter === '—' ? 'No chapter' : `Ch. ${chapter}`,
+                                                hours,
+                                              }))
+                                          : [];
                                       return (
                                         <div
                                           key={`${row.employee}-${lane.project}-${segIdx}-${taskPart.task}-${i}`}
-                                          className="h-full min-h-0"
+                                          role="presentation"
+                                          className="h-full min-h-0 cursor-pointer"
                                           style={{
                                             width: `${Math.max(2, pct)}%`,
-                                            backgroundColor: employeeGanttModel.taskColor[taskPart.task] || COLORS[i % COLORS.length],
+                                            backgroundColor:
+                                              employeeGanttModel.taskColor[taskPart.task] || COLORS[i % COLORS.length],
                                           }}
-                                          title={`${taskPart.task}: ${taskHours.toFixed(2)} hrs`}
+                                          onMouseEnter={(e) =>
+                                            setGanttHover({
+                                              x: e.clientX,
+                                              y: e.clientY,
+                                              row: row.employee,
+                                              project: lane.project,
+                                              task: taskPart.task,
+                                              hours: taskHours,
+                                              total: Number(seg.totalHours) || 0,
+                                              from: fromLabel,
+                                              to: toLabel,
+                                              breakdown,
+                                              breakdownTitle: 'Chapter breakdown',
+                                            })
+                                          }
+                                          onMouseMove={(e) =>
+                                            setGanttHover((prev) =>
+                                              prev ? { ...prev, x: e.clientX, y: e.clientY } : prev
+                                            )
+                                          }
+                                          onMouseLeave={() => setGanttHover(null)}
                                         />
                                       );
                                     })}
@@ -6611,40 +6729,224 @@ const Visualization = () => {
               </div>
             )}
 
-            {ganttHover && (
-              <div
-                className="fixed z-[11000] max-w-sm rounded-lg border border-indigo-500 bg-gray-900 p-3 shadow-2xl text-xs"
-                style={(() => {
-                  const tooltipW = 330;
-                  const tooltipH = 240;
-                  const anchorX = Number(ganttHover.anchorX || 0);
-                  const anchorY = Number(ganttHover.anchorY || 0);
-                  const preferRight = anchorX + 12 + tooltipW <= window.innerWidth - 8;
-                  const left = preferRight
-                    ? anchorX + 12
-                    : Math.max(8, anchorX - tooltipW - 12);
-                  const top = Math.max(8, Math.min(anchorY - tooltipH / 2, window.innerHeight - tooltipH - 8));
-                  return {
-                    left: `${left}px`,
-                    top: `${top}px`,
-                    pointerEvents: 'none',
-                  };
-                })()}
-              >
-                <p className="text-white font-semibold break-words">{ganttHover.project}</p>
-                <p className="text-indigo-300 mt-1">Employee: <span className="text-white">{ganttHover.employee}</span></p>
-                <p className="text-gray-300">Range: {ganttHover.from} → {ganttHover.to}</p>
-                <p className="text-purple-300 font-semibold mt-1">Total: {Number(ganttHover.hours || 0).toFixed(2)} hrs</p>
-                <div className="mt-2 border-t border-gray-700 pt-2 max-h-28 overflow-y-auto custom-scrollbar">
-                  {ganttHover.tasks?.slice(0, 8).map((t, i) => (
-                    <p key={`${t.task}-${i}`} className="text-gray-300">
-                      {t.task} = <span className="text-white font-semibold">{(Number(t.hours) || 0).toFixed(2)} hrs</span>
-                    </p>
-                  ))}
-                  {(ganttHover.tasks?.length || 0) > 8 && (
-                    <p className="text-gray-500 italic">+ {(ganttHover.tasks.length || 0) - 8} more tasks</p>
+            {ganttHover &&
+              createPortal(
+                <div
+                  className="pointer-events-none fixed z-[10003] max-w-xs rounded-lg border border-purple-500/70 bg-gray-900 px-3 py-2 text-xs shadow-xl"
+                  style={{
+                    left: `${Math.min(
+                      Math.max((ganttHover.x || 0) + 12, 8),
+                      (typeof window !== 'undefined' ? window.innerWidth : 800) - 280
+                    )}px`,
+                    top: `${Math.min(
+                      Math.max((ganttHover.y || 0) + 12, 8),
+                      (typeof window !== 'undefined' ? window.innerHeight : 600) - 320
+                    )}px`,
+                  }}
+                >
+                  <p className="text-white font-semibold break-words">{ganttHover.row}</p>
+                  <p className="text-indigo-300 mt-0.5">
+                    Project: <span className="text-white">{ganttHover.project}</span>
+                  </p>
+                  <p className="text-indigo-300 mt-0.5">
+                    Task: <span className="text-white">{ganttHover.task}</span>
+                  </p>
+                  <p className="text-gray-400 mt-0.5">
+                    {ganttHover.from}
+                    {ganttHover.from !== ganttHover.to ? ` → ${ganttHover.to}` : ''}
+                  </p>
+                  <p className="text-purple-200 mt-1">
+                    {Number(ganttHover.hours || 0).toFixed(2)} hrs
+                    {Number(ganttHover.total) > 0 && (
+                      <span className="text-gray-500">
+                        {' '}
+                        ({((Number(ganttHover.hours || 0) / Number(ganttHover.total)) * 100).toFixed(0)}% of segment)
+                      </span>
+                    )}
+                  </p>
+                  {Array.isArray(ganttHover.breakdown) && ganttHover.breakdown.length > 0 && (
+                    <div className="mt-2 border-t border-gray-700 pt-2">
+                      <p className="text-gray-400 text-[10px] font-semibold uppercase tracking-wide mb-1">
+                        {ganttHover.breakdownTitle || 'Chapter breakdown'}
+                      </p>
+                      <div className="max-h-32 overflow-y-auto space-y-0.5 pr-1 custom-scrollbar">
+                        {ganttHover.breakdown.map((line) => (
+                          <div key={String(line.key)} className="flex justify-between gap-3 text-gray-300">
+                            <span className="truncate">{line.label}</span>
+                            <span className="text-white font-semibold shrink-0 tabular-nums">
+                              {Number(line.hours || 0).toFixed(2)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
                   )}
+                </div>,
+                document.body
+              )}
+          </div>
+
+          {/* Employee × day/week/month hours heatmap (after Gantt) */}
+          <div className="bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-xl p-6 shadow-2xl border border-gray-700">
+            <div className="mb-4 flex items-center justify-between gap-3 flex-wrap">
+              <div>
+                <h2 className="text-2xl font-bold text-white flex items-center">
+                  <LayoutGrid className="mr-2 text-cyan-400" /> Employee hours heatmap
+                </h2>
+                <p className="text-gray-400 text-sm mt-1 max-w-3xl">
+                  Rows are employees for the current team filters; columns are calendar days, weeks, or months (newest on the left). Each cell is total hours logged in that period across all projects.
+                </p>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap justify-end">
+                <span className="text-gray-400 text-xs font-semibold whitespace-nowrap">Columns:</span>
+                <div className="inline-flex rounded-lg border border-gray-600 overflow-hidden text-xs font-semibold">
+                  <button
+                    type="button"
+                    className={`px-3 py-1.5 ${teamHoursHeatmapScale === 'Day' ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+                    onClick={() => setTeamHoursHeatmapScale('Day')}
+                  >
+                    Day
+                  </button>
+                  <button
+                    type="button"
+                    className={`px-3 py-1.5 border-l border-gray-600 ${teamHoursHeatmapScale === 'Week' ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+                    onClick={() => setTeamHoursHeatmapScale('Week')}
+                  >
+                    Week
+                  </button>
+                  <button
+                    type="button"
+                    className={`px-3 py-1.5 border-l border-gray-600 ${teamHoursHeatmapScale === 'Month' ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+                    onClick={() => setTeamHoursHeatmapScale('Month')}
+                  >
+                    Month
+                  </button>
                 </div>
+              </div>
+            </div>
+            <p className="text-gray-400 text-xs mb-3">
+              Uses the same underlying data as the employee timeline Gantt. Darker blue = more hours in that bucket. Day view scrolls horizontally to show every day in the filtered range.
+            </p>
+
+            {employeeHoursHeatmapModel.employees.length > 0 && employeeHoursHeatmapModel.buckets.length > 0 ? (
+              <div
+                key={`emp-hours-heat-${teamHoursHeatmapScale}-${employeeHoursHeatmapModel.employees.length}-${employeeHoursHeatmapModel.buckets.length}`}
+                className={`isolate w-full overflow-x-auto overflow-y-auto rounded-lg border border-gray-700 bg-gray-900/40 ${
+                  teamHoursHeatmapScale === 'Day' ? 'max-h-[min(75vh,560px)]' : 'max-h-[min(70vh,480px)]'
+                }`}
+              >
+                <table
+                  className="w-full table-fixed border-separate border-spacing-0 text-[11px]"
+                  style={{
+                    minWidth: `max(100%, ${160 + 74 + employeeHoursHeatmapModel.buckets.length * (teamHoursHeatmapScale === 'Day' ? 40 : 56)}px)`,
+                  }}
+                >
+                  <colgroup>
+                    <col style={{ width: 160 }} />
+                    {employeeHoursHeatmapModel.buckets.map((b) => (
+                      <col key={b.key} />
+                    ))}
+                    <col style={{ width: 74 }} />
+                  </colgroup>
+                  <thead>
+                    <tr>
+                      <th className="sticky top-0 left-0 z-30 w-[160px] bg-gray-800 px-3 py-2 text-left font-semibold text-gray-300 border-b border-r border-gray-700">
+                        Employee
+                      </th>
+                      {employeeHoursHeatmapModel.buckets.map((b) => (
+                        <th
+                          key={b.key}
+                          title={teamHoursHeatmapScale === 'Day' ? `${b.key} — ${b.label}` : b.label}
+                          className={`sticky top-0 z-10 bg-gray-800/90 py-2 text-gray-400 font-semibold border-b border-gray-700 align-bottom ${
+                            teamHoursHeatmapScale === 'Day' ? 'px-0.5 text-[9px]' : 'px-1.5 text-[11px]'
+                          }`}
+                        >
+                          <span className="inline-block w-full text-center leading-tight">{b.label}</span>
+                        </th>
+                      ))}
+                      <th className="sticky top-0 right-0 z-30 w-[74px] bg-gray-800 px-2 py-2 text-gray-200 font-semibold border-b border-l border-gray-700 text-right shadow-[-4px_0_10px_rgba(0,0,0,0.35)]">
+                        Total
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {employeeHoursHeatmapModel.employees.map((emp) => (
+                      <tr key={emp} className="border-b border-gray-800/80">
+                        <td
+                          className="sticky left-0 z-10 w-[160px] bg-gray-900 px-3 py-2 font-medium text-gray-100 border-r border-gray-700 whitespace-nowrap truncate"
+                          title={emp}
+                        >
+                          {emp}
+                        </td>
+                        {employeeHoursHeatmapModel.buckets.map((b) => {
+                          const h = employeeHoursHeatmapModel.cellMap.get(`${emp}\t${b.key}`) || 0;
+                          const rng = Math.max(employeeHoursHeatmapModel.hMax - employeeHoursHeatmapModel.hMin, 1e-6);
+                          const t = (h - employeeHoursHeatmapModel.hMin) / rng;
+                          const clr = h <= 0 ? '#ffffff' : purpleHeatAlpha(Math.max(0.12, Math.min(1, t)));
+                          return (
+                            <td key={`${emp}-${b.key}`} className="p-0.5 border-l border-gray-800/70 text-center align-middle">
+                              <div
+                                title={`${emp}\n${b.label}${teamHoursHeatmapScale === 'Day' ? ` (${b.key})` : ''}\nTotal: ${h.toFixed(1)} hrs`}
+                                className={`w-full rounded-md flex items-center justify-center font-semibold tracking-tight ${
+                                  teamHoursHeatmapScale === 'Day' ? 'min-h-8 py-0.5 text-[9px]' : 'min-h-9 py-0.5 text-[10px]'
+                                }`}
+                                style={{
+                                  backgroundColor: clr,
+                                  color: h <= 0 ? '#111827' : h > employeeHoursHeatmapModel.hMin + rng * 0.55 ? '#fafafa' : '#1e1b24',
+                                }}
+                              >
+                                {h > 0 ? (h >= 99 ? `${Math.round(h)}` : h.toFixed(1)) : ''}
+                              </div>
+                            </td>
+                          );
+                        })}
+                        <td className="sticky right-0 z-20 w-[74px] bg-gray-900 px-2 py-2 text-right text-gray-100 font-semibold border-l border-gray-700 tabular-nums shadow-[-4px_0_10px_rgba(0,0,0,0.35)]">
+                          {employeeHoursHeatmapModel.buckets
+                            .reduce((sum, b) => sum + (employeeHoursHeatmapModel.cellMap.get(`${emp}\t${b.key}`) || 0), 0)
+                            .toFixed(1)}
+                        </td>
+                      </tr>
+                    ))}
+                    <tr className="border-t-2 border-gray-600">
+                      <td className="sticky left-0 bottom-0 z-30 w-[160px] bg-gray-800 px-3 py-2 font-bold text-white border-r border-gray-700">
+                        Total hours
+                      </td>
+                      {employeeHoursHeatmapModel.buckets.map((b) => {
+                        const colTotal = employeeHoursHeatmapModel.employees.reduce(
+                          (sum, emp) => sum + (employeeHoursHeatmapModel.cellMap.get(`${emp}\t${b.key}`) || 0),
+                          0
+                        );
+                        return (
+                          <td
+                            key={`coltot-${b.key}`}
+                            className={`sticky bottom-0 z-20 bg-gray-800 text-center font-bold text-white tabular-nums border-l border-gray-700 ${
+                              teamHoursHeatmapScale === 'Day' ? 'px-0.5 py-1.5 text-[9px]' : 'px-1.5 py-2 text-[11px]'
+                            }`}
+                          >
+                            {colTotal.toFixed(1)}
+                          </td>
+                        );
+                      })}
+                      <td className="sticky right-0 bottom-0 z-40 w-[74px] bg-gray-800 px-2 py-2 text-right font-bold text-white tabular-nums border-l border-gray-700 shadow-[-4px_0_10px_rgba(0,0,0,0.35)]">
+                        {employeeHoursHeatmapModel.employees
+                          .reduce(
+                            (sum, emp) =>
+                              sum +
+                              employeeHoursHeatmapModel.buckets.reduce(
+                                (inner, bk) => inner + (employeeHoursHeatmapModel.cellMap.get(`${emp}\t${bk.key}`) || 0),
+                                0
+                              ),
+                            0
+                          )
+                          .toFixed(1)}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="h-[200px] flex items-center justify-center text-gray-500 text-sm rounded-lg border border-gray-700">
+                No hourly breakdown for the current filters (same source as the Gantt chart).
               </div>
             )}
           </div>

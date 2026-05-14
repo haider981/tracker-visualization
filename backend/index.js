@@ -4441,13 +4441,13 @@ app.get('/api/dashboard/employee-performance-over-time', async (req, res) => {
   }
 });
 
-// Project Gantt rows (project x employee x date with task-hour breakdown)
+// Project Gantt rows (project x employee x date with task-hour breakdown + chapter split)
 app.get('/api/dashboard/project-gantt', async (req, res) => {
   try {
     // Include project-name token filters (segment/class/series)
     const where = applyProjectTokenFilters(buildWhereClause(req), req);
     const rows = await prisma.masterDatabase.groupBy({
-      by: ['project_name', 'name', 'date', 'task_name'],
+      by: ['project_name', 'name', 'date', 'task_name', 'chapter_number'],
       _sum: { hours_spent: true },
       where: {
         ...where,
@@ -4467,21 +4467,42 @@ app.get('/api/dashboard/project-gantt', async (req, res) => {
           employee: r.name,
           date: dateStr,
           hours: 0,
-          tasks: []
+          tasks: {}
         });
       }
       const row = byDay.get(key);
       const h = Number(r?._sum?.hours_spent) || 0;
       row.hours += h;
-      row.tasks.push({
-        task: String(r.task_name || 'Unspecified'),
-        hours: h
-      });
+      const taskName = String(r.task_name || 'Unspecified');
+      const chRaw =
+        r.chapter_number != null && String(r.chapter_number).trim()
+          ? String(r.chapter_number).trim()
+          : '—';
+      if (!row.tasks[taskName]) {
+        row.tasks[taskName] = { hours: 0, chapters: {} };
+      }
+      const t = row.tasks[taskName];
+      t.hours += h;
+      t.chapters[chRaw] = (t.chapters[chRaw] || 0) + h;
     }
 
     const payload = Array.from(byDay.values()).map((r) => ({
-      ...r,
-      tasks: r.tasks.sort((a, b) => (b.hours || 0) - (a.hours || 0))
+      project: r.project,
+      employee: r.employee,
+      date: r.date,
+      hours: r.hours,
+      tasks: Object.entries(r.tasks || {})
+        .map(([task, v]) => ({
+          task,
+          hours: v.hours,
+          chapters: Object.entries(v.chapters || {})
+            .sort((a, b) => (b[1] || 0) - (a[1] || 0))
+            .map(([chapter, hours]) => ({
+              chapter: chapter === '—' ? null : chapter,
+              hours: Number(hours) || 0
+            }))
+        }))
+        .sort((a, b) => (b.hours || 0) - (a.hours || 0))
     }));
 
     payload.sort((a, b) => {
