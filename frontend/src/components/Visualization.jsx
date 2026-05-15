@@ -4064,13 +4064,13 @@ function teamGanttFormatRangeLabel(start, end) {
   return `${s} - ${e}`;
 }
 
-/** datesDesc: ISO day keys, newest first. Returns buckets (newest-left order) + date→bucketKey */
+/** datesDesc: ISO day keys in any order. Returns buckets oldest→newest (left→right) + date→bucketKey */
 function buildTeamGanttBuckets(datesDesc, timeScale) {
   const uniqueDates = [...new Set(datesDesc)];
   const asc = [...uniqueDates].sort((a, b) => a.localeCompare(b));
 
   if (timeScale === 'Day') {
-    const buckets = uniqueDates.map((iso) => {
+    const buckets = asc.map((iso) => {
       const [y, m, d] = iso.split('-').map(Number);
       const dt = new Date(y, (m || 1) - 1, d || 1);
       return {
@@ -4078,7 +4078,7 @@ function buildTeamGanttBuckets(datesDesc, timeScale) {
         label: dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
       };
     });
-    const lookup = new Map(uniqueDates.map((d) => [d, d]));
+    const lookup = new Map(asc.map((d) => [d, d]));
     return { buckets, dateToBucketKey: lookup };
   }
 
@@ -4097,7 +4097,7 @@ function buildTeamGanttBuckets(datesDesc, timeScale) {
         });
       }
     });
-    const buckets = [...monthMap.values()].sort((a, b) => b.key.localeCompare(a.key));
+    const buckets = [...monthMap.values()].sort((a, b) => a.key.localeCompare(b.key));
     const lookup = new Map();
     asc.forEach((iso) => {
       const [y, m, d] = iso.split('-').map(Number);
@@ -4125,7 +4125,7 @@ function buildTeamGanttBuckets(datesDesc, timeScale) {
       });
     }
   });
-  const buckets = [...weekMap.values()].sort((a, b) => b.key.localeCompare(a.key));
+  const buckets = [...weekMap.values()].sort((a, b) => a.key.localeCompare(b.key));
   const lookup = new Map();
   asc.forEach((iso) => {
     const [y, m, d] = iso.split('-').map(Number);
@@ -4156,6 +4156,104 @@ function cloneGanttTaskChapterMaps(src) {
     out.set(task, new Map(m));
   }
   return out;
+}
+
+/** Calendar days spanned by a heatmap bucket (for prorating to avg hrs/week). */
+function calendarDaysInHeatmapBucket(bucket, timeScale) {
+  if (timeScale === 'Day') return 1;
+  if (timeScale === 'Month') {
+    const parts = String(bucket?.key || '').split('-');
+    const y = Number(parts[0]);
+    const m = Number(parts[1]);
+    if (!y || !m) return 30;
+    return new Date(y, m, 0).getDate();
+  }
+  if (bucket?.start instanceof Date && bucket?.end instanceof Date) {
+    const ms = bucket.end.getTime() - bucket.start.getTime();
+    const d = Math.round(ms / 86400000) + 1;
+    return Math.min(14, Math.max(1, d));
+  }
+  return 7;
+}
+
+/** Hours per week if the same pace continued for a full 7-day week (total over `days` calendar days). */
+function hoursToAvgWeeklyRate(totalHours, days) {
+  const d = Math.max(1, Number(days) || 1);
+  return (Number(totalHours) || 0) * (7 / d);
+}
+
+/** Every calendar ISO date from minIso through maxIso inclusive (local calendar days). */
+function enumerateIsoCalendarDaysInclusive(minIso, maxIso) {
+  const a = String(minIso || '').slice(0, 10);
+  const b = String(maxIso || '').slice(0, 10);
+  if (!a || !b || a > b) return [];
+  const [y1, m1, d1] = a.split('-').map(Number);
+  const [y2, m2, d2] = b.split('-').map(Number);
+  const out = [];
+  const cur = new Date(y1, (m1 || 1) - 1, d1 || 1);
+  const end = new Date(y2, (m2 || 1) - 1, d2 || 1);
+  while (cur <= end) {
+    out.push(
+      `${cur.getFullYear()}-${String(cur.getMonth() + 1).padStart(2, '0')}-${String(cur.getDate()).padStart(2, '0')}`
+    );
+    cur.setDate(cur.getDate() + 1);
+  }
+  return out;
+}
+
+/** Local YYYY-MM-DD for a Date (matches backend period day boundaries). */
+function toIsoDateLocal(d) {
+  const x = new Date(d);
+  return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`;
+}
+
+/**
+ * Same bounded range as backend `getPeriodDateRange` (buildWhereClause).
+ * Returns inclusive calendar start/end ISO strings, or null when period is All / unknown.
+ */
+function getDashPeriodIsoRange(periodRaw) {
+  const raw = String(periodRaw || '').trim();
+  if (!raw || raw.toLowerCase() === 'all') return null;
+
+  const normalized = raw.toLowerCase().replace(/\s+/g, ' ');
+  const now = new Date();
+  const start = new Date(now);
+  const end = new Date(now);
+
+  switch (normalized) {
+    case 'last 7 days':
+    case 'last 7 day':
+    case '7d':
+      start.setDate(start.getDate() - 7);
+      break;
+    case 'last 30 days':
+    case 'last 30 day':
+    case '30d':
+      start.setDate(start.getDate() - 30);
+      break;
+    case 'last 3 months':
+    case '3m':
+      start.setMonth(start.getMonth() - 3);
+      break;
+    case 'last 6 months':
+    case '6m':
+      start.setMonth(start.getMonth() - 6);
+      break;
+    case 'last year':
+    case '12m':
+    case '1y':
+      start.setMonth(start.getMonth() - 12);
+      break;
+    case 'this year':
+      start.setFullYear(start.getFullYear(), 0, 1);
+      break;
+    default:
+      return null;
+  }
+
+  start.setHours(0, 0, 0, 0);
+  end.setHours(23, 59, 59, 999);
+  return { startIso: toIsoDateLocal(start), endIso: toIsoDateLocal(end) };
 }
 
 function employeeNameInitials(name) {
@@ -4693,6 +4791,8 @@ const Visualization = () => {
   const [teamGanttTimeScale, setTeamGanttTimeScale] = useState('Week');
   /** Employee × time heatmap columns (independent from Gantt time scale) */
   const [teamHoursHeatmapScale, setTeamHoursHeatmapScale] = useState('Week');
+  /** 'total' = hours in bucket; 'avgWeekly' = equivalent avg hrs/week (prorated by calendar days in bucket) */
+  const [teamHeatmapValueMode, setTeamHeatmapValueMode] = useState('total');
   const ganttViewportRef = useRef(null);
   const [ganttViewportWidth, setGanttViewportWidth] = useState(0);
 
@@ -5285,7 +5385,7 @@ const Visualization = () => {
             if (run) segments.push(run);
 
             const totalHours = segments.reduce((s, seg) => s + (seg.totalHours || 0), 0);
-            const lastIdx = segments.length ? Math.max(...segments.map((seg) => seg.startIdx)) : -1;
+            const lastIdx = segments.length ? Math.max(...segments.map((seg) => seg.endIdx)) : -1;
             return { project, totalHours, segments, lastIdx };
           })
           .filter((l) => l.totalHours > 0)
@@ -5332,10 +5432,12 @@ const Visualization = () => {
         employees: [],
         buckets: [],
         cellMap: new Map(),
+        bucketByKey: new Map(),
         hMin: 0,
         hMax: 1,
         empColW: 160,
         timeScale: teamHoursHeatmapScale,
+        valueMode: teamHeatmapValueMode,
       };
     }
 
@@ -5355,8 +5457,20 @@ const Visualization = () => {
       dm.set(date, (dm.get(date) || 0) + h);
     }
 
-    const dates = Array.from(dateSet).sort((a, b) => b.localeCompare(a));
-    const { buckets, dateToBucketKey } = buildTeamGanttBuckets(dates, teamHoursHeatmapScale);
+    const periodIso = getDashPeriodIsoRange(selectedPeriod);
+    const datesAsc = Array.from(dateSet).sort((a, b) => a.localeCompare(b));
+    const datesForBuckets =
+      teamHoursHeatmapScale === 'Day' && periodIso
+        ? enumerateIsoCalendarDaysInclusive(periodIso.startIso, periodIso.endIso).sort((a, b) =>
+            b.localeCompare(a)
+          )
+        : teamHoursHeatmapScale === 'Day' && datesAsc.length > 0
+          ? enumerateIsoCalendarDaysInclusive(datesAsc[0], datesAsc[datesAsc.length - 1]).sort((a, b) =>
+              b.localeCompare(a)
+            )
+          : Array.from(dateSet).sort((a, b) => b.localeCompare(a));
+    const { buckets, dateToBucketKey } = buildTeamGanttBuckets(datesForBuckets, teamHoursHeatmapScale);
+    const bucketByKey = new Map(buckets.map((b) => [b.key, b]));
 
     const cellMap = new Map();
     for (const [employee, dm] of dayHoursByEmp.entries()) {
@@ -5370,11 +5484,17 @@ const Visualization = () => {
 
     let hMin = Infinity;
     let hMax = 0;
-    for (const v of cellMap.values()) {
-      if (v > 0) {
-        hMin = Math.min(hMin, v);
-        hMax = Math.max(hMax, v);
-      }
+    for (const [key, raw] of cellMap.entries()) {
+      if (raw <= 0) continue;
+      const tab = key.indexOf('\t');
+      const bk = tab >= 0 ? key.slice(tab + 1) : '';
+      const b = bucketByKey.get(bk);
+      const disp =
+        teamHeatmapValueMode === 'avgWeekly' && teamHoursHeatmapScale === 'Month'
+          ? hoursToAvgWeeklyRate(raw, calendarDaysInHeatmapBucket(b, teamHoursHeatmapScale))
+          : raw;
+      hMin = Math.min(hMin, disp);
+      hMax = Math.max(hMax, disp);
     }
     if (!Number.isFinite(hMin)) hMin = 0;
 
@@ -5386,13 +5506,21 @@ const Visualization = () => {
     return {
       employees,
       buckets,
+      bucketByKey,
       cellMap,
       hMin,
       hMax: Math.max(hMax, 1e-9),
       empColW: 160,
       timeScale: teamHoursHeatmapScale,
+      valueMode: teamHeatmapValueMode,
     };
-  }, [projectGanttRows, teamHoursHeatmapScale]);
+  }, [projectGanttRows, teamHoursHeatmapScale, teamHeatmapValueMode, selectedPeriod]);
+
+  useEffect(() => {
+    if (teamHeatmapValueMode === 'avgWeekly' && (teamHoursHeatmapScale === 'Day' || teamHoursHeatmapScale === 'Week')) {
+      setTeamHoursHeatmapScale('Month');
+    }
+  }, [teamHeatmapValueMode, teamHoursHeatmapScale]);
 
   useEffect(() => {
     const node = ganttViewportRef.current;
@@ -6544,7 +6672,7 @@ const Visualization = () => {
               </div>
             </div>
             <p className="text-gray-400 text-xs mb-3">
-              X-axis: {teamGanttTimeScale.toLowerCase()} buckets (newest on the left) · Y-axis: employees · bar border: accent · bar fill: task mix.
+              X-axis: {teamGanttTimeScale.toLowerCase()} buckets (oldest on the left, newest on the right) · Y-axis: employees · bar border: accent · bar fill: task mix.
             </p>
 
             {employeeGanttModel.employees.length > 0 && employeeGanttModel.buckets.length > 0 ? (
@@ -6794,23 +6922,67 @@ const Visualization = () => {
                   <LayoutGrid className="mr-2 text-cyan-400" /> Employee hours heatmap
                 </h2>
                 <p className="text-gray-400 text-sm mt-1 max-w-3xl">
-                  Rows are employees for the current team filters; columns are calendar days, weeks, or months (newest on the left). Each cell is total hours logged in that period across all projects.
+                  Rows are employees for the current team filters; columns are calendar days, weeks, or months (oldest on the left, newest on the right).{' '}
+                  <span className="text-gray-500">
+                    {teamHeatmapValueMode === 'total'
+                      ? 'Each cell shows total hours logged in that bucket across all projects.'
+                      : 'Month columns only: equivalent avg hours per week = (hours in that month) × 7 ÷ (days in that calendar month). Switch to Month to use this mode. Total column stays sum of raw hours.'}
+                  </span>
                 </p>
               </div>
-              <div className="flex items-center gap-2 flex-wrap justify-end">
-                <span className="text-gray-400 text-xs font-semibold whitespace-nowrap">Columns:</span>
+              <div className="flex flex-col items-end gap-2 sm:flex-row sm:items-center sm:gap-3 flex-wrap justify-end">
+                <div className="flex items-center gap-2 flex-wrap justify-end">
+                  <span className="text-gray-400 text-xs font-semibold whitespace-nowrap">Values:</span>
+                  <div className="inline-flex rounded-lg border border-gray-600 overflow-hidden text-xs font-semibold">
+                    <button
+                      type="button"
+                      className={`px-3 py-1.5 ${teamHeatmapValueMode === 'total' ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+                      onClick={() => setTeamHeatmapValueMode('total')}
+                    >
+                      Total hrs
+                    </button>
+                    <button
+                      type="button"
+                      title="Average weekly rate from each bucket (Month only: prorated by days in that month)"
+                      className={`px-3 py-1.5 border-l border-gray-600 ${
+                        teamHeatmapValueMode === 'avgWeekly' ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                      }`}
+                      onClick={() => setTeamHeatmapValueMode('avgWeekly')}
+                    >
+                      Avg / week
+                    </button>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 flex-wrap justify-end">
+                  <span className="text-gray-400 text-xs font-semibold whitespace-nowrap">Columns:</span>
                 <div className="inline-flex rounded-lg border border-gray-600 overflow-hidden text-xs font-semibold">
                   <button
                     type="button"
-                    className={`px-3 py-1.5 ${teamHoursHeatmapScale === 'Day' ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
-                    onClick={() => setTeamHoursHeatmapScale('Day')}
+                    disabled={teamHeatmapValueMode === 'avgWeekly'}
+                    title={
+                      teamHeatmapValueMode === 'avgWeekly'
+                        ? 'Switch Values to Total hrs to use Day columns'
+                        : undefined
+                    }
+                    className={`px-3 py-1.5 ${teamHoursHeatmapScale === 'Day' ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'} ${
+                      teamHeatmapValueMode === 'avgWeekly' ? 'opacity-45 cursor-not-allowed' : ''
+                    }`}
+                    onClick={() => teamHeatmapValueMode !== 'avgWeekly' && setTeamHoursHeatmapScale('Day')}
                   >
                     Day
                   </button>
                   <button
                     type="button"
-                    className={`px-3 py-1.5 border-l border-gray-600 ${teamHoursHeatmapScale === 'Week' ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
-                    onClick={() => setTeamHoursHeatmapScale('Week')}
+                    disabled={teamHeatmapValueMode === 'avgWeekly'}
+                    title={
+                      teamHeatmapValueMode === 'avgWeekly'
+                        ? 'Switch Values to Total hrs to use Week columns'
+                        : undefined
+                    }
+                    className={`px-3 py-1.5 border-l border-gray-600 ${teamHoursHeatmapScale === 'Week' ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'} ${
+                      teamHeatmapValueMode === 'avgWeekly' ? 'opacity-45 cursor-not-allowed' : ''
+                    }`}
+                    onClick={() => teamHeatmapValueMode !== 'avgWeekly' && setTeamHoursHeatmapScale('Week')}
                   >
                     Week
                   </button>
@@ -6822,15 +6994,29 @@ const Visualization = () => {
                     Month
                   </button>
                 </div>
+                </div>
               </div>
             </div>
             <p className="text-gray-400 text-xs mb-3">
-              Uses the same underlying data as the employee timeline Gantt. Darker blue = more hours in that bucket. Day view scrolls horizontally to show every day in the filtered range.
+              Uses the same underlying data as the employee timeline Gantt. Darker blue = higher values in the current mode.{' '}
+              {teamHoursHeatmapScale === 'Day'
+                ? `Day columns match the Period filter when it is a fixed window (e.g. Last 7 Days through today); for All or unknown periods they span the earliest–latest logged date. Days with no hours show 0. Scroll horizontally for the full range.`
+                : 'Scroll wide grids horizontally as needed.'}
+              {teamHeatmapValueMode === 'total' && teamHoursHeatmapScale === 'Month' && (
+                <span className="block mt-1 text-gray-500">
+                  Month cells and the Total column use one decimal; Total is the exact sum of hours in those months (add the precise values from tooltips if you need to match by hand).
+                </span>
+              )}
+              {teamHeatmapValueMode === 'avgWeekly' && teamHoursHeatmapScale === 'Month' && (
+                <span className="block mt-1 text-indigo-300/90">
+                  Avg / week uses each month&apos;s calendar day count to prorate that month&apos;s hours to a 7-day week.
+                </span>
+              )}
             </p>
 
             {employeeHoursHeatmapModel.employees.length > 0 && employeeHoursHeatmapModel.buckets.length > 0 ? (
               <div
-                key={`emp-hours-heat-${teamHoursHeatmapScale}-${employeeHoursHeatmapModel.employees.length}-${employeeHoursHeatmapModel.buckets.length}`}
+                key={`emp-hours-heat-${teamHoursHeatmapScale}-${teamHeatmapValueMode}-${employeeHoursHeatmapModel.employees.length}-${employeeHoursHeatmapModel.buckets.length}`}
                 className={`isolate w-full overflow-x-auto overflow-y-auto rounded-lg border border-gray-700 bg-gray-900/40 ${
                   teamHoursHeatmapScale === 'Day' ? 'max-h-[min(75vh,560px)]' : 'max-h-[min(70vh,480px)]'
                 }`}
@@ -6879,23 +7065,46 @@ const Visualization = () => {
                           {emp}
                         </td>
                         {employeeHoursHeatmapModel.buckets.map((b) => {
-                          const h = employeeHoursHeatmapModel.cellMap.get(`${emp}\t${b.key}`) || 0;
+                          const raw = employeeHoursHeatmapModel.cellMap.get(`${emp}\t${b.key}`) || 0;
+                          const bucket = employeeHoursHeatmapModel.bucketByKey?.get(b.key);
+                          const useAvgWeekly =
+                            teamHeatmapValueMode === 'avgWeekly' && teamHoursHeatmapScale === 'Month';
+                          const display = useAvgWeekly
+                            ? hoursToAvgWeeklyRate(
+                                raw,
+                                calendarDaysInHeatmapBucket(bucket, teamHoursHeatmapScale)
+                              )
+                            : raw;
                           const rng = Math.max(employeeHoursHeatmapModel.hMax - employeeHoursHeatmapModel.hMin, 1e-6);
-                          const t = (h - employeeHoursHeatmapModel.hMin) / rng;
-                          const clr = h <= 0 ? '#ffffff' : purpleHeatAlpha(Math.max(0.12, Math.min(1, t)));
+                          const t = (display - employeeHoursHeatmapModel.hMin) / rng;
+                          const isZeroCell = Math.abs(display) < 1e-6;
+                          const clr = isZeroCell
+                            ? '#f1f5f9'
+                            : purpleHeatAlpha(Math.max(0.12, Math.min(1, t)));
+                          const titleExtra = isZeroCell
+                            ? useAvgWeekly
+                              ? '\nNo hours in this bucket'
+                              : '\n0 hrs logged'
+                            : useAvgWeekly
+                              ? `\nTotal in bucket: ${raw.toFixed(1)} hrs\nAvg / week (prorated): ${display.toFixed(1)} hrs`
+                              : `\nTotal: ${raw.toFixed(1)} hrs`;
                           return (
                             <td key={`${emp}-${b.key}`} className="p-0.5 border-l border-gray-800/70 text-center align-middle">
                               <div
-                                title={`${emp}\n${b.label}${teamHoursHeatmapScale === 'Day' ? ` (${b.key})` : ''}\nTotal: ${h.toFixed(1)} hrs`}
+                                title={`${emp}\n${b.label}${teamHoursHeatmapScale === 'Day' ? ` (${b.key})` : ''}${titleExtra}`}
                                 className={`w-full rounded-md flex items-center justify-center font-semibold tracking-tight ${
                                   teamHoursHeatmapScale === 'Day' ? 'min-h-8 py-0.5 text-[9px]' : 'min-h-9 py-0.5 text-[10px]'
                                 }`}
                                 style={{
                                   backgroundColor: clr,
-                                  color: h <= 0 ? '#111827' : h > employeeHoursHeatmapModel.hMin + rng * 0.55 ? '#fafafa' : '#1e1b24',
+                                  color: isZeroCell
+                                    ? '#64748b'
+                                    : display > employeeHoursHeatmapModel.hMin + rng * 0.55
+                                      ? '#fafafa'
+                                      : '#1e1b24',
                                 }}
                               >
-                                {h > 0 ? (h >= 99 ? `${Math.round(h)}` : h.toFixed(1)) : ''}
+                                {isZeroCell ? '0' : display.toFixed(1)}
                               </div>
                             </td>
                           );

@@ -586,7 +586,8 @@
 
 // export default Visualization2;
 
-import React, { useState, useEffect, useRef, memo, useMemo } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, memo, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import { NavLink, useLocation } from 'react-router-dom';
 import {
   AreaChart,
@@ -619,7 +620,8 @@ import {
   Zap,
   TrendingUp,
   Target,
-  Activity
+  Activity,
+  ChevronDown
 } from 'lucide-react';
 
 const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL || '').replace(/\/$/, '');
@@ -637,6 +639,24 @@ function projectDashTabFromPath(pathname) {
   if (pathname === '/project/night') return 'night';
   if (pathname === '/project/books') return 'books';
   return 'projects';
+}
+
+function appendSeriesParams(params, seriesArr) {
+  (Array.isArray(seriesArr) ? seriesArr : []).forEach((s) => {
+    const t = String(s || '').trim();
+    if (t) params.append('series', t);
+  });
+}
+
+/** Series token for project_name — must match backend `projectSeriesToken` rules. */
+function extractProjectSeriesToken(projectName) {
+  if (!projectName || typeof projectName !== 'string') return '';
+  const parts = projectName.split('_').map((x) => x.trim()).filter(Boolean);
+  const parenIdx = parts.findIndex((p) => p && /^\(.+\)$/.test(p));
+  if (parenIdx > 2) return parts[parenIdx - 1] || '';
+  const yearIdx = parts.findIndex((p) => p && /^\d{2}-\d{2}$/.test(p));
+  if (yearIdx > 2) return parts[yearIdx - 1] || '';
+  return parts[4] || parts[3] || '';
 }
 
 // Department → team-name matcher  (same logic as Visualization.jsx)
@@ -771,6 +791,34 @@ const HEATMAP_TASK_STAGE_ORDER = [
   'GLANCE'
 ];
 
+/** Inclusive calendar days: maxDate and the prior N−1 days (N-day window) for task-stage heatmap blue. */
+const HEATMAP_BLUE_ROLLING_DAYS = 7;
+
+function heatmapIsoAddDays(iso, deltaDays) {
+  const [y, m, d] = String(iso || '').slice(0, 10).split('-').map(Number);
+  if (!y) return '';
+  const dt = new Date(y, (m || 1) - 1, d || 1);
+  dt.setDate(dt.getDate() + deltaDays);
+  return getIsoDateKey(dt);
+}
+
+/** Canonical heatmap stages (DRF … GLANCE) that had hours in the inclusive date window. */
+function heatmapStagesActiveInInclusiveWindow(rows, maxDateIso, windowDays) {
+  const end = String(maxDateIso || '').slice(0, 10);
+  if (!end) return new Set();
+  const n = Math.max(1, Number(windowDays) || 7);
+  const start = heatmapIsoAddDays(end, -(n - 1));
+  const out = new Set();
+  for (const row of rows) {
+    if ((Number(row.hours) || 0) <= 0) continue;
+    const d = String(row.date || '').slice(0, 10);
+    if (!d || d < start || d > end) continue;
+    const c = canonicalHeatmapStageFromRaw(row.task_name || '');
+    if (c) out.add(c);
+  }
+  return out;
+}
+
 function heatmapStageOrderIndex(taskName) {
   const raw = String(taskName || '').trim();
   if (!raw) return 99999;
@@ -824,8 +872,8 @@ function formatRangeLabel(start, end) {
 }
 
 /**
- * Build descending X-axis buckets for gantt time scale.
- * datesDesc contains ISO date keys sorted newest -> oldest.
+ * Build chronological X-axis buckets for gantt time scale (oldest left, newest right).
+ * datesDesc may be in any order; bucket order follows ascending calendar.
  */
 function buildGanttBuckets(datesDesc, timeScale) {
   const uniqueDates = [...new Set(datesDesc)];
@@ -834,7 +882,7 @@ function buildGanttBuckets(datesDesc, timeScale) {
   const maxIso = asc[asc.length - 1] || null;
 
   if (timeScale === 'Day') {
-    const buckets = uniqueDates.map((iso) => {
+    const buckets = asc.map((iso) => {
       const [y, m, d] = iso.split('-').map(Number);
       const dt = new Date(y, (m || 1) - 1, d || 1);
       return {
@@ -842,7 +890,7 @@ function buildGanttBuckets(datesDesc, timeScale) {
         label: dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
       };
     });
-    const lookup = new Map(uniqueDates.map((d) => [d, d]));
+    const lookup = new Map(asc.map((d) => [d, d]));
     return { buckets, dateToBucketKey: lookup };
   }
 
@@ -861,7 +909,7 @@ function buildGanttBuckets(datesDesc, timeScale) {
         });
       }
     });
-    const buckets = [...monthMap.values()].sort((a, b) => b.key.localeCompare(a.key));
+    const buckets = [...monthMap.values()].sort((a, b) => a.key.localeCompare(b.key));
     const lookup = new Map();
     asc.forEach((iso) => {
       const [y, m, d] = iso.split('-').map(Number);
@@ -902,7 +950,7 @@ function buildGanttBuckets(datesDesc, timeScale) {
       });
     }
   });
-  const buckets = [...weekMap.values()].sort((a, b) => b.key.localeCompare(a.key));
+  const buckets = [...weekMap.values()].sort((a, b) => a.key.localeCompare(b.key));
   const lookup = new Map();
   asc.forEach((iso) => {
     const [y, m, d] = iso.split('-').map(Number);
@@ -1037,7 +1085,7 @@ const Visualization2 = () => {
   const [classesList, setClassesList] = useState([]);
 
   const [selSegment, setSelSegment] = useState('All');
-  const [selSeries, setSelSeries] = useState('All');
+  const [selectedSeries, setSelectedSeries] = useState([]);
   const [selClass, setSelClass] = useState('All');
   const [selPeriod, setSelPeriod] = useState('Last 7 Days');
   const [ganttTimeScale, setGanttTimeScale] = useState('Week');
@@ -1048,6 +1096,8 @@ const Visualization2 = () => {
 
   // ── dropdown visibility ──
   const [showProjDrop, setShowProjDrop] = useState(false);
+  const [showSeriesDrop, setShowSeriesDrop] = useState(false);
+  const [seriesSearch, setSeriesSearch] = useState('');
 
   // ── data ──
   const [projects, setProjects] = useState([]);  // top-10 with task breakdown
@@ -1057,10 +1107,14 @@ const Visualization2 = () => {
   const [timeline, setTimeline] = useState([]);  // area chart rows
   const [timelineTasks, setTimelineTasks] = useState([]);  // task keys present in timeline
   const [ganttRows, setGanttRows] = useState([]);
+  /** Gantt rows without the Gantt-only department filter — used for task stage heatmap so it stays stable when Department changes. */
+  const [ganttRowsStageHeatmap, setGanttRowsStageHeatmap] = useState([]);
   const [ganttLoading, setGanttLoading] = useState(false);
   const [ganttTooltip, setGanttTooltip] = useState(null);
   const ganttViewportRef = useRef(null);
   const [ganttViewportWidth, setGanttViewportWidth] = useState(0);
+  const projectBarsViewportRef = useRef(null);
+  const [projectBarsChartWidth, setProjectBarsChartWidth] = useState(0);
   const [projectInsights, setProjectInsights] = useState(null);
   const [insightsLoading, setInsightsLoading] = useState(false);
   const [expandedTask, setExpandedTask] = useState(null);
@@ -1077,6 +1131,15 @@ const Visualization2 = () => {
 
   // ── refs ──
   const projDropRef = useRef(null);
+  const seriesDropRef = useRef(null);
+  const seriesPanelRef = useRef(null);
+  /** Fixed position for Series panel (portal) — avoids overflow-x-auto clipping on the filter row */
+  const [seriesPanelPos, setSeriesPanelPos] = useState(null);
+
+  const seriesSelectionKey = useMemo(
+    () => [...selectedSeries].sort((a, b) => a.localeCompare(b)).join('\t'),
+    [selectedSeries]
+  );
 
   // ─── colour map: stable across renders, built from ALL tasks seen in projects data ──
   const globalTaskColorMap = useMemo(() => {
@@ -1092,14 +1155,10 @@ const Visualization2 = () => {
     return buildColorMap([...set]);
   }, [projects]);
 
-  // ─── fetch all project names (NO filters) once to derive all segment/series/class options
+  // ─── fetch project names to derive segment / series / class dropdowns (no period — period is downstream only)
   const fetchFilters = async () => {
     try {
-      // Fetch project names WITHOUT any segment/series/class filters (only team/employee/period)
-      const params = new URLSearchParams();
-      if (selPeriod !== 'All') params.append('period', selPeriod);
-      const sfx = params.toString() ? `?${params.toString()}` : '';
-      const projRes = await fetch(`${API_URL}/project-view/filter/project-names${sfx}`);
+      const projRes = await fetch(`${API_URL}/project-view/filter/project-names`);
       const namesRaw = tryParseJson(await projRes.text());
       const names = asJsonArray(namesRaw);
       setProjectNames(names);
@@ -1109,16 +1168,7 @@ const Visualization2 = () => {
       const classSet = new Set();
       const seriesSet = new Set();
 
-      const detectSeries = (parts) => {
-        // prefer token immediately before a parenthesised token like '(Eng)'
-        const parenIdx = parts.findIndex(p => p && /^\(.+\)$/.test(p));
-        if (parenIdx > 2) return parts[parenIdx - 1];
-        // otherwise prefer token immediately before a year token like '26-27'
-        const yearIdx = parts.findIndex(p => p && /^\d{2}-\d{2}$/.test(p));
-        if (yearIdx > 2) return parts[yearIdx - 1];
-        // fallback to 4th token if present, else 3rd
-        return parts[4] || parts[3] || '';
-      };
+      const detectSeries = (parts) => extractProjectSeriesToken(parts.join('_'));
 
       names.forEach(n => {
         const parts = n.split('_').map(p => p.trim()).filter(Boolean);
@@ -1141,7 +1191,7 @@ const Visualization2 = () => {
       // Send filters to backend: segment/series/class/period + selected projects
       const params = new URLSearchParams();
       if (selSegment !== 'All') params.append('segment', selSegment);
-      if (selSeries !== 'All') params.append('series', selSeries);
+      appendSeriesParams(params, selectedSeries);
       if (selClass !== 'All') params.append('class', selClass);
       if (selPeriod !== 'All') params.append('period', selPeriod);
       if (selectedProjects.length > 0) selectedProjects.forEach(p => params.append('project_name', p));
@@ -1160,7 +1210,7 @@ const Visualization2 = () => {
   const buildAnalyticsQueryParams = () => {
     const params = new URLSearchParams();
     if (selSegment !== 'All') params.append('segment', selSegment);
-    if (selSeries !== 'All') params.append('series', selSeries);
+    appendSeriesParams(params, selectedSeries);
     if (selClass !== 'All') params.append('class', selClass);
     if (selPeriod !== 'All') params.append('period', selPeriod);
     selectedProjects.forEach((p) => params.append('project_name', p));
@@ -1190,7 +1240,7 @@ const Visualization2 = () => {
     try {
       const params = new URLSearchParams();
       if (selSegment !== 'All') params.append('segment', selSegment);
-      if (selSeries !== 'All') params.append('series', selSeries);
+      appendSeriesParams(params, selectedSeries);
       if (selClass !== 'All') params.append('class', selClass);
       if (selPeriod !== 'All') params.append('period', selPeriod);
       selectedProjects.forEach((p) => params.append('project_name', p));
@@ -1245,7 +1295,7 @@ const Visualization2 = () => {
       projectNamesArray.forEach(n => params.append('project_name', n));
       if (selPeriod !== 'All') params.append('period', selPeriod);
       if (selSegment !== 'All') params.append('segment', selSegment);
-      if (selSeries !== 'All') params.append('series', selSeries);
+      appendSeriesParams(params, selectedSeries);
       if (selClass !== 'All') params.append('class', selClass);
 
       const res = await fetch(`${API_URL}/project-view/timeline?${params}`);
@@ -1272,7 +1322,7 @@ const Visualization2 = () => {
       projectNamesArray.forEach(n => params.append('project_name', n));
       if (selPeriod !== 'All') params.append('period', selPeriod);
       if (selSegment !== 'All') params.append('segment', selSegment);
-      if (selSeries !== 'All') params.append('series', selSeries);
+      appendSeriesParams(params, selectedSeries);
       if (selClass !== 'All') params.append('class', selClass);
 
       const res = await fetch(`${API_URL}/project-view/project-insights?${params.toString()}`);
@@ -1291,25 +1341,30 @@ const Visualization2 = () => {
     }
   };
 
+  const fetchProjectGanttRows = async (projectNamesArray, department) => {
+    const params = new URLSearchParams();
+    if (Array.isArray(projectNamesArray) && projectNamesArray.length > 0) {
+      projectNamesArray.forEach((n) => params.append('project_name', n));
+    }
+    if (selPeriod !== 'All') params.append('period', selPeriod);
+    if (selSegment !== 'All') params.append('segment', selSegment);
+    appendSeriesParams(params, selectedSeries);
+    if (selClass !== 'All') params.append('class', selClass);
+    if (department != null && department !== 'All') {
+      const deptApiValue = department === 'Digital_Marketing' ? 'Digital Marketing' : department;
+      params.append('department', deptApiValue);
+    }
+
+    const res = await fetch(`${API_URL}/project-view/gantt?${params.toString()}`);
+    const data = tryParseJson(await res.text());
+    return asJsonArray(data);
+  };
+
   const fetchProjectGantt = async (projectNamesArray) => {
     setGanttLoading(true);
     try {
-      const params = new URLSearchParams();
-      if (Array.isArray(projectNamesArray) && projectNamesArray.length > 0) {
-        projectNamesArray.forEach((n) => params.append('project_name', n));
-      }
-      if (selPeriod !== 'All') params.append('period', selPeriod);
-      if (selSegment !== 'All') params.append('segment', selSegment);
-      if (selSeries !== 'All') params.append('series', selSeries);
-      if (selClass !== 'All') params.append('class', selClass);
-      if (ganttDepartment !== 'All') {
-        const deptApiValue = ganttDepartment === 'Digital_Marketing' ? 'Digital Marketing' : ganttDepartment;
-        params.append('department', deptApiValue);
-      }
-
-      const res = await fetch(`${API_URL}/project-view/gantt?${params.toString()}`);
-      const data = tryParseJson(await res.text());
-      setGanttRows(asJsonArray(data));
+      const data = await fetchProjectGanttRows(projectNamesArray, ganttDepartment);
+      setGanttRows(data);
     } catch (e) {
       console.error('fetchProjectGantt', e);
       setGanttRows([]);
@@ -1318,17 +1373,30 @@ const Visualization2 = () => {
     }
   };
 
+  const fetchProjectGanttStageHeatmapRows = async (projectNamesArray) => {
+    try {
+      const data = await fetchProjectGanttRows(projectNamesArray, 'All');
+      setGanttRowsStageHeatmap(data);
+    } catch (e) {
+      console.error('fetchProjectGanttStageHeatmapRows', e);
+      setGanttRowsStageHeatmap([]);
+    }
+  };
+
   // ─── effects ─────────────────────────────────────────────────
-  // initial + whenever period changes: project-name list for filters (respects period)
-  useEffect(() => { fetchFilters(); }, [selPeriod]);
+  // Load filter vocabulary once; chain is segment → series → class → period (period must not reshape series/class options)
+  useEffect(() => {
+    fetchFilters();
+  }, []);
 
   // refetch projects automatically when filter selections change
-  useEffect(() => { fetchProjects(); }, [selSegment, selSeries, selClass, selPeriod, selectedProjects]);
+  useEffect(() => { fetchProjects(); }, [selSegment, seriesSelectionKey, selClass, selPeriod, selectedProjects]);
 
   // timeline + deep dive follow active project OR all selected projects
-  useEffect(() => { fetchTimeline(timelineInsightProjects); }, [timelineInsightProjects, selPeriod, selSegment, selSeries, selClass]);
-  useEffect(() => { fetchProjectGantt(ganttFetchTarget); }, [ganttFetchTarget, selPeriod, selSegment, selSeries, selClass, ganttDepartment]);
-  useEffect(() => { fetchProjectInsights(timelineInsightProjects); }, [timelineInsightProjects, selPeriod, selSegment, selSeries, selClass]);
+  useEffect(() => { fetchTimeline(timelineInsightProjects); }, [timelineInsightProjects, selPeriod, selSegment, seriesSelectionKey, selClass]);
+  useEffect(() => { fetchProjectGanttStageHeatmapRows(ganttFetchTarget); }, [ganttFetchTarget, selPeriod, selSegment, seriesSelectionKey, selClass]);
+  useEffect(() => { fetchProjectGantt(ganttFetchTarget); }, [ganttFetchTarget, selPeriod, selSegment, seriesSelectionKey, selClass, ganttDepartment]);
+  useEffect(() => { fetchProjectInsights(timelineInsightProjects); }, [timelineInsightProjects, selPeriod, selSegment, seriesSelectionKey, selClass]);
   useEffect(() => {
     if (activeProject && !selectedProjects.includes(activeProject)) {
       setActiveProject(null);
@@ -1338,7 +1406,7 @@ const Visualization2 = () => {
 
   useEffect(() => {
     if (dashTab === 'night') fetchNightAnalytics();
-  }, [dashTab, selSegment, selSeries, selClass, selPeriod, selectedProjects]);
+  }, [dashTab, selSegment, seriesSelectionKey, selClass, selPeriod, selectedProjects]);
 
   useEffect(() => {
     if (dashTab !== 'books') return undefined;
@@ -1347,7 +1415,7 @@ const Visualization2 = () => {
       crossBooksFetchSeq.current += 1;
       setBooksLoading(false);
     };
-  }, [dashTab, selSegment, selSeries, selClass, selPeriod, selectedProjects, bookSessionMin]);
+  }, [dashTab, selSegment, seriesSelectionKey, selClass, selPeriod, selectedProjects, bookSessionMin]);
 
   useEffect(() => {
     if (!selectedBookGroup) return;
@@ -1357,10 +1425,45 @@ const Visualization2 = () => {
     return () => cancelAnimationFrame(id);
   }, [selectedBookGroup?.baseKey]);
 
-  // Click-outside closes project search dropdown
+  // Series multi-select: fixed portal below trigger (filter row uses overflow-x-auto which clips absolute menus)
+  useLayoutEffect(() => {
+    if (!showSeriesDrop) {
+      setSeriesPanelPos(null);
+      return undefined;
+    }
+    const update = () => {
+      const el = seriesDropRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const panelW = Math.min(Math.max(r.width, 288), vw - 16);
+      let left = r.left;
+      if (left + panelW > vw - 8) left = Math.max(8, vw - 8 - panelW);
+      const top = r.bottom + 4;
+      const maxH = Math.max(140, Math.min(320, vh - top - 12));
+      setSeriesPanelPos({ top, left, width: panelW, maxH });
+    };
+    update();
+    window.addEventListener('resize', update);
+    window.addEventListener('scroll', update, true);
+    return () => {
+      window.removeEventListener('resize', update);
+      window.removeEventListener('scroll', update, true);
+    };
+  }, [showSeriesDrop]);
+
   useEffect(() => {
     const handler = (e) => {
       if (projDropRef.current && !projDropRef.current.contains(e.target)) setShowProjDrop(false);
+      const t = e.target;
+      const inSeries =
+        (seriesDropRef.current && seriesDropRef.current.contains(t)) ||
+        (seriesPanelRef.current && seriesPanelRef.current.contains(t));
+      if (!inSeries) {
+        setShowSeriesDrop(false);
+        setSeriesSearch('');
+      }
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
@@ -1368,11 +1471,14 @@ const Visualization2 = () => {
 
   // ─── clear all ───────────────────────────────────────────────
   const clearAll = () => {
-    setSelSegment('All'); setSelSeries('All'); setSelClass('All');
+    setSelSegment('All');
+    setSelectedSeries([]);
+    setSelClass('All');
     setSelPeriod('Last 7 Days');
     setProjectSearch(''); setSelectedProjects([]);
     setTimeline([]); setTimelineTasks([]);
     setGanttRows([]);
+    setGanttRowsStageHeatmap([]);
     setActiveProject(null);
     setProjectInsights(null);
     setExpandedTask(null);
@@ -1414,14 +1520,8 @@ const Visualization2 = () => {
     }
 
     // filter by series
-    if (selSeries !== 'All') {
-      results = results.filter(n => {
-        const parts = n.split('_').map(x => x.trim()).filter(Boolean);
-        const parenIdx = parts.findIndex(p => p && /^\(.+\)$/.test(p));
-        const yearIdx = parts.findIndex(p => p && /^\d{2}-\d{2}$/.test(p));
-        const series = parenIdx > 2 ? parts[parenIdx - 1] : (yearIdx > 2 ? parts[yearIdx - 1] : (parts[4] || parts[3]));
-        return series === selSeries;
-      });
+    if (selectedSeries.length > 0) {
+      results = results.filter(n => selectedSeries.includes(extractProjectSeriesToken(n)));
     }
 
     // filter by search text
@@ -1430,7 +1530,39 @@ const Visualization2 = () => {
     }
 
     return results;
-  }, [projectNames, selSegment, selClass, selSeries, projectSearch]);
+  }, [projectNames, selSegment, selClass, seriesSelectionKey, projectSearch]);
+
+  /** Project names matching segment / class / series (ignores project search) — used to prune stale multi-select. */
+  const projectNamesMatchingFilters = useMemo(() => {
+    let results = projectNames;
+    if (selSegment !== 'All') {
+      results = results.filter((n) => {
+        const parts = n.split('_').map((x) => x.trim()).filter(Boolean);
+        return parts[0] === selSegment;
+      });
+    }
+    if (selClass !== 'All') {
+      results = results.filter((n) => {
+        const parts = n.split('_').map((x) => x.trim()).filter(Boolean);
+        return parts[1] === selClass;
+      });
+    }
+    if (selectedSeries.length > 0) {
+      results = results.filter((n) => selectedSeries.includes(extractProjectSeriesToken(n)));
+    }
+    return results;
+  }, [projectNames, selSegment, selClass, seriesSelectionKey]);
+
+  useEffect(() => {
+    if (!projectNames.length) return;
+    const allow = new Set(projectNamesMatchingFilters);
+    setSelectedProjects((prev) => {
+      if (!prev.length) return prev;
+      const next = prev.filter((p) => allow.has(p));
+      return next.length === prev.length ? prev : next;
+    });
+    setActiveProject((prev) => (prev && !allow.has(prev) ? null : prev));
+  }, [projectNames, projectNamesMatchingFilters, selSegment, selClass, seriesSelectionKey]);
 
   // derived lists for Series and Class based on selected Segment/Series
   const derivedSeries = useMemo(() => {
@@ -1440,13 +1572,8 @@ const Visualization2 = () => {
     projectNames.forEach(n => {
       const parts = n.split('_').map(x => x.trim()).filter(Boolean);
       if (parts[0] !== selSegment) return;
-      // use same detection logic as fetchFilters
-      const parenIdx = parts.findIndex(p => p && /^\(.+\)$/.test(p));
-      if (parenIdx > 2) { set.add(parts[parenIdx - 1]); return; }
-      const yearIdx = parts.findIndex(p => p && /^\d{2}-\d{2}$/.test(p));
-      if (yearIdx > 2) { set.add(parts[yearIdx - 1]); return; }
-      if (parts[4]) set.add(parts[4]);
-      else if (parts[3]) set.add(parts[3]);
+      const tok = extractProjectSeriesToken(n);
+      if (tok) set.add(tok);
     });
     return ['All', ...[...set]];
   }, [selSegment, projectNames, seriesList]);
@@ -1456,17 +1583,32 @@ const Visualization2 = () => {
     projectNames.forEach(n => {
       const parts = n.split('_').map(x => x.trim()).filter(Boolean);
       if (selSegment !== 'All' && parts[0] !== selSegment) return;
-      if (selSeries !== 'All') {
-        // ensure series matches using same detection
-        const parenIdx = parts.findIndex(p => p && /^\(.+\)$/.test(p));
-        const yearIdx = parts.findIndex(p => p && /^\d{2}-\d{2}$/.test(p));
-        const seriesCandidate = parenIdx > 2 ? parts[parenIdx - 1] : (yearIdx > 2 ? parts[yearIdx - 1] : (parts[4] || parts[3]));
-        if (seriesCandidate !== selSeries) return;
+      if (selectedSeries.length > 0) {
+        if (!selectedSeries.includes(extractProjectSeriesToken(n))) return;
       }
       if (parts[1]) set.add(parts[1]);
     });
     return ['All', ...[...set]];
-  }, [selSegment, selSeries, projectNames]);
+  }, [selSegment, selectedSeries, projectNames]);
+
+  useEffect(() => {
+    if (selClass === 'All') return;
+    if (!derivedClasses.includes(selClass)) setSelClass('All');
+  }, [selClass, derivedClasses]);
+
+  const seriesOptionsSorted = useMemo(
+    () =>
+      derivedSeries
+        .filter((s) => s && s !== 'All')
+        .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })),
+    [derivedSeries]
+  );
+
+  const seriesOptionsFiltered = useMemo(() => {
+    const q = seriesSearch.trim().toLowerCase();
+    if (!q) return seriesOptionsSorted;
+    return seriesOptionsSorted.filter((s) => s.toLowerCase().includes(q));
+  }, [seriesOptionsSorted, seriesSearch]);
 
   // ─── HORIZONTAL BAR CHART (custom SVG) ──────────────────────
   // Each project = one row.  Each row is segmented by task, widths proportional to hours.
@@ -1474,7 +1616,9 @@ const Visualization2 = () => {
   const BAR_HEIGHT = 28;
   const ROW_GAP = 8;
   const LABEL_COL_WIDTH = 260; // px reserved for project names on the left
-  const BAR_AREA_WIDTH = 900;  // px for the actual bars (will scale with container)
+  /** Right-side space for total-hours labels; longest bar uses ~87.5% of the remaining track (85–90% band). */
+  const BAR_HOURS_LABEL_RESERVE = 102;
+  const BAR_MAX_FILL_RATIO = 0.875;
 
   const maxTotalHours = useMemo(() => {
     if (!Array.isArray(projects) || projects.length === 0) return 1;
@@ -1484,6 +1628,14 @@ const Visualization2 = () => {
     );
   }, [projects]);
 
+  const horizontalBarDims = useMemo(() => {
+    const innerW = projectBarsChartWidth > 0 ? projectBarsChartWidth : 1180;
+    const barTrackWidth = Math.max(280, innerW - LABEL_COL_WIDTH - BAR_HOURS_LABEL_RESERVE);
+    const maxBarWidth = barTrackWidth * BAR_MAX_FILL_RATIO;
+    const svgWidth = LABEL_COL_WIDTH + barTrackWidth + BAR_HOURS_LABEL_RESERVE;
+    return { barTrackWidth, maxBarWidth, svgWidth };
+  }, [projectBarsChartWidth, LABEL_COL_WIDTH, BAR_HOURS_LABEL_RESERVE]);
+
   // Hover state for bar tooltip
   const [barTooltip, setBarTooltip] = useState(null); // { x, y, task, hours, units, projectName, projectTotalHours, projectTotalUnits, taskSharePct }
 
@@ -1491,11 +1643,11 @@ const Visualization2 = () => {
     if (!Array.isArray(projects)) return null;
     return projects.map((project, pIdx) => {
       const y = pIdx * (BAR_HEIGHT + ROW_GAP);
-      const barWidth = (project.totalHours / maxTotalHours) * BAR_AREA_WIDTH;
+      const barWidth = (project.totalHours / maxTotalHours) * horizontalBarDims.maxBarWidth;
       let xOffset = 0;
 
       const segments = (Array.isArray(project.tasks) ? project.tasks : []).map((t, tIdx) => {
-        const segW = (t.hours / project.totalHours) * barWidth;
+        const segW = project.totalHours > 0 ? (t.hours / project.totalHours) * barWidth : 0;
         const seg = (
           <g key={tIdx}>
             <rect
@@ -1575,6 +1727,18 @@ const Visualization2 = () => {
           <g transform={`translate(${LABEL_COL_WIDTH}, 0)`}>
             {segments}
           </g>
+          <text
+            x={LABEL_COL_WIDTH + barWidth + 10}
+            y={y + BAR_HEIGHT / 2}
+            textAnchor="start"
+            dominantBaseline="central"
+            fill="#e5e7eb"
+            fontSize={12}
+            fontWeight={600}
+            pointerEvents="none"
+          >
+            {typeof project.totalHours === 'number' ? `${project.totalHours.toFixed(2)} hrs` : '—'}
+          </text>
         </g>
       );
     });
@@ -1822,7 +1986,7 @@ const Visualization2 = () => {
 
   /** Y = projects in scope with hours; X = canonical task sequence; green = task has DB entry, blue = current active stage. */
   const taskStageHeatmapModel = useMemo(() => {
-    const rowsAll = Array.isArray(ganttRows) ? ganttRows : [];
+    const rowsAll = Array.isArray(ganttRowsStageHeatmap) ? ganttRowsStageHeatmap : [];
     const filtered =
       selectedProjects.length === 0
         ? rowsAll
@@ -1865,6 +2029,8 @@ const Visualization2 = () => {
       });
       seenCanonicalSetByProject[p] = seenSet;
 
+      const stagesInRollingWeek = heatmapStagesActiveInInclusiveWindow(rp, maxDate, HEATMAP_BLUE_ROLLING_DAYS);
+
       // Current active stage = latest date's highest pipeline stage (hours tie-breaker).
       const dayRows = rp.filter((r) => r.date === maxDate);
       let currentCanonical = null;
@@ -1880,6 +2046,25 @@ const Visualization2 = () => {
           currentCanonical = c;
           currentIdx = idx;
           bestHours = h;
+        }
+      }
+
+      // Stages can overlap in time: if an earlier pipeline stage had hours in the last 7 calendar days,
+      // keep blue on the leftmost such "warm" stage instead of jumping to the furthest stage touched only on maxDate.
+      if (currentCanonical != null) {
+        const M = currentIdx;
+        let leftmost = null;
+        let leftmostIdx = -1;
+        for (const c of stagesInRollingWeek) {
+          const ix = heatmapStageOrderIndex(c);
+          if (ix < M && (leftmost === null || ix < leftmostIdx)) {
+            leftmost = c;
+            leftmostIdx = ix;
+          }
+        }
+        if (leftmost != null) {
+          currentCanonical = leftmost;
+          currentIdx = leftmostIdx;
         }
       }
 
@@ -1919,7 +2104,7 @@ const Visualization2 = () => {
       lastDateByProject,
       projTotals
     };
-  }, [ganttRows, displayedProjects, selectedProjects.length]);
+  }, [ganttRowsStageHeatmap, displayedProjects, selectedProjects.length]);
 
   useEffect(() => {
     if (dashTab !== 'projects' || projectsLoading) return undefined;
@@ -1933,9 +2118,102 @@ const Visualization2 = () => {
     return () => ro.disconnect();
   }, [dashTab, projectsLoading, selectedProjects.length]);
 
+  useEffect(() => {
+    if (dashTab !== 'projects' || projectsLoading) return undefined;
+    const el = projectBarsViewportRef.current;
+    if (!el) return undefined;
+    const ro = new ResizeObserver(() => {
+      setProjectBarsChartWidth(el.getBoundingClientRect().width);
+    });
+    ro.observe(el);
+    setProjectBarsChartWidth(el.getBoundingClientRect().width);
+    return () => ro.disconnect();
+  }, [dashTab, projectsLoading, projects.length]);
+
   // ─── render ──────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-gray-900">
+      {showSeriesDrop &&
+        seriesPanelPos &&
+        createPortal(
+          <div
+            ref={seriesPanelRef}
+            className="flex min-h-0 flex-col overflow-hidden rounded-lg border border-gray-600 bg-gray-700 shadow-2xl"
+            style={{
+              position: 'fixed',
+              top: seriesPanelPos.top,
+              left: seriesPanelPos.left,
+              width: seriesPanelPos.width,
+              maxHeight: seriesPanelPos.maxH,
+              zIndex: 10050,
+            }}
+          >
+            <div className="shrink-0 border-b border-gray-600 p-2">
+              <div className="relative">
+                <input
+                  type="text"
+                  value={seriesSearch}
+                  onChange={(e) => setSeriesSearch(e.target.value)}
+                  placeholder="Search series…"
+                  className="w-full rounded border border-gray-600 bg-gray-800 px-2 py-1.5 pr-7 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                />
+                <Search className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-500" />
+              </div>
+              <div className="mt-2 flex justify-between gap-2 text-xs">
+                <button
+                  type="button"
+                  className="text-indigo-300 hover:underline"
+                  onClick={() => {
+                    setSelectedSeries((prev) => {
+                      const next = new Set(prev);
+                      seriesOptionsFiltered.forEach((s) => next.add(s));
+                      return [...next].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+                    });
+                  }}
+                >
+                  Select filtered
+                </button>
+                <button type="button" className="text-gray-300 hover:underline" onClick={() => setSelectedSeries([])}>
+                  Clear all
+                </button>
+              </div>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto py-1">
+              {seriesOptionsFiltered.map((s) => (
+                <div
+                  key={s}
+                  onClick={() => {
+                    setSelectedSeries((prev) =>
+                      prev.includes(s)
+                        ? prev.filter((x) => x !== s)
+                        : [...prev, s].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
+                    );
+                  }}
+                  className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm text-white hover:bg-gray-600"
+                >
+                  <input type="checkbox" readOnly checked={selectedSeries.includes(s)} className="pointer-events-none h-4 w-4" />
+                  <span className="truncate">{s}</span>
+                </div>
+              ))}
+              {seriesOptionsFiltered.length === 0 && (
+                <div className="px-3 py-2 text-sm text-gray-400">No match</div>
+              )}
+            </div>
+            <div className="shrink-0 border-t border-gray-600 px-2 py-1.5 text-right">
+              <button
+                type="button"
+                className="text-xs text-gray-300 hover:underline"
+                onClick={() => {
+                  setShowSeriesDrop(false);
+                  setSeriesSearch('');
+                }}
+              >
+                Done
+              </button>
+            </div>
+          </div>,
+          document.body
+        )}
       {/* ─── STICKY HEADER + FILTERS ─── */}
       <div className="sticky top-0 z-50 bg-gradient-to-br from-gray-900 via-purple-900 to-gray-900 border-b border-gray-700 shadow-lg">
         <div className="px-8 pt-6 pb-4 flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4">
@@ -2006,18 +2284,26 @@ const Visualization2 = () => {
               <div className="flex gap-3 min-w-0 flex-1 overflow-x-auto pb-1 shrink">
                 <div className="w-[7.5rem] shrink-0">
                   <label className="text-white text-sm font-semibold mb-2 block">Segment</label>
-                  <select value={selSegment} onChange={e => { setSelSegment(e.target.value); setSelSeries('All'); setSelClass('All'); }}
+                  <select value={selSegment} onChange={e => { setSelSegment(e.target.value); setSelectedSeries([]); setSelClass('All'); }}
                     className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500">
                     <option value="All">All</option>
                     {segments.filter(s => s).map(s => <option key={s} value={s}>{s}</option>)}
                   </select>
                 </div>
-                <div className="w-[9rem] shrink-0">
+                <div className="relative min-w-[12.5rem] w-[13rem] shrink-0" ref={seriesDropRef}>
                   <label className="text-white text-sm font-semibold mb-2 block">Series</label>
-                  <select value={selSeries} onChange={e => { setSelSeries(e.target.value); setSelClass('All'); }}
-                    className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500">
-                    {derivedSeries.map(s => <option key={s} value={s}>{s}</option>)}
-                  </select>
+                  <button
+                    type="button"
+                    onClick={() => setShowSeriesDrop((v) => !v)}
+                    className="flex w-full items-center justify-between gap-1 rounded-lg border border-gray-600 bg-gray-700 px-2 py-2 text-left text-sm text-white focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  >
+                    <span className="truncate">
+                      {selectedSeries.length === 0 ? 'All series' : `${selectedSeries.length} selected`}
+                    </span>
+                    <ChevronDown
+                      className={`h-4 w-4 shrink-0 text-gray-400 transition-transform ${showSeriesDrop ? 'rotate-180' : ''}`}
+                    />
+                  </button>
                 </div>
                 <div className="w-[7.5rem] shrink-0">
                   <label className="text-white text-sm font-semibold mb-2 block">Class</label>
@@ -2107,8 +2393,8 @@ const Visualization2 = () => {
 
         {dashTab === 'projects' && !projectsLoading && (
           <>
-            {/* ── PROJECT-WISE TASKS title ── */}
-            <h2 className="text-3xl font-bold text-white text-center mb-3">Project-wise Tasks</h2>
+            {/* ── Top projects (horizontal bars) ── */}
+            <h2 className="text-3xl font-bold text-white text-center mb-3">Top Projects</h2>
 
             {/* ── scrollable legend (task colours) ── */}
             <div className="flex items-center gap-1.5 mb-3 overflow-x-auto pb-1" style={{ scrollbarWidth: 'thin' }}>
@@ -2122,8 +2408,8 @@ const Visualization2 = () => {
 
             {/* ── HORIZONTAL BAR CHART (custom SVG inside scrollable container) ── */}
             <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl overflow-hidden mb-6">
-              <div className="overflow-auto max-h-[560px]" style={{ position: 'relative' }}>
-                <svg width={LABEL_COL_WIDTH + BAR_AREA_WIDTH + 20} height={svgHeight} style={{ display: 'block' }}>
+              <div ref={projectBarsViewportRef} className="overflow-auto max-h-[560px]" style={{ position: 'relative' }}>
+                <svg width={horizontalBarDims.svgWidth} height={svgHeight} style={{ display: 'block' }}>
                   {renderBars()}
                 </svg>
 
@@ -2175,6 +2461,104 @@ const Visualization2 = () => {
                 <span className="text-gray-500 text-xs">{projects.length} projects</span>
               </div>
             </div>
+
+            {/* ── PROJECT PROGRESS (task-stage heatmap — same period as Gantt) ── */}
+            <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6 mb-6">
+                <h2 className="text-2xl font-bold text-white mb-1">Project Progress</h2>
+                <p className="text-gray-400 text-sm mb-3 max-w-4xl">
+                  Rows are projects in the current scope with logged hours. Columns follow your task sequence.{' '}
+                  <span className="text-emerald-400 font-semibold">Green</span> shows completed stages in sequence and{' '}
+                  <span className="text-sky-400 font-semibold">Blue</span> starts from the{' '}
+                  <strong className="text-gray-200">most recent calendar day</strong> (furthest stage touched that day),
+                  then if any <strong className="text-gray-200">earlier</strong> pipeline stage still has hours in the{' '}
+                  <strong className="text-gray-200">last 7 calendar days</strong>, blue moves back to the leftmost of
+                  those so parallel work does not look ahead of an active earlier stage.
+                </p>
+                {taskStageHeatmapModel.projects.length === 0 ? (
+                  <p className="text-gray-500 text-sm py-8 text-center border border-gray-700 rounded-lg">
+                    No Gantt data for this period — select projects and ensure the period includes worklogs.
+                  </p>
+                ) : (
+                  <div className="max-h-[480px] overflow-y-auto overflow-x-auto rounded-lg border border-gray-700 bg-gray-950/80 w-full">
+                    <table className="border-collapse text-[10px] w-full table-fixed">
+                      <thead>
+                        <tr className="bg-gray-900/95 sticky top-0 z-20">
+                          <th
+                            className="sticky left-0 z-30 bg-gray-900/95 border border-gray-700 px-2 py-2 text-left text-gray-300 font-semibold min-w-[12rem] w-[18rem]"
+                            scope="col"
+                          >
+                            Project
+                          </th>
+                          {taskStageHeatmapModel.xTasks.map((t) => (
+                            <th
+                              key={t}
+                              className="border border-gray-700 px-0.5 py-1 text-gray-400 font-medium text-center align-bottom whitespace-nowrap"
+                              style={{ minWidth: '22px', writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}
+                              title={t}
+                            >
+                              <span className="inline-block max-h-[140px] truncate">{t}</span>
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {taskStageHeatmapModel.projects.map((proj) => {
+                          const canon = taskStageHeatmapModel.currentCanonicalByProject[proj];
+                          const currentIdx = taskStageHeatmapModel.currentStageIndexByProject[proj] ?? -1;
+                          const seenSet = taskStageHeatmapModel.seenCanonicalSetByProject[proj] || new Set();
+                          const hasCurrentCanonical = taskStageHeatmapModel.hasCurrentCanonicalByProject[proj] === true;
+                          const raw = taskStageHeatmapModel.currentStageByProject[proj];
+                          const lastD = taskStageHeatmapModel.lastDateByProject[proj];
+                          return (
+                            <tr key={proj} className="border-b border-gray-800 hover:bg-gray-900/40">
+                              <td
+                                className="sticky left-0 z-10 bg-gray-950/95 border border-gray-700 px-2 py-1.5 text-gray-200 font-medium truncate w-[18rem] max-w-[18rem]"
+                                title={proj}
+                              >
+                                <div className="truncate">{proj}</div>
+                                {lastD && (
+                                  <div className="text-[9px] text-gray-500 font-normal mt-0.5">
+                                    Last day: {lastD}
+                                    {raw && canon === null && (
+                                      <span className="text-amber-500/90"> · {raw}</span>
+                                    )}
+                                  </div>
+                                )}
+                              </td>
+                              {taskStageHeatmapModel.xTasks.map((colTask) => {
+                                const colIdx = heatmapStageOrderIndex(colTask);
+                                const isCurrent = hasCurrentCanonical && canon != null && colTask === canon && currentIdx >= 0;
+                                const isSeen = !isCurrent && seenSet.has(colTask) && colIdx >= 0;
+                                return (
+                                  <td
+                                    key={`${proj}-${colTask}`}
+                                    className={`border border-gray-800 p-0 text-center ${
+                                      isCurrent
+                                        ? 'bg-sky-500 shadow-[inset_0_0_0_1px_rgba(14,165,233,0.65)]'
+                                        : isSeen
+                                          ? 'bg-emerald-500 shadow-[inset_0_0_0_1px_rgba(16,185,129,0.6)]'
+                                          : 'bg-black'
+                                    }`}
+                                    title={
+                                      isCurrent
+                                        ? `Current stage: ${colTask} (from ${lastD}; 7-day parallel-stage rule)`
+                                        : isSeen
+                                          ? `Has DB entry: ${colTask}`
+                                          : `${proj} · ${colTask}`
+                                    }
+                                  >
+                                    <div className="h-7 w-full min-w-[20px]" />
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
 
             {/* ── PROJECT GANTT (day columns — period + filters; project scope from filter or all projects when none selected) ── */}
             <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6 mb-6">
@@ -2407,101 +2791,6 @@ const Visualization2 = () => {
                   <p className="text-gray-500 text-sm py-10 text-center border border-gray-700 rounded-lg">
                     No Gantt rows for this period and filter set — widen the period or relax segment / series / class filters.
                   </p>
-                )}
-              </div>
-
-            {/* ── TASK STAGE HEATMAP (latest stage per project vs full task sequence; same period as Gantt) ── */}
-            <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6 mb-6">
-                <h2 className="text-2xl font-bold text-white mb-1">Task stage heatmap</h2>
-                <p className="text-gray-400 text-sm mb-3 max-w-4xl">
-                  Rows are projects in the current scope with logged hours. Columns follow your task sequence.{' '}
-                  <span className="text-emerald-400 font-semibold">Green</span> shows completed stages in sequence and{' '}
-                  <span className="text-sky-400 font-semibold">Blue</span> marks the current stage from the{' '}
-                  <strong className="text-gray-200">most recent calendar day</strong> in the period.
-                </p>
-                {taskStageHeatmapModel.projects.length === 0 ? (
-                  <p className="text-gray-500 text-sm py-8 text-center border border-gray-700 rounded-lg">
-                    No Gantt data for this period — select projects and ensure the period includes worklogs.
-                  </p>
-                ) : (
-                  <div className="max-h-[480px] overflow-y-auto overflow-x-auto rounded-lg border border-gray-700 bg-gray-950/80 w-full">
-                    <table className="border-collapse text-[10px] w-full table-fixed">
-                      <thead>
-                        <tr className="bg-gray-900/95 sticky top-0 z-20">
-                          <th
-                            className="sticky left-0 z-30 bg-gray-900/95 border border-gray-700 px-2 py-2 text-left text-gray-300 font-semibold min-w-[12rem] w-[18rem]"
-                            scope="col"
-                          >
-                            Project
-                          </th>
-                          {taskStageHeatmapModel.xTasks.map((t) => (
-                            <th
-                              key={t}
-                              className="border border-gray-700 px-0.5 py-1 text-gray-400 font-medium text-center align-bottom whitespace-nowrap"
-                              style={{ minWidth: '22px', writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}
-                              title={t}
-                            >
-                              <span className="inline-block max-h-[140px] truncate">{t}</span>
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {taskStageHeatmapModel.projects.map((proj) => {
-                          const canon = taskStageHeatmapModel.currentCanonicalByProject[proj];
-                          const currentIdx = taskStageHeatmapModel.currentStageIndexByProject[proj] ?? -1;
-                          const seenSet = taskStageHeatmapModel.seenCanonicalSetByProject[proj] || new Set();
-                          const hasCurrentCanonical = taskStageHeatmapModel.hasCurrentCanonicalByProject[proj] === true;
-                          const raw = taskStageHeatmapModel.currentStageByProject[proj];
-                          const lastD = taskStageHeatmapModel.lastDateByProject[proj];
-                          return (
-                            <tr key={proj} className="border-b border-gray-800 hover:bg-gray-900/40">
-                              <td
-                                className="sticky left-0 z-10 bg-gray-950/95 border border-gray-700 px-2 py-1.5 text-gray-200 font-medium truncate w-[18rem] max-w-[18rem]"
-                                title={proj}
-                              >
-                                <div className="truncate">{proj}</div>
-                                {lastD && (
-                                  <div className="text-[9px] text-gray-500 font-normal mt-0.5">
-                                    Last day: {lastD}
-                                    {raw && canon === null && (
-                                      <span className="text-amber-500/90"> · {raw}</span>
-                                    )}
-                                  </div>
-                                )}
-                              </td>
-                              {taskStageHeatmapModel.xTasks.map((colTask) => {
-                                const colIdx = heatmapStageOrderIndex(colTask);
-                                const isCurrent = hasCurrentCanonical && canon != null && colTask === canon && currentIdx >= 0;
-                                const isSeen = !isCurrent && seenSet.has(colTask) && colIdx >= 0;
-                                return (
-                                  <td
-                                    key={`${proj}-${colTask}`}
-                                    className={`border border-gray-800 p-0 text-center ${
-                                      isCurrent
-                                        ? 'bg-sky-500 shadow-[inset_0_0_0_1px_rgba(14,165,233,0.65)]'
-                                        : isSeen
-                                          ? 'bg-emerald-500 shadow-[inset_0_0_0_1px_rgba(16,185,129,0.6)]'
-                                          : 'bg-black'
-                                    }`}
-                                    title={
-                                      isCurrent
-                                        ? `Current stage: ${colTask} (from ${lastD})`
-                                        : isSeen
-                                          ? `Has DB entry: ${colTask}`
-                                        : `${proj} · ${colTask}`
-                                    }
-                                  >
-                                    <div className="h-7 w-full min-w-[20px]" />
-                                  </td>
-                                );
-                              })}
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
                 )}
               </div>
 

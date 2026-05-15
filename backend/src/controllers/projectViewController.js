@@ -1,5 +1,13 @@
 const prisma = require('../config/prisma');
 const { buildWhereClause, buildProjectViewWhere } = require('../utils/queryBuilder');
+const { projectMatchesSeriesSelection } = require('../utils/projectSeriesToken');
+
+function seriesValsFromReq(req) {
+  const q = req.query.series;
+  if (q == null || q === '' || q === 'All') return [];
+  const arr = Array.isArray(q) ? q : [q];
+  return arr.map((s) => String(s || '').trim()).filter((s) => s && s !== 'All');
+}
 
 exports.getTeams = async (req, res) => {
   try {
@@ -152,6 +160,7 @@ exports.getProjects = async (req, res) => {
         ...p,
         tasks: p.tasks.sort((a, b) => b.hours - a.hours)
       }))
+      .filter((p) => projectMatchesSeriesSelection(p.name, seriesValsFromReq(req)))
       .sort((a, b) => b.totalHours - a.totalHours)
       .slice(0, 10);
 

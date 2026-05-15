@@ -71,9 +71,19 @@ function buildWhereClause(req) {
       // class/year is typically the second token: match _<class>_ somewhere
       nameFilters.push({ project_name: { contains: `_${req.query.class}_` } });
     }
-    if (req.query.series && req.query.series !== 'All') {
-      // series often appears later; match as a whole token between underscores
-      nameFilters.push({ project_name: { contains: `_${req.query.series}_` } });
+    const seriesQ = req.query.series;
+    const seriesVals =
+      seriesQ == null || seriesQ === '' || seriesQ === 'All'
+        ? []
+        : (Array.isArray(seriesQ) ? seriesQ : [seriesQ])
+            .map((s) => String(s || '').trim())
+            .filter((s) => s && s !== 'All');
+    if (seriesVals.length === 1) {
+      nameFilters.push({ project_name: { contains: `_${seriesVals[0]}_` } });
+    } else if (seriesVals.length > 1) {
+      nameFilters.push({
+        OR: seriesVals.map((s) => ({ project_name: { contains: `_${s}_` } })),
+      });
     }
     if (nameFilters.length) {
       where.AND = where.AND ? [...where.AND, ...nameFilters] : nameFilters;

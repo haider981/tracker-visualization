@@ -2966,7 +2966,8 @@
 
 const express = require('express');
 const cors = require('cors');
-const prisma = require('./src/config/prisma'); 
+const prisma = require('./src/config/prisma');
+const { projectMatchesSeriesSelection } = require('./src/utils/projectSeriesToken');
 
 const app = express();
 
@@ -3070,6 +3071,14 @@ function buildWhereClause(req) {
   return where;
 }
 
+/** Normalize repeated `series` query params (multi-select) to a non-empty string list. */
+function normalizeSeriesQueryList(req) {
+  const q = req.query.series;
+  if (q == null || q === '' || q === 'All') return [];
+  const arr = Array.isArray(q) ? q : [q];
+  return arr.map((s) => String(s || '').trim()).filter((s) => s && s !== 'All');
+}
+
 // Helper function to filter project names by segment/class/series tokens
 function applyProjectTokenFilters(where, req) {
   const tokenFilters = [];
@@ -3082,9 +3091,13 @@ function applyProjectTokenFilters(where, req) {
     // class/year is the second token: _<class>_...
     tokenFilters.push({ project_name: { contains: `_${req.query.class}_` } });
   }
-  if (req.query.series && req.query.series !== 'All') {
-    // series is typically at position 3 or 4; use contains to be flexible
-    tokenFilters.push({ project_name: { contains: `_${req.query.series}_` } });
+  const seriesVals = normalizeSeriesQueryList(req);
+  if (seriesVals.length === 1) {
+    tokenFilters.push({ project_name: { contains: `_${seriesVals[0]}_` } });
+  } else if (seriesVals.length > 1) {
+    tokenFilters.push({
+      OR: seriesVals.map((s) => ({ project_name: { contains: `_${s}_` } })),
+    });
   }
   
   if (tokenFilters.length > 0) {
@@ -4707,16 +4720,9 @@ app.get('/api/dashboard/project-view/projects', async (req, res) => {
       if (req.query.class && req.query.class !== 'All') {
         if (tokens[1] !== req.query.class) return false;
       }
-      // series -> try to match at typical positions (3 or 4) or any token after position 2
-      if (req.query.series && req.query.series !== 'All') {
-        const series = req.query.series;
-        const candidatePositions = [];
-        if (tokens[3]) candidatePositions.push(tokens[3]);
-        if (tokens[4]) candidatePositions.push(tokens[4]);
-        // also allow any token after index 2
-        for (let i = 2; i < tokens.length; i++) candidatePositions.push(tokens[i]);
-        if (!candidatePositions.some(c => c === series)) return false;
-      }
+      // series -> exact token match (same extraction as project-view UI; avoids SureS matching SureS_WB via substring)
+      const seriesVals = normalizeSeriesQueryList(req);
+      if (seriesVals.length > 0 && !projectMatchesSeriesSelection(projName, seriesVals)) return false;
       return true;
     };
 
@@ -4858,7 +4864,11 @@ app.get('/api/dashboard/project-view/gantt', async (req, res) => {
       hours: Number(r._sum?.hours_spent) || 0
     })).filter((x) => x.hours > 0);
 
-    res.json(payload);
+    const seriesVals = normalizeSeriesQueryList(req);
+    const payloadFiltered =
+      seriesVals.length > 0 ? payload.filter((x) => projectMatchesSeriesSelection(x.project_name, seriesVals)) : payload;
+
+    res.json(payloadFiltered);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
