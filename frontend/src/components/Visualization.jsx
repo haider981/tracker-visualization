@@ -3570,8 +3570,8 @@
 import React, { useState, useEffect, useMemo, memo, useRef, useCallback } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { createPortal } from 'react-dom';
-import { BarChart, Bar, LineChart, Line, PieChart, Pie, AreaChart, Area, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Treemap, LabelList } from 'recharts';
-import { TrendingUp, Users, Clock, Briefcase, Activity, Zap, Target, CheckCircle, Filter, X, Search, Moon, BookMarked, AlertTriangle, LayoutDashboard, LayoutGrid } from 'lucide-react';
+import { BarChart, Bar, LineChart, Line, PieChart, Pie, AreaChart, Area, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Treemap, LabelList, ReferenceLine } from 'recharts';
+import { TrendingUp, Users, Clock, Briefcase, Activity, Zap, Target, CheckCircle, Filter, X, Search, Moon, BookMarked, AlertTriangle, LayoutDashboard, LayoutGrid, CircleHelp, BarChart3, PieChart as PieChartIcon } from 'lucide-react';
 
 const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL || '').replace(/\/$/, '');
 const API_URL = `${BACKEND_URL}/api/dashboard`;
@@ -3580,6 +3580,381 @@ const REFRESH_INTERVAL = 60000;
 const DEFAULT_DASH_PERIOD = 'Last 7 Days';
 
 const COLORS = ['#8b5cf6', '#ec4899', '#f59e0b', '#10b981', '#3b82f6', '#ef4444', '#14b8a6', '#f97316'];
+
+const GANTT_PROJECT_COL = 240;
+
+/** Task → Independent (I) vs Collaborative (C) for contribution donuts. Unlisted tasks default to I. */
+const TASK_IC_MODE = (() => {
+  const raw = `DRF\tI
+VRF-MS\tI
+CMPL-MS\tI
+COM\tI
+JCR\tC
+Coord\tC
+MEET\tC
+R1\tI
+CR1\tI
+R2\tI
+CR2\tI
+R3\tI
+CR3\tI
+R4\tI
+CR4\tI
+R5\tI
+CR5\tI
+TAL\tI
+FINAL\tI
+FER\tI
+GLANCE\tI
+SET\tI
+Development\tI
+Research\tI
+Analysis\tI
+Rα\tI
+CRα\tI
+Rβ\tI
+CRβ\tI
+PLAN\tI
+MKT Content\tI
+Miscellaneous\tC
+UPL\tI
+SCAN\tI
+Interview\tI
+Training\tC
+KT\tC
+Book keeping\tI
+ISBN\tI
+Design\tI
+Testing\tI
+REV\tI
+QRY\tC
+Code\tI
+EDIT\tI
+Order generation\tI
+Stakeholder management\tC
+Webinar\tC
+Listing\tI
+Creative update\tI
+Campaign\tI
+Shipment\tI
+Website design/check\tI
+Briefing\tC
+Stock updation\tI
+REC\tC
+Report generation\tI
+Customer support\tC
+Compiling\tI
+Generation\tI
+Update\tI
+QR Gen\tI
+Sketch\tI
+Flat colour\tI
+Final Colour\tI
+Final Output\tI
+Visit\tC
+Practice\tI
+Internet/System Issue\tI`;
+  const m = {};
+  raw.trim().split('\n').forEach((line) => {
+    const [task, mode] = line.split('\t').map((s) => s.trim());
+    if (task) m[task] = mode === 'C' ? 'C' : 'I';
+  });
+  return m;
+})();
+const TASK_IC_MODE_LOWER = new Map(Object.entries(TASK_IC_MODE).map(([k, v]) => [k.toLowerCase(), v]));
+
+function classifyTaskIndependentOrCollab(taskName) {
+  const t = String(taskName || '').trim();
+  if (!t) return 'I';
+  if (TASK_IC_MODE[t]) return TASK_IC_MODE[t];
+  const lo = t.toLowerCase();
+  if (TASK_IC_MODE_LOWER.has(lo)) return TASK_IC_MODE_LOWER.get(lo);
+  return 'I';
+}
+
+function quartiles(sorted) {
+  const a = [...sorted].sort((x, y) => x - y);
+  const n = a.length;
+  if (!n) return { min: 0, q1: 0, median: 0, q3: 0, max: 0, samples: [] };
+  const q = (p) => {
+    const pos = (n - 1) * p;
+    const base = Math.floor(pos);
+    const rest = pos - base;
+    return a[base + 1] !== undefined ? a[base] + rest * (a[base + 1] - a[base]) : a[base];
+  };
+  return { min: a[0], q1: q(0.25), median: q(0.5), q3: q(0.75), max: a[n - 1], samples: a };
+}
+
+function buildChapterMapFromGantt(ganttRows, employeeName) {
+  const map = new Map();
+  const emp = String(employeeName || '').trim();
+  for (const r of ganttRows || []) {
+    if (String(r?.employee || r?.name || '').trim() !== emp) continue;
+    const project = String(r?.project || r?.project_name || '').trim();
+    if (!project || !Array.isArray(r?.tasks)) continue;
+    for (const t of r.tasks) {
+      const task = String(t?.task || 'Unspecified').trim() || 'Unspecified';
+      const key = `${project}\t${task}`;
+      const o = map.get(key) || new Map();
+      if (Array.isArray(t.chapters) && t.chapters.length) {
+        for (const c of t.chapters) {
+          const ch = c.chapter != null && String(c.chapter).trim() !== '' ? String(c.chapter).trim() : '—';
+          const hh = Number(c.hours) || 0;
+          if (hh > 0) addChapterHoursToMap(o, ch, hh);
+        }
+      } else {
+        const th = Number(t?.hours) || 0;
+        if (th > 0) o.set('—', (o.get('—') || 0) + th);
+      }
+      map.set(key, o);
+    }
+  }
+  const out = new Map();
+  for (const [k, chMap] of map.entries()) {
+    out.set(
+      k,
+      [...chMap.entries()]
+        .map(([chapter, hours]) => ({ chapter, hours }))
+        .sort((a, b) => b.hours - a.hours)
+    );
+  }
+  return out;
+}
+
+const EmployeeProjectStackTooltip = memo(({ active, payload, chapterMap }) => {
+  if (!active || !payload?.length) return null;
+  const row = payload[0]?.payload;
+  if (!row?.fullName) return null;
+  const taskRows = payload
+    .map((p) => {
+      const task = String(p.dataKey || '');
+      const hours = Number(p.value) || 0;
+      if (!task || hours <= 0) return null;
+      return { task, hours };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.hours - a.hours);
+  const total = taskRows.reduce((s, r) => s + r.hours, 0);
+  return (
+    <div className="rounded-lg border border-purple-500 bg-gray-900 px-3 py-2 text-xs shadow-xl max-w-sm" style={{ zIndex: 10005 }}>
+      <p className="text-white font-semibold">{row.fullName}</p>
+      <p className="text-gray-400 mt-1">Total: <span className="text-white font-bold">{total.toFixed(1)} hrs</span></p>
+      <div className="mt-2 space-y-2 max-h-52 overflow-y-auto">
+        {taskRows.map((tr) => {
+          const chLines = chapterMap?.get(`${row.fullName}\t${tr.task}`) || [];
+          return (
+            <div key={tr.task} className="border-t border-gray-700/80 pt-1.5">
+              <p className="text-purple-200 font-semibold">{tr.task}: {tr.hours.toFixed(1)} hrs</p>
+              {chLines.length > 0 && (
+                <ul className="mt-1 space-y-0.5 text-gray-400 pl-2">
+                  {chLines.map((c) => (
+                    <li key={`${tr.task}-${c.chapter}`}>
+                      Ch {c.chapter}: <span className="text-gray-200">{c.hours.toFixed(1)}h</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+});
+EmployeeProjectStackTooltip.displayName = 'EmployeeProjectStackTooltip';
+
+const PIE_LABEL_LINE_STYLE = { stroke: '#94a3b8', strokeWidth: 1 };
+
+const PieExternalLabel = ({ cx, cy, midAngle, outerRadius, percent, name }) => {
+  if (percent < 0.03) return null;
+  const RAD = Math.PI / 180;
+  const r = outerRadius + 20;
+  const x = cx + r * Math.cos(-midAngle * RAD);
+  const y = cy + r * Math.sin(-midAngle * RAD);
+  const anchor = x > cx ? 'start' : 'end';
+  const raw = String(name || '');
+  const label = raw.length > 24 ? `${raw.slice(0, 22)}…` : raw;
+  return (
+    <text
+      x={x}
+      y={y}
+      textAnchor={anchor}
+      dominantBaseline="central"
+      fill="#f1f5f9"
+      fontSize={11}
+      fontWeight={600}
+      style={{ paintOrder: 'stroke', stroke: 'rgba(15, 23, 42, 0.95)', strokeWidth: 3 }}
+    >
+      {`${label} ${(percent * 100).toFixed(0)}%`}
+    </text>
+  );
+};
+
+const EmployeeProjectDonutTooltip = memo(({ active, payload }) => {
+  if (!active || !payload?.length) return null;
+  const d = payload[0].payload;
+  const hours = Number(payload[0].value) || 0;
+  const title = d?.fullName || d?.name || 'Project';
+  const pct = d?.pct != null ? d.pct.toFixed(0) : '—';
+  return (
+    <div
+      className="rounded-lg border border-purple-500 px-3 py-2 shadow-2xl max-w-xs"
+      style={{ backgroundColor: 'rgb(17 24 39)', zIndex: 10005 }}
+    >
+      <p className="text-white font-semibold text-sm break-words">{title}</p>
+      <p className="text-purple-300 text-sm mt-1">
+        <span className="text-white font-bold">{hours.toFixed(1)} hrs</span>
+        <span className="text-gray-400"> ({pct}%)</span>
+      </p>
+    </div>
+  );
+});
+EmployeeProjectDonutTooltip.displayName = 'EmployeeProjectDonutTooltip';
+
+function DonutWithLegend({ title, subtitle, centerLabel, pct, slices, totalLabel, totalValue, accentClass }) {
+  const total = slices.reduce((s, x) => s + x.value, 0) || 1;
+  return (
+    <div className="flex flex-col h-full">
+      <h4 className={`text-sm font-bold ${accentClass}`}>{title}</h4>
+      {subtitle && <p className="text-gray-500 text-[11px] mt-0.5">{subtitle}</p>}
+      <div className="flex-1 flex flex-col items-center justify-center min-h-[220px]">
+        <div className="relative w-[200px] h-[200px]">
+          <ResponsiveContainer width="100%" height="100%">
+            <PieChart>
+              <Pie
+                data={slices}
+                dataKey="value"
+                nameKey="name"
+                cx="50%"
+                cy="50%"
+                innerRadius={58}
+                outerRadius={82}
+                paddingAngle={2}
+                isAnimationActive={false}
+              >
+                {slices.map((entry, i) => (
+                  <Cell key={entry.name} fill={entry.fill || COLORS[i % COLORS.length]} />
+                ))}
+              </Pie>
+            </PieChart>
+          </ResponsiveContainer>
+          <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+            <span className="text-2xl font-bold text-white">{Math.round(pct)}%</span>
+            <span className="text-[10px] text-gray-400 text-center px-2">{centerLabel}</span>
+          </div>
+        </div>
+        <ul className="w-full mt-3 space-y-1.5 text-xs text-gray-300">
+          {slices.map((s, i) => (
+            <li key={s.name} className="flex items-center gap-2">
+              <span className="size-2.5 shrink-0 rounded-full" style={{ backgroundColor: s.fill || COLORS[i % COLORS.length] }} />
+              <span className="flex-1 truncate" title={s.name}>{s.name}</span>
+              <span className="tabular-nums text-gray-400">{((s.value / total) * 100).toFixed(0)}%</span>
+              <span className="tabular-nums text-gray-200 w-16 text-right">{s.value.toFixed(1)}h</span>
+            </li>
+          ))}
+        </ul>
+      </div>
+      <div className="mt-3 rounded-md border border-gray-600 bg-gray-900/70 px-3 py-2 flex justify-between text-sm">
+        <span className="text-gray-400">{totalLabel}</span>
+        <span className={`font-bold tabular-nums ${accentClass}`}>{totalValue}</span>
+      </div>
+    </div>
+  );
+}
+
+function TaskTimePerUnitBoxPlot({ tasks }) {
+  if (!tasks?.length) {
+    return (
+      <div className="h-[280px] flex flex-col items-center justify-center text-gray-400 text-sm text-center px-6 gap-2">
+        <p>No tasks with both hours and units in this period.</p>
+        <p className="text-xs text-gray-500">Time-per-unit needs logged unit counts on work entries.</p>
+      </div>
+    );
+  }
+  const padL = 132;
+  const padR = 24;
+  const padT = 20;
+  const padB = 48;
+  const rowH = 32;
+  const h = padT + padB + tasks.length * rowH;
+  const w = 640;
+  const plotW = w - padL - padR;
+  const allVals = tasks.flatMap((t) => t.stats?.samples ?? [t.stats.min, t.stats.max]);
+  const maxV = Math.max(...allVals.filter((v) => Number.isFinite(v)), 0.01);
+  const xScale = (v) => padL + (Math.min(v, maxV) / maxV) * plotW;
+  const xTicks = [0, 0.25, 0.5, 0.75, 1].map((f) => ({ v: maxV * f, x: xScale(maxV * f) }));
+
+  return (
+    <div className="w-full overflow-x-auto">
+      <svg viewBox={`0 0 ${w} ${h}`} className="w-full min-w-[480px]" style={{ maxHeight: 420 }} preserveAspectRatio="xMidYMid meet" role="img" aria-label="Time per unit by task">
+        <line x1={padL} y1={padT - 4} x2={padL} y2={h - padB} stroke="#475569" strokeWidth={1} />
+        <line x1={padL} y1={h - padB} x2={w - padR} y2={h - padB} stroke="#475569" strokeWidth={1} />
+        {xTicks.map((t) => (
+          <g key={t.v}>
+            <line x1={t.x} y1={padT - 4} x2={t.x} y2={h - padB} stroke="#334155" strokeDasharray="3 3" />
+            <text x={t.x} y={h - padB + 16} textAnchor="middle" fill="#94a3b8" fontSize={10}>
+              {t.v >= 10 ? t.v.toFixed(0) : t.v.toFixed(1)}
+            </text>
+          </g>
+        ))}
+        {tasks.map((t, i) => {
+          const y = padT + i * rowH + rowH / 2;
+          const { min, q1, median, q3, max } = t.stats;
+          const n = t.stats.samples?.length ?? 0;
+          const collapsed = Math.abs(q3 - q1) < 1e-6;
+          const tip = `${t.task}\nHours per unit (lower = faster)\nMin: ${min.toFixed(2)} · Q1: ${q1.toFixed(2)} · Median: ${median.toFixed(2)} · Q3: ${q3.toFixed(2)} · Max: ${max.toFixed(2)}\n${n} logged slice(s)`;
+          return (
+            <g key={t.task}>
+              <text x={padL - 8} y={y + 4} textAnchor="end" fill="#e2e8f0" fontSize={10} fontWeight={500}>
+                {t.task.length > 16 ? `${t.task.slice(0, 14)}…` : t.task}
+              </text>
+              <title>{tip}</title>
+              <line x1={xScale(min)} y1={y} x2={xScale(max)} y2={y} stroke="#94a3b8" strokeWidth={2} />
+              {collapsed ? (
+                <circle cx={xScale(median)} cy={y} r={5} fill="#818cf8" stroke="#e0e7ff" strokeWidth={1.5} />
+              ) : (
+                <>
+                  <rect
+                    x={xScale(q1)}
+                    y={y - 9}
+                    width={Math.max(3, xScale(q3) - xScale(q1))}
+                    height={18}
+                    fill="rgba(99, 102, 241, 0.55)"
+                    stroke="#a5b4fc"
+                    rx={2}
+                  />
+                  <line x1={xScale(median)} y1={y - 11} x2={xScale(median)} y2={y + 11} stroke="#f8fafc" strokeWidth={2.5} />
+                </>
+              )}
+              <text x={xScale(max) + 6} y={y + 4} fill="#cbd5e1" fontSize={9} fontWeight={600}>
+                {median.toFixed(1)}
+              </text>
+            </g>
+          );
+        })}
+        <text x={(padL + w - padR) / 2} y={h - 6} textAnchor="middle" fill="#94a3b8" fontSize={11}>
+          Hours per unit (median line · box = middle 50% of entries)
+        </text>
+      </svg>
+    </div>
+  );
+}
+
+/** Non-blocking overlay while refetching after filter changes (keeps header + filters visible). */
+function FilterRefreshOverlay({ active, label = 'Updating charts…' }) {
+  if (!active) return null;
+  return (
+    <div
+      className="pointer-events-none absolute inset-0 z-40 flex items-start justify-center bg-gray-900/45 backdrop-blur-[1px] pt-20"
+      aria-hidden
+    >
+      <div className="flex items-center gap-3 rounded-lg border border-purple-500/50 bg-gray-900/95 px-4 py-2.5 shadow-xl">
+        <div className="animate-spin rounded-full h-6 w-6 border-2 border-purple-400 border-t-transparent" />
+        <span className="text-gray-200 text-sm font-medium">{label}</span>
+      </div>
+    </div>
+  );
+}
 
 function mainDashTabFromPath(pathname) {
   if (pathname === '/night') return 'night';
@@ -4136,6 +4511,40 @@ function buildTeamGanttBuckets(datesDesc, timeScale) {
   return { buckets, dateToBucketKey: lookup };
 }
 
+/** Split composite chapter labels (e.g. "3, 8") into individual chapter tokens. */
+function parseChapterTokens(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s || s === '—') return [];
+  const parts = s
+    .split(/[,;/|]+|\s+and\s+/gi)
+    .map((p) => p.trim().replace(/^ch\.?\s*/i, ''))
+    .filter(Boolean);
+  const seen = new Set();
+  const out = [];
+  for (const p of parts) {
+    if (!seen.has(p)) {
+      seen.add(p);
+      out.push(p);
+    }
+  }
+  return out;
+}
+
+/** Add hours to Map<chapter, hours>, splitting multi-chapter keys evenly. */
+function addChapterHoursToMap(chMap, chapterRaw, hours) {
+  const hh = Number(hours) || 0;
+  if (hh <= 0) return;
+  const tokens = parseChapterTokens(chapterRaw);
+  if (!tokens.length) {
+    chMap.set('—', (chMap.get('—') || 0) + hh);
+    return;
+  }
+  const share = hh / tokens.length;
+  for (const ch of tokens) {
+    chMap.set(ch, (chMap.get(ch) || 0) + share);
+  }
+}
+
 /** Merge per-task chapter hour maps into dest (Map<task, Map<chapter, hours>>). */
 function mergeGanttTaskChapterMaps(dest, src) {
   if (!src || !dest) return;
@@ -4143,7 +4552,7 @@ function mergeGanttTaskChapterMaps(dest, src) {
     if (!dest.has(task)) dest.set(task, new Map());
     const dm = dest.get(task);
     for (const [ch, h] of sm.entries()) {
-      dm.set(ch, (dm.get(ch) || 0) + h);
+      addChapterHoursToMap(dm, ch, h);
     }
   }
 }
@@ -4455,16 +4864,15 @@ const ProjectEmployeeTooltip = memo(({ active, payload, chartMeta }) => {
         Hours: <span className="text-white font-bold tabular-nums">{hours.toFixed(1)}</span>
       </p>
       {breakdown.length > 0 ? (
-        <div className="mt-2 border-t border-gray-700 pt-2 space-y-1">
-          {breakdown.slice(0, 8).map((t) => (
-            <p key={`${bKey}-${t.task}`} className="text-gray-200 flex items-center justify-between gap-3">
-              <span className="truncate max-w-[150px]" title={t.task}>{t.task}</span>
-              <span className="text-white tabular-nums">{`${Number(t.hours || 0).toFixed(1)}h`}</span>
-            </p>
-          ))}
-          {breakdown.length > 8 && (
-            <p className="text-[10px] text-gray-400">+{breakdown.length - 8} more tasks</p>
-          )}
+        <div className="mt-2 border-t border-gray-700 pt-2">
+          <div className="max-h-48 overflow-y-auto pr-1 space-y-1">
+            {breakdown.map((t) => (
+              <p key={`${bKey}-${t.task}`} className="text-gray-200 flex items-center justify-between gap-3">
+                <span className="truncate max-w-[150px]" title={t.task}>{t.task}</span>
+                <span className="text-white tabular-nums">{`${Number(t.hours || 0).toFixed(1)}h`}</span>
+              </p>
+            ))}
+          </div>
         </div>
       ) : (
         <p className="text-gray-400 mt-2">No task-level breakdown for this segment.</p>
@@ -4749,17 +5157,24 @@ const Visualization = () => {
   const [tasks, setTasks] = useState([]);
   const [statuses, setStatuses] = useState([]);
   const [employeeTaskBreakdown, setEmployeeTaskBreakdown] = useState([]);
+  const [employeeTaskRateSamples, setEmployeeTaskRateSamples] = useState([]);
   const [projectTaskEffort, setProjectTaskEffort] = useState([]);
   const [projectEmployeeBreakdown, setProjectEmployeeBreakdown] = useState([]);
   const [projectGanttRows, setProjectGanttRows] = useState([]);
   const [projectTreemapChunkStart, setProjectTreemapChunkStart] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [dashboardRefreshing, setDashboardRefreshing] = useState(false);
+  const hasDashboardLoadedRef = useRef(false);
   const [lastUpdate, setLastUpdate] = useState(new Date());
 
   const [nightData, setNightData] = useState(null);
   const [nightLoading, setNightLoading] = useState(false);
+  const [nightRefreshing, setNightRefreshing] = useState(false);
+  const nightHasLoadedRef = useRef(false);
   const [crossBooks, setCrossBooks] = useState(null);
   const [booksLoading, setBooksLoading] = useState(false);
+  const [booksRefreshing, setBooksRefreshing] = useState(false);
+  const booksHasLoadedRef = useRef(false);
   const [selectedBookGroup, setSelectedBookGroup] = useState(null);
   const [bookSessionMin, setBookSessionMin] = useState(2);
   const crossBooksFetchSeq = useRef(0);
@@ -4777,6 +5192,10 @@ const Visualization = () => {
   const allDataCacheRef = useRef(null);
   /** Fresh values for scheduled auto-refresh */
   const refreshDashFiltersRef = useRef({ department: 'All', team: 'All', employee: 'All', period: DEFAULT_DASH_PERIOD });
+  const timelineChunkStartRef = useRef(0);
+  timelineChunkStartRef.current = timelineChunkStart;
+  const applyDashboardBundleRef = useRef(null);
+  const fetchDashboardBundleRef = useRef(null);
   /** Track prior overall-fetch signature to avoid splash loader on timeline-range-only changes. */
   const prevOverallFetchRef = useRef({ scopeKey: '', chunk: 0 });
   /** Avoid stale-route checks after awaits (fixes dropped applies under Strict Mode / fast tab switches). */
@@ -4853,6 +5272,8 @@ const Visualization = () => {
     selectedDepartment === 'All' && selectedTeam === 'All' && selectedEmployee === 'All';
   const isDepartmentTeamView =
     selectedDepartment !== 'All' && selectedTeam === 'All' && selectedEmployee === 'All';
+  const isEmployeeDetailView =
+    selectedDepartment !== 'All' && selectedTeam !== 'All' && selectedEmployee !== 'All';
 
   const teamToDepartment = useCallback(
     (teamName) => {
@@ -4869,6 +5290,187 @@ const Visualization = () => {
   const workModeByDaysChartData = useMemo(() => {
     return workModeByDays || [];
   }, [workModeByDays]);
+
+  const employeeChapterMap = useMemo(
+    () => (isEmployeeDetailView ? buildChapterMapFromGantt(projectGanttRows, selectedEmployee) : new Map()),
+    [isEmployeeDetailView, projectGanttRows, selectedEmployee]
+  );
+
+  const employeeTopProjectsStack = useMemo(() => {
+    if (!isEmployeeDetailView) return { rows: [], stackKeys: [] };
+    const flat = projectTaskEffort || [];
+    const byProj = new Map();
+    for (const r of flat) {
+      const p = r.project_name;
+      const task = r.task_name;
+      const h = Number(r.hours) || 0;
+      if (!p || !task || h <= 0) continue;
+      if (!byProj.has(p)) byProj.set(p, new Map());
+      const tm = byProj.get(p);
+      tm.set(task, (tm.get(task) || 0) + h);
+    }
+    const projTotals = [...byProj.entries()]
+      .map(([name, tm]) => ({ name, total: [...tm.values()].reduce((s, v) => s + v, 0), tasks: tm }))
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 10);
+    const taskTotals = {};
+    for (const { tasks } of projTotals) {
+      for (const [t, h] of tasks.entries()) taskTotals[t] = (taskTotals[t] || 0) + h;
+    }
+    const stackKeys = Object.entries(taskTotals)
+      .sort((a, b) => b[1] - a[1])
+      .map(([t]) => t);
+    const rows = projTotals.map(({ name, tasks, total }) => {
+      const row = {
+        name: name.length > 32 ? `${name.slice(0, 30)}…` : name,
+        fullName: name,
+        _total: total,
+      };
+      for (const k of stackKeys) row[k] = tasks.get(k) || 0;
+      return row;
+    });
+    return { rows, stackKeys };
+  }, [isEmployeeDetailView, projectTaskEffort]);
+
+  const employeeWorkModePie = useMemo(() => {
+    if (!isEmployeeDetailView) return [];
+    const total = (workMode || []).reduce((s, w) => s + (Number(w.hours) || 0), 0) || 1;
+    return (workMode || [])
+      .filter((w) => (Number(w.hours) || 0) > 0)
+      .map((w) => ({
+        name: w.mode,
+        hours: Number(w.hours) || 0,
+        pct: ((Number(w.hours) || 0) / total) * 100,
+        fill: WORK_MODE_COLORS[w.mode] || COLORS[0],
+      }))
+      .sort((a, b) => b.hours - a.hours);
+  }, [isEmployeeDetailView, workMode]);
+
+  const employeeProjectDonut = useMemo(() => {
+    if (!isEmployeeDetailView) return { slices: [], total: 0 };
+    const byProj = {};
+    for (const r of projectTaskEffort || []) {
+      const p = r.project_name;
+      const h = Number(r.hours) || 0;
+      if (!p || h <= 0) continue;
+      byProj[p] = (byProj[p] || 0) + h;
+    }
+    const total = Object.values(byProj).reduce((s, v) => s + v, 0) || 1;
+    const slices = Object.entries(byProj)
+      .sort((a, b) => b[1] - a[1])
+      .map(([name, hours], i) => ({
+        name: name.length > 28 ? `${name.slice(0, 26)}…` : name,
+        fullName: name,
+        value: hours,
+        hours,
+        pct: (hours / total) * 100,
+        fill: COLORS[i % COLORS.length],
+      }));
+    return { slices, total };
+  }, [isEmployeeDetailView, projectTaskEffort]);
+
+  const employeeProjectTaskHeatmap = useMemo(() => {
+    if (!isEmployeeDetailView) return { projects: [], tasks: [], cellMap: new Map(), hMin: 0, hMax: 1 };
+    const projTotals = {};
+    const taskTotals = {};
+    const cellMap = new Map();
+    for (const r of projectTaskEffort || []) {
+      const p = r.project_name;
+      const t = r.task_name;
+      const h = Number(r.hours) || 0;
+      if (!p || !t || h <= 0) continue;
+      projTotals[p] = (projTotals[p] || 0) + h;
+      taskTotals[t] = (taskTotals[t] || 0) + h;
+      const k = `${p}\t${t}`;
+      cellMap.set(k, { hours: (cellMap.get(k)?.hours || 0) + h, units: (cellMap.get(k)?.units || 0) + (Number(r.units) || 0) });
+    }
+    const projects = Object.entries(projTotals).sort((a, b) => b[1] - a[1]).map(([p]) => p);
+    const tasks = Object.entries(taskTotals).sort((a, b) => b[1] - a[1]).map(([t]) => t);
+    let hMin = Infinity;
+    let hMax = -Infinity;
+    for (const v of cellMap.values()) {
+      if (v.hours > 0) {
+        hMin = Math.min(hMin, v.hours);
+        hMax = Math.max(hMax, v.hours);
+      }
+    }
+    if (hMin === Infinity) {
+      hMin = 0;
+      hMax = 1;
+    }
+    return { projects, tasks, cellMap, hMin, hMax };
+  }, [isEmployeeDetailView, projectTaskEffort]);
+
+  const employeeContributionModel = useMemo(() => {
+    if (!isEmployeeDetailView) return null;
+    const flat = (employeeTaskBreakdown || []).filter(
+      (r) => String(r.employee || '').trim() === String(selectedEmployee).trim()
+    );
+    const iTasks = new Map();
+    const cTasks = new Map();
+    let iH = 0;
+    let cH = 0;
+    for (const r of flat) {
+      const task = r.task;
+      const h = Number(r.hours) || 0;
+      if (!task || h <= 0) continue;
+      const mode = classifyTaskIndependentOrCollab(task);
+      if (mode === 'C') {
+        cH += h;
+        cTasks.set(task, (cTasks.get(task) || 0) + h);
+      } else {
+        iH += h;
+        iTasks.set(task, (iTasks.get(task) || 0) + h);
+      }
+    }
+    const total = iH + cH || 1;
+    const toSlices = (m) =>
+      [...m.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([name, value], idx) => ({ name, value, fill: COLORS[idx % COLORS.length] }));
+    return {
+      iH,
+      cH,
+      total,
+      indepPct: (iH / total) * 100,
+      collabPct: (cH / total) * 100,
+      indepSlices: toSlices(iTasks),
+      collabSlices: toSlices(cTasks),
+    };
+  }, [isEmployeeDetailView, employeeTaskBreakdown, selectedEmployee]);
+
+  const employeeTaskBoxPlot = useMemo(() => {
+    if (!isEmployeeDetailView) return [];
+    const emp = String(selectedEmployee).trim();
+    const byTask = new Map();
+    for (const r of employeeTaskRateSamples || []) {
+      if (String(r.employee || '').trim() !== emp) continue;
+      const task = r.task;
+      const hours = Number(r.hours) || 0;
+      const units = Number(r.units) || 0;
+      if (!task || hours <= 0 || units <= 0) continue;
+      const rate = hours / units;
+      if (!byTask.has(task)) byTask.set(task, []);
+      byTask.get(task).push(rate);
+    }
+    if (byTask.size === 0) {
+      for (const r of employeeTaskBreakdown || []) {
+        if (String(r.employee || '').trim() !== emp) continue;
+        const task = r.task;
+        const hours = Number(r.hours) || 0;
+        const units = Number(r.units) || 0;
+        if (!task || hours <= 0 || units <= 0) continue;
+        const rate = hours / units;
+        if (!byTask.has(task)) byTask.set(task, []);
+        byTask.get(task).push(rate);
+      }
+    }
+    return [...byTask.entries()]
+      .map(([task, samples]) => ({ task, stats: quartiles(samples) }))
+      .filter((t) => t.stats.samples.length > 0)
+      .sort((a, b) => b.stats.median - a.stats.median)
+      .slice(0, 16);
+  }, [isEmployeeDetailView, employeeTaskRateSamples, employeeTaskBreakdown, selectedEmployee]);
 
   const workDistributionAgg = useMemo(() => {
     const flatRaw = employeeTaskBreakdown || [];
@@ -4992,6 +5594,7 @@ const Visualization = () => {
 
     return { rows, stackKeys, heatRows, taskColsHeat, heatCells, heatCellMap, hMin, hMax };
   }, [employeeTaskBreakdown, selectedEmployeeFromStack, isDepartmentTeamView, isAllDepartmentView, teamToDepartment, taskSplitMetric]);
+
   const workModeChartMinWidth = useMemo(() => {
     const n = workModeByDaysChartData?.length || 0;
     // Keep bars visually consistent: small n shouldn't explode width; large n scrolls.
@@ -5270,10 +5873,10 @@ const Visualization = () => {
               const ckey =
                 c.chapter != null && String(c.chapter).trim() !== '' ? String(c.chapter).trim() : '—';
               const hh = Number(c.hours) || 0;
-              chm.set(ckey, (chm.get(ckey) || 0) + hh);
+              addChapterHoursToMap(chm, ckey, hh);
             }
           } else if (th > 0) {
-            chm.set('—', (chm.get('—') || 0) + th);
+            addChapterHoursToMap(chm, '—', th);
           }
         }
       }
@@ -5423,6 +6026,152 @@ const Visualization = () => {
       laneHeight: LANE_H,
     };
   }, [projectGanttRows, ganttViewportWidth, ganttSortMode, teamGanttTimeScale]);
+
+  /** Single employee: Y = projects, X = time buckets, bar stacks = tasks. */
+  const employeeProjectGanttModel = useMemo(() => {
+    if (!isEmployeeDetailView) {
+      return { projects: [], buckets: [], colWidth: 42, chartWidth: 0, rowHeights: new Map(), taskColor: {}, dateRangeLabel: '', projColW: GANTT_PROJECT_COL };
+    }
+    const emp = String(selectedEmployee).trim();
+    const rows = (Array.isArray(projectGanttRows) ? projectGanttRows : []).filter(
+      (r) => String(r?.employee || r?.name || '').trim() === emp
+    );
+    if (!rows.length) {
+      return { projects: [], buckets: [], colWidth: 42, chartWidth: 0, rowHeights: new Map(), taskColor: {}, dateRangeLabel: '', projColW: GANTT_PROJECT_COL };
+    }
+
+    const dateSet = new Set();
+    const byProject = new Map();
+
+    for (const r of rows) {
+      const project = String(r?.project || r?.project_name || '').trim();
+      const date = String(r?.date || '').slice(0, 10);
+      if (!project || !date) continue;
+      dateSet.add(date);
+      if (!byProject.has(project)) byProject.set(project, new Map());
+      const dayMap = byProject.get(project);
+      const existing = dayMap.get(date) || { hours: 0, tasks: new Map(), taskChapters: new Map() };
+      existing.hours += Number(r?.hours) || 0;
+      if (Array.isArray(r?.tasks)) {
+        for (const t of r.tasks) {
+          const taskName = String(t?.task || 'Unspecified').trim() || 'Unspecified';
+          const th = Number(t?.hours) || 0;
+          existing.tasks.set(taskName, (existing.tasks.get(taskName) || 0) + th);
+          if (!existing.taskChapters.has(taskName)) existing.taskChapters.set(taskName, new Map());
+          const chm = existing.taskChapters.get(taskName);
+          if (Array.isArray(t.chapters) && t.chapters.length) {
+            for (const c of t.chapters) {
+              const ckey = c.chapter != null && String(c.chapter).trim() !== '' ? String(c.chapter).trim() : '—';
+              addChapterHoursToMap(chm, ckey, Number(c.hours) || 0);
+            }
+          } else if (th > 0) addChapterHoursToMap(chm, '—', th);
+        }
+      }
+      dayMap.set(date, existing);
+    }
+
+    const dates = Array.from(dateSet).sort((a, b) => b.localeCompare(a));
+    const { buckets, dateToBucketKey } = buildTeamGanttBuckets(dates, teamGanttTimeScale);
+    const cellMap = new Map();
+    for (const [project, dayMap] of byProject.entries()) {
+      for (const [dateStr, v] of dayMap.entries()) {
+        const bk = dateToBucketKey.get(dateStr);
+        if (!bk) continue;
+        const key = `${project}\t${bk}`;
+        if (!cellMap.has(key)) cellMap.set(key, { hours: 0, tasks: new Map(), taskChapters: new Map() });
+        const cell = cellMap.get(key);
+        cell.hours += v.hours || 0;
+        for (const [tk, h] of v.tasks.entries()) cell.tasks.set(tk, (cell.tasks.get(tk) || 0) + h);
+        mergeGanttTaskChapterMaps(cell.taskChapters, v.taskChapters);
+      }
+    }
+
+    const taskTotals = new Map();
+    for (const cell of cellMap.values()) {
+      for (const [tk, h] of cell.tasks.entries()) taskTotals.set(tk, (taskTotals.get(tk) || 0) + h);
+    }
+    const taskColor = {};
+    Array.from(taskTotals.entries())
+      .sort((a, b) => b[1] - a[1])
+      .forEach(([task], i) => {
+        taskColor[task] = COLORS[i % COLORS.length];
+      });
+
+    const ascDates = [...dates].sort((a, b) => a.localeCompare(b));
+    const minD = ascDates[0];
+    const maxD = ascDates[ascDates.length - 1];
+    let dateRangeLabel = '';
+    if (minD && maxD) {
+      const [y1, m1, d1] = minD.split('-').map(Number);
+      const [y2, m2, d2] = maxD.split('-').map(Number);
+      const dt1 = new Date(y1, m1 - 1, d1);
+      const dt2 = new Date(y2, m2 - 1, d2);
+      dateRangeLabel = `${dt1.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} – ${dt2.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}`;
+    }
+
+    const usableWidth = Math.max(320, (Number(ganttViewportWidth) || 0) - GANTT_PROJECT_COL);
+    const minColW = teamGanttTimeScale === 'Month' ? 88 : teamGanttTimeScale === 'Week' ? 108 : 28;
+    const colWidth = buckets.length > 0 ? Math.max(minColW, Math.min(140, usableWidth / buckets.length)) : 42;
+    const chartWidth = Math.max(usableWidth, buckets.length * colWidth);
+
+    const projects = Array.from(byProject.keys())
+      .map((project) => {
+        const withData = [];
+        for (let bi = 0; bi < buckets.length; bi += 1) {
+          const b = buckets[bi];
+          const cell = cellMap.get(`${project}\t${b.key}`);
+          if (!cell || !(cell.hours > 0)) continue;
+          withData.push({ idx: bi, bucketKey: b.key, hours: cell.hours, tasks: cell.tasks, taskChapters: cell.taskChapters });
+        }
+        const segments = [];
+        let run = null;
+        for (const d of withData) {
+          if (!run) {
+            run = {
+              startIdx: d.idx,
+              endIdx: d.idx,
+              totalHours: d.hours || 0,
+              tasks: new Map(d.tasks),
+              taskChapters: cloneGanttTaskChapterMaps(d.taskChapters),
+            };
+            continue;
+          }
+          if (d.idx === run.endIdx + 1) {
+            run.endIdx = d.idx;
+            run.totalHours += d.hours || 0;
+            for (const [tk, h] of d.tasks.entries()) run.tasks.set(tk, (run.tasks.get(tk) || 0) + h);
+            mergeGanttTaskChapterMaps(run.taskChapters, d.taskChapters);
+          } else {
+            segments.push(run);
+            run = {
+              startIdx: d.idx,
+              endIdx: d.idx,
+              totalHours: d.hours || 0,
+              tasks: new Map(d.tasks),
+              taskChapters: cloneGanttTaskChapterMaps(d.taskChapters),
+            };
+          }
+        }
+        if (run) segments.push(run);
+        const totalHours = segments.reduce((s, seg) => s + (seg.totalHours || 0), 0);
+        return { project, totalHours, segments };
+      })
+      .filter((p) => p.totalHours > 0)
+      .sort((a, b) => b.totalHours - a.totalHours);
+
+    const rowHeights = new Map(projects.map((p) => [p.project, 44]));
+
+    return {
+      projects,
+      buckets,
+      colWidth,
+      chartWidth,
+      rowHeights,
+      taskColor,
+      dateRangeLabel,
+      projColW: GANTT_PROJECT_COL,
+    };
+  }, [isEmployeeDetailView, projectGanttRows, selectedEmployee, ganttViewportWidth, teamGanttTimeScale]);
 
   /** Rows = employees, columns = week or month; cell = total hours in that bucket (all projects). */
   const employeeHoursHeatmapModel = useMemo(() => {
@@ -5613,7 +6362,7 @@ const Visualization = () => {
     if (team !== 'All') params.append('team', team);
     if (employee !== 'All') params.append('employee', employee);
     if (period !== 'All') params.append('period', period);
-    params.append('timelineStart', String(Math.max(0, timelineChunkStart)));
+    params.append('timelineStart', String(Math.max(0, timelineChunkStartRef.current)));
     params.append('timelineLimit', String(TIMELINE_PROJECT_CHUNK));
     const qs = params.toString();
     return qs ? `?${qs}` : '';
@@ -5657,8 +6406,15 @@ const Visualization = () => {
   };
 
   /** One bad endpoint cannot wipe the dashboard; pool/timeouts won't reject the whole bundle. */
-  const fetchDashboardBundle = async (department, team, employee, period) => {
+  const fetchDashboardBundle = async (department, team, employee, period, { bustCache = false } = {}) => {
     const urlSuffix = dashboardUrlSuffix(department, team, employee, period);
+    const withBust = (path) => {
+      if (!bustCache) return path;
+      const sep = path.includes('?') ? '&' : '?';
+      return `${path}${sep}_=${Date.now()}`;
+    };
+    const dashboardFetch = (path) =>
+      fetch(withBust(path), { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
     const endpoints = [
       `${API_URL}/overview${urlSuffix}`,
       `${API_URL}/projects${urlSuffix}`,
@@ -5671,12 +6427,13 @@ const Visualization = () => {
       `${API_URL}/tasks${urlSuffix}`,
       `${API_URL}/status${urlSuffix}`,
       `${API_URL}/employee-task-breakdown${urlSuffix}`,
+      `${API_URL}/employee-task-rate-samples${urlSuffix}`,
       `${API_URL}/project-task-effort${urlSuffix}`,
       `${API_URL}/project-employee-breakdown${urlSuffix}`,
       `${API_URL}/project-gantt${urlSuffix}`,
     ];
 
-    const settled = await Promise.allSettled(endpoints.map((u) => fetch(u)));
+    const settled = await Promise.allSettled(endpoints.map((u) => dashboardFetch(u)));
     const responses = settled.map((r) => (r.status === 'fulfilled' ? r.value : null));
 
     const [
@@ -5691,6 +6448,7 @@ const Visualization = () => {
       tasks,
       statuses,
       jt1,
+      jt1b,
       jt2,
       jt3,
       jt4,
@@ -5709,6 +6467,7 @@ const Visualization = () => {
       responses[11] ? parseArrJson(responses[11]) : Promise.resolve([]),
       responses[12] ? parseArrJson(responses[12]) : Promise.resolve([]),
       responses[13] ? parseArrJson(responses[13]) : Promise.resolve([]),
+      responses[14] ? parseArrJson(responses[14]) : Promise.resolve([]),
     ]);
 
     return {
@@ -5724,6 +6483,7 @@ const Visualization = () => {
       tasks,
       statuses,
       employeeTaskBreakdown: jt1,
+      employeeTaskRateSamples: jt1b,
       projectTaskEffort: jt2,
       projectEmployeeBreakdown: jt3,
       projectGanttRows: jt4,
@@ -5743,10 +6503,14 @@ const Visualization = () => {
     setTasks(b.tasks || []);
     setStatuses(b.statuses || []);
     setEmployeeTaskBreakdown(b.employeeTaskBreakdown || []);
+    setEmployeeTaskRateSamples(b.employeeTaskRateSamples || []);
     setProjectTaskEffort(b.projectTaskEffort || []);
     setProjectEmployeeBreakdown(b.projectEmployeeBreakdown || []);
     setProjectGanttRows(b.projectGanttRows || []);
+    hasDashboardLoadedRef.current = true;
   };
+  applyDashboardBundleRef.current = applyDashboardBundle;
+  fetchDashboardBundleRef.current = fetchDashboardBundle;
 
   // Initial load
   useEffect(() => {
@@ -5795,12 +6559,6 @@ const Visualization = () => {
     setTimelineChunkStart(0);
   }, [selectedDepartment, selectedTeam, selectedEmployee, selectedPeriod]);
 
-  /** Night / Books tabs don't use the Overall fetch effect; avoid a stuck splash loader */
-  useEffect(() => {
-    if (dashTab !== 'overall') setLoading(false);
-    if (dashTab === 'overall') setLoading(true);
-  }, [dashTab]);
-
   // Overall dashboard: default period slices fast query; prefetch full-range in background when not on "All"
   useEffect(() => {
     if (dashTab !== 'overall') return undefined;
@@ -5809,7 +6567,6 @@ const Visualization = () => {
     const prefetchGenAtStart = prefetchGenerationRef.current;
 
     let cancelled = false;
-    let intervalId = null;
 
     const teamEmpKey = `${selectedDepartment}|${selectedTeam}|${selectedEmployee}|${timelineChunkStart}`;
 
@@ -5820,8 +6577,8 @@ const Visualization = () => {
         const chunkOnlyChange = prev.scopeKey === scopeKey && prev.chunk !== timelineChunkStart;
         prevOverallFetchRef.current = { scopeKey, chunk: timelineChunkStart };
         if (!chunkOnlyChange) {
-          // Block UI until this filter slice is ready (prevents click/portal gaps)
-          setLoading(true);
+          if (hasDashboardLoadedRef.current) setDashboardRefreshing(true);
+          else setLoading(true);
         }
         if (selectedPeriod === 'All') {
           const cached = allDataCacheRef.current;
@@ -5871,32 +6628,57 @@ const Visualization = () => {
 
         if (!cancelled && prefetchGenerationRef.current === prefetchGenAtStart) {
           setLastUpdate(new Date());
-          if (!chunkOnlyChange) setLoading(false);
+          if (!chunkOnlyChange) {
+            setLoading(false);
+            setDashboardRefreshing(false);
+          }
         }
       } catch (error) {
         console.error('Error fetching data:', error);
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+          setDashboardRefreshing(false);
+        }
       }
     }
 
     syncDashboard();
 
-    intervalId = window.setInterval(() => {
-      const r = refreshDashFiltersRef.current;
-      fetchDashboardBundle(r.department, r.team, r.employee, r.period)
-        .then((fresh) => {
-          applyDashboardBundle(fresh);
-          setLastUpdate(new Date());
-        })
-        .catch(() => {});
-    }, REFRESH_INTERVAL);
-
     return () => {
       cancelled = true;
-      if (intervalId != null) window.clearInterval(intervalId);
       prefetchGenerationRef.current += 1;
     };
   }, [dashTab, selectedDepartment, selectedTeam, selectedEmployee, selectedPeriod, timelineChunkStart]);
+
+  // Stable 60s refresh — not tied to filter/timeline refetches (avoids interval reset / missed ticks)
+  useEffect(() => {
+    if (dashTab !== 'overall') return undefined;
+
+    const runRefresh = (bustCache = true) => {
+      const r = refreshDashFiltersRef.current;
+      const fetchBundle = fetchDashboardBundleRef.current;
+      if (!fetchBundle) return;
+      fetchBundle(r.department, r.team, r.employee, r.period, { bustCache })
+        .then((fresh) => {
+          applyDashboardBundleRef.current?.(fresh);
+          allDataCacheRef.current = null;
+          setLastUpdate(new Date());
+        })
+        .catch((err) => console.error('Dashboard auto-refresh failed:', err));
+    };
+
+    const intervalId = window.setInterval(() => runRefresh(true), REFRESH_INTERVAL);
+
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') runRefresh(true);
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [dashTab]);
 
   useEffect(() => {
     setSelectedEmployeeFromStack(null);
@@ -5907,26 +6689,30 @@ const Visualization = () => {
   }, [selectedTeam, selectedEmployee, selectedPeriod]);
 
   const fetchNightAnalytics = async () => {
-    setNightLoading(true);
+    const isInitial = !nightHasLoadedRef.current;
+    if (isInitial) setNightLoading(true);
+    else setNightRefreshing(true);
     try {
       const queryString = buildQueryParams();
       const urlSuffix = queryString ? `?${queryString}` : '';
       const res = await fetch(`${API_URL}/night-analytics${urlSuffix}`);
       const json = await res.json();
       setNightData(json.error ? null : json);
+      nightHasLoadedRef.current = true;
     } catch (e) {
       console.error('Night analytics fetch failed:', e);
       setNightData(null);
     } finally {
       setNightLoading(false);
+      setNightRefreshing(false);
     }
   };
 
   const fetchCrossSessionBooks = async () => {
     const seq = ++crossBooksFetchSeq.current;
-    setBooksLoading(true);
-    setCrossBooks(null);
-    setSelectedBookGroup(null);
+    const isInitial = !booksHasLoadedRef.current;
+    if (isInitial) setBooksLoading(true);
+    else setBooksRefreshing(true);
     try {
       const params = new URLSearchParams();
       if (selectedTeam !== 'All') params.append('team', selectedTeam);
@@ -5938,6 +6724,7 @@ const Visualization = () => {
       const json = await res.json();
       if (crossBooksFetchSeq.current !== seq) return;
       setCrossBooks(json.error ? null : json);
+      booksHasLoadedRef.current = true;
     } catch (e) {
       console.error('Cross-session books fetch failed:', e);
       if (crossBooksFetchSeq.current !== seq) return;
@@ -5945,6 +6732,7 @@ const Visualization = () => {
     } finally {
       if (crossBooksFetchSeq.current === seq) {
         setBooksLoading(false);
+        setBooksRefreshing(false);
       }
     }
   };
@@ -6009,7 +6797,8 @@ const Visualization = () => {
     }
   };
 
-  if (loading) {
+  // Only block the whole app for Team view initial load — Night/Books use their own loaders
+  if (dashTab === 'overall' && loading && !hasDashboardLoadedRef.current) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-gray-900 flex items-center justify-center">
         <div className="text-center">
@@ -6246,7 +7035,8 @@ const Visualization = () => {
       )}
 
       {/* Scrollable Content */}
-      <div className="px-8 py-6 overflow-y-auto">
+      <div className="px-8 py-6 overflow-y-auto relative min-h-[12rem]">
+        <FilterRefreshOverlay active={dashboardRefreshing && dashTab === 'overall'} />
         {dashTab === 'overall' && (
         <>
         {/* Stats Cards */}
@@ -6261,6 +7051,7 @@ const Visualization = () => {
             icon={Users}
             title="Employees"
             value={overview?.totalEmployees || 0}
+            subtitle="Registered users"
             color="from-pink-500 to-pink-700"
           />
           <StatCard
@@ -6279,6 +7070,294 @@ const Visualization = () => {
         </div>
 
         <div className="space-y-10 pb-8">
+
+        {isEmployeeDetailView ? (
+          <>
+            <div className="rounded-xl border border-sky-500/30 bg-sky-950/25 px-4 py-3 text-sky-100 text-sm">
+              <strong className="text-sky-200">Employee focus</strong> — {selectedEmployee} · {selectedTeam} · {selectedDepartment}
+              <span className="text-sky-300/80"> · Period: {selectedPeriod}</span>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+              <div className="bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-xl p-6 shadow-2xl border border-gray-700">
+                <h2 className="text-xl font-bold text-white mb-1 flex items-center">
+                  <Activity className="mr-2 text-amber-400 shrink-0" /> Task Split of Top 10 Projects
+                </h2>
+                <p className="text-gray-400 text-xs mb-3">Y-axis: projects · X-axis: hours · stacks: tasks · hover for chapter breakdown</p>
+                {employeeTopProjectsStack.rows.length > 0 ? (
+                  <div style={{ height: Math.max(360, employeeTopProjectsStack.rows.length * 36) }}>
+                    <ResponsiveContainer width="100%" height="100%" debounce={120}>
+                      <BarChart data={employeeTopProjectsStack.rows} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 8 }} isAnimationActive={false}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis type="number" stroke="#9ca3af" tick={{ fontSize: 10 }} label={{ value: 'Hours', position: 'insideBottom', fill: '#9ca3af', fontSize: 11 }} />
+                        <YAxis type="category" dataKey="name" width={160} stroke="#9ca3af" tick={{ fontSize: 9 }} interval={0} />
+                        <Tooltip content={<EmployeeProjectStackTooltip chapterMap={employeeChapterMap} />} wrapperStyle={{ zIndex: 10005 }} />
+                        <Legend wrapperStyle={{ fontSize: 10 }} />
+                        {employeeTopProjectsStack.stackKeys.map((key, i) => (
+                          <Bar key={key} dataKey={key} stackId="empProj" fill={COLORS[i % COLORS.length]} name={key} isAnimationActive={false} />
+                        ))}
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                ) : (
+                  <div className="h-[320px] flex items-center justify-center text-gray-500 text-sm">No project/task hours for this employee.</div>
+                )}
+              </div>
+
+              <div className="bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-xl p-6 shadow-2xl border border-gray-700">
+                <h2 className="text-xl font-bold text-white mb-1 flex items-center">
+                  <Clock className="mr-2 text-pink-400 shrink-0" /> Work Mode Analysis
+                </h2>
+                <p className="text-gray-400 text-xs mb-3">Share of hours by work mode for {selectedEmployee}</p>
+                {employeeWorkModePie.length > 0 ? (
+                  <ResponsiveContainer width="100%" height={360}>
+                    <PieChart>
+                      <Pie
+                        data={employeeWorkModePie}
+                        dataKey="hours"
+                        nameKey="name"
+                        cx="50%"
+                        cy="50%"
+                        outerRadius={110}
+                        labelLine={PIE_LABEL_LINE_STYLE}
+                        label={PieExternalLabel}
+                        isAnimationActive={false}
+                      >
+                        {employeeWorkModePie.map((entry, i) => (
+                          <Cell key={entry.name} fill={entry.fill || COLORS[i % COLORS.length]} />
+                        ))}
+                      </Pie>
+                      <Tooltip content={<WorkModeDistributionTooltip />} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div className="h-[360px] flex items-center justify-center text-gray-500 text-sm">No work mode data.</div>
+                )}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+              <div className="bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-xl p-6 shadow-2xl border border-gray-700">
+                <h2 className="text-xl font-bold text-white mb-1 flex items-center">
+                  <Briefcase className="mr-2 text-purple-400 shrink-0" /> Projects by Hours
+                </h2>
+                <p className="text-gray-400 text-xs mb-3">Donut: share of this employee&apos;s hours across projects</p>
+                {employeeProjectDonut.slices.length > 0 ? (
+                  <ResponsiveContainer width="100%" height={360}>
+                    <PieChart>
+                      <Pie
+                        data={employeeProjectDonut.slices}
+                        dataKey="value"
+                        nameKey="name"
+                        cx="50%"
+                        cy="50%"
+                        innerRadius={70}
+                        outerRadius={120}
+                        labelLine={PIE_LABEL_LINE_STYLE}
+                        label={PieExternalLabel}
+                        isAnimationActive={false}
+                      >
+                        {employeeProjectDonut.slices.map((entry, i) => (
+                          <Cell key={entry.fullName} fill={entry.fill} />
+                        ))}
+                      </Pie>
+                      <Tooltip
+                        content={<EmployeeProjectDonutTooltip />}
+                        wrapperStyle={{ zIndex: 10005, outline: 'none' }}
+                      />
+                    </PieChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div className="h-[360px] flex items-center justify-center text-gray-500 text-sm">No project hours.</div>
+                )}
+              </div>
+
+              <div className="bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-xl p-6 shadow-2xl border border-gray-700">
+                <h2 className="text-xl font-bold text-white mb-1 flex items-center">
+                  <Target className="mr-2 text-indigo-400 shrink-0" /> Project × Task Heatmap
+                </h2>
+                <p className="text-gray-400 text-xs mb-3">Rows: projects · Columns: tasks · Shade: hours</p>
+                {employeeProjectTaskHeatmap.projects.length > 0 && employeeProjectTaskHeatmap.tasks.length > 0 ? (
+                  <div className="overflow-auto max-h-[min(70vh,480px)] rounded-lg border border-gray-700">
+                    <table className="text-[11px] min-w-max border-separate border-spacing-0">
+                      <thead>
+                        <tr>
+                          <th className="sticky left-0 z-20 bg-gray-800 px-2 py-2 text-left text-gray-300 border-b border-r border-gray-700 w-[140px]">Project</th>
+                          {employeeProjectTaskHeatmap.tasks.map((t) => (
+                            <th key={t} title={t} className="bg-gray-800 px-1 py-2 text-gray-400 border-b border-gray-700 min-w-[52px]">
+                              <span className="block truncate max-w-[50px]">{t.length > 8 ? `${t.slice(0, 7)}…` : t}</span>
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {employeeProjectTaskHeatmap.projects.map((proj) => (
+                          <tr key={proj}>
+                            <td className="sticky left-0 z-10 bg-gray-900 px-2 py-1.5 text-gray-100 border-r border-gray-700 truncate max-w-[140px]" title={proj}>{proj.length > 18 ? `${proj.slice(0, 16)}…` : proj}</td>
+                            {employeeProjectTaskHeatmap.tasks.map((task) => {
+                              const cell = employeeProjectTaskHeatmap.cellMap.get(`${proj}\t${task}`);
+                              const h = cell?.hours || 0;
+                              const rng = Math.max(employeeProjectTaskHeatmap.hMax - employeeProjectTaskHeatmap.hMin, 1e-6);
+                              const t = (h - employeeProjectTaskHeatmap.hMin) / rng;
+                              const clr = h <= 0 ? '#fff' : purpleHeatAlpha(Math.max(0.12, Math.min(1, t)));
+                              return (
+                                <td key={`${proj}-${task}`} className="p-0.5 border-l border-gray-800/60">
+                                  <div title={`${proj} · ${task}: ${h.toFixed(1)}h`} className="h-8 min-w-[48px] rounded flex items-center justify-center text-[10px] font-semibold" style={{ backgroundColor: clr, color: h > employeeProjectTaskHeatmap.hMin + rng * 0.5 ? '#fff' : '#111' }}>
+                                    {h > 0 ? (h >= 99 ? Math.round(h) : h.toFixed(0)) : ''}
+                                  </div>
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <div className="h-[280px] flex items-center justify-center text-gray-500 text-sm">No project×task data.</div>
+                )}
+              </div>
+            </div>
+
+            <div className="bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-xl p-6 shadow-2xl border border-gray-700">
+              <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+                <div>
+                  <h2 className="text-xl font-bold text-white flex items-center">
+                    <TrendingUp className="mr-2 text-blue-400" /> Project Gantt Chart
+                  </h2>
+                  <p className="text-gray-400 text-xs mt-1">X-axis: dates · Y-axis: projects · bar segments: tasks (hover for task hour breakdown)</p>
+                </div>
+                <select
+                  value={teamGanttTimeScale}
+                  onChange={(e) => setTeamGanttTimeScale(e.target.value)}
+                  className="bg-gray-700 text-gray-200 border border-gray-600 rounded-md px-2 py-1 text-xs"
+                >
+                  <option value="Day">Day</option>
+                  <option value="Week">Week</option>
+                  <option value="Month">Month</option>
+                </select>
+              </div>
+              {employeeProjectGanttModel.dateRangeLabel && (
+                <p className="text-gray-500 text-xs mb-2">{employeeProjectGanttModel.dateRangeLabel}</p>
+              )}
+              {employeeProjectGanttModel.projects.length > 0 && employeeProjectGanttModel.buckets.length > 0 ? (
+                <div ref={ganttViewportRef} className="overflow-auto max-h-[560px] rounded-lg border border-gray-700 bg-gray-900/50">
+                  <div style={{ minWidth: `${employeeProjectGanttModel.projColW + employeeProjectGanttModel.chartWidth}px` }}>
+                    <div className="flex border-b border-gray-700 sticky top-0 z-10 bg-gray-900">
+                      <div className="shrink-0 px-3 py-2 text-xs font-semibold text-gray-400 border-r border-gray-700" style={{ width: employeeProjectGanttModel.projColW }}>Project</div>
+                      <div className="flex" style={{ width: employeeProjectGanttModel.chartWidth }}>
+                        {employeeProjectGanttModel.buckets.map((b) => (
+                          <div key={b.key} className="text-[10px] text-gray-400 text-center border-l border-gray-800 py-2 truncate px-0.5" style={{ width: employeeProjectGanttModel.colWidth }} title={b.label}>{b.label}</div>
+                        ))}
+                      </div>
+                    </div>
+                    {employeeProjectGanttModel.projects.map((row) => (
+                      <div key={row.project} className="flex border-b border-gray-800/80" style={{ minHeight: 44 }}>
+                        <div className="shrink-0 px-3 py-2 text-xs text-gray-100 border-r border-gray-700 truncate" style={{ width: employeeProjectGanttModel.projColW }} title={row.project}>{row.project}</div>
+                        <div className="relative" style={{ width: employeeProjectGanttModel.chartWidth, height: 40 }}>
+                          {employeeProjectGanttModel.buckets.map((b, idx) => (
+                            <div key={b.key} className="absolute top-0 bottom-0 border-l border-gray-800/50" style={{ left: idx * employeeProjectGanttModel.colWidth, width: employeeProjectGanttModel.colWidth }} />
+                          ))}
+                          {row.segments.map((seg, segIdx) => {
+                            const left = seg.startIdx * employeeProjectGanttModel.colWidth + 1;
+                            const width = (seg.endIdx - seg.startIdx + 1) * employeeProjectGanttModel.colWidth - 2;
+                            const taskParts = [...seg.tasks.entries()].sort((a, b) => b[1] - a[1]);
+                            const total = taskParts.reduce((s, [, h]) => s + h, 0) || 1;
+                            const fromLabel = employeeProjectGanttModel.buckets[seg.startIdx]?.label || '';
+                            const toLabel = employeeProjectGanttModel.buckets[seg.endIdx]?.label || '';
+                            return (
+                              <div
+                                key={`${row.project}-${segIdx}`}
+                                className="absolute top-1 bottom-1 flex overflow-hidden rounded-sm border border-slate-600/80"
+                                style={{ left, width: Math.max(4, width) }}
+                                onMouseEnter={(e) => {
+                                  const breakdown = taskParts.map(([task, hours]) => ({ task, hours }));
+                                  setGanttHover({
+                                    x: e.clientX,
+                                    y: e.clientY,
+                                    row: row.project,
+                                    project: row.project,
+                                    task: breakdown.map((b) => `${b.task}=${b.hours.toFixed(1)}h`).join(', '),
+                                    from: fromLabel,
+                                    to: toLabel,
+                                    hours: seg.totalHours,
+                                    total: seg.totalHours,
+                                    breakdownTitle: 'Task breakdown',
+                                    breakdown: breakdown.map((b) => `${b.task}: ${b.hours.toFixed(1)} hrs`),
+                                  });
+                                }}
+                                onMouseLeave={() => setGanttHover(null)}
+                              >
+                                {taskParts.map(([task, hours], i) => (
+                                  <div
+                                    key={task}
+                                    style={{
+                                      width: `${(hours / total) * 100}%`,
+                                      backgroundColor: employeeProjectGanttModel.taskColor[task] || COLORS[i % COLORS.length],
+                                    }}
+                                    title={`${task}: ${hours.toFixed(1)}h`}
+                                  />
+                                ))}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="h-[200px] flex items-center justify-center text-gray-500 text-sm">No timeline data for this employee.</div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+              <div className="bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-xl p-6 shadow-2xl border border-gray-700">
+                <h2 className="text-xl font-bold text-white mb-1 flex items-center">
+                  <BarChart3 className="mr-2 text-violet-400 shrink-0" /> Time per Unit by Task
+                </h2>
+                <p className="text-gray-400 text-xs mb-3">
+                  How long this person takes per unit of work, by task. Each box uses logged hours ÷ units from individual entries (lower median = faster). Whiskers show spread; white line = median.
+                </p>
+                <TaskTimePerUnitBoxPlot tasks={employeeTaskBoxPlot} />
+              </div>
+
+              <div className="bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-xl p-6 shadow-2xl border border-gray-700">
+                <h2 className="text-xl font-bold text-white mb-2 flex items-center">
+                  <PieChartIcon className="mr-2 text-sky-400 shrink-0" /> Contribution Split
+                </h2>
+                <p className="text-gray-400 text-xs mb-4">Independent vs collaborative work (task classification)</p>
+                {employeeContributionModel && (employeeContributionModel.indepSlices.length || employeeContributionModel.collabSlices.length) ? (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <DonutWithLegend
+                      title="A. Individual Work (Creation Focused)"
+                      centerLabel="Individual Work"
+                      subtitle="Drafting, composing, and other I-classified tasks"
+                      pct={employeeContributionModel.indepPct}
+                      slices={employeeContributionModel.indepSlices}
+                      totalLabel="Total Individual Hours"
+                      totalValue={`${employeeContributionModel.iH.toFixed(1)} hrs`}
+                      accentClass="text-blue-400"
+                    />
+                    <DonutWithLegend
+                      title="B. Collaborative Work (Review & Refinement)"
+                      centerLabel="Collaborative Work"
+                      subtitle="Readings, coordination, and C-classified tasks"
+                      pct={employeeContributionModel.collabPct}
+                      slices={employeeContributionModel.collabSlices}
+                      totalLabel="Total Collaborative Hours"
+                      totalValue={`${employeeContributionModel.cH.toFixed(1)} hrs`}
+                      accentClass="text-emerald-400"
+                    />
+                  </div>
+                ) : (
+                  <div className="h-[280px] flex items-center justify-center text-gray-500 text-sm">No classified task hours.</div>
+                )}
+              </div>
+            </div>
+          </>
+        ) : (
+        <>
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
           {/* Top Projects by Hours with Clickable Bars */}
 <div className="bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-xl p-6 shadow-2xl border border-gray-700">
@@ -7400,29 +8479,59 @@ const Visualization = () => {
             </div>
           </section>
 
+        </>
+        )}
+
         </div>
         </>
         )}
 
         {dashTab === 'night' && (
-          <div className="space-y-8 pb-8">
-            <div className="rounded-xl border border-indigo-500/40 bg-indigo-950/30 p-4 text-indigo-100 text-sm max-w-4xl">
-              <strong className="text-indigo-200">Night view</strong> includes only rows where <code className="text-indigo-300 bg-gray-900/80 px-1 rounded">work_mode</code> is Night
-              (case-insensitive). Hour-of-day uses <code className="text-indigo-300 bg-gray-900/80 px-1 rounded">submitted_at</code> when present, otherwise the work <code className="text-indigo-300 bg-gray-900/80 px-1 rounded">date</code>.
-              Day baseline for task ratios uses WFH, In Office, OT Office, OT Home, On Duty, and Half Day.
-            </div>
-            {nightLoading && (
+          <div className="space-y-8 pb-8 relative min-h-[16rem]">
+            <FilterRefreshOverlay active={nightRefreshing} label="Updating night analytics…" />
+            {nightLoading && !nightHasLoadedRef.current && (
               <div className="flex justify-center py-24">
                 <div className="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-indigo-500" />
               </div>
             )}
-            {!nightLoading && nightData?.summary && (
+            {(nightHasLoadedRef.current || nightData?.summary) && !nightLoading && nightData?.summary && (
               <>
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
                   <StatCard icon={Moon} title="Night hours" value={Math.round(nightData.summary.totalNightHours || 0)} subtitle="Filtered scope" color="from-indigo-600 to-indigo-900" />
                   <StatCard icon={Clock} title="Night entries" value={nightData.summary.totalNightEntries || 0} subtitle="Row count" color="from-slate-600 to-slate-900" />
                   <StatCard icon={Users} title="Night contributors" value={nightData.summary.uniqueNightContributors || 0} subtitle="Distinct names" color="from-violet-600 to-violet-900" />
                   <StatCard icon={Zap} title="Night share" value={`${(nightData.summary.nightPercentOfFilteredHours || 0).toFixed(1)}%`} subtitle="Of all hours in filter" color="from-fuchsia-600 to-purple-900" />
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                  <StatCard
+                    icon={Clock}
+                    title="Avg per entry"
+                    value={nightData.summary.avgHoursPerNightEntry ?? 0}
+                    subtitle="Hours per night log"
+                    color="from-amber-600 to-amber-900"
+                  />
+                  <StatCard
+                    icon={Target}
+                    title="Units / night hr"
+                    value={nightData.summary.globalUnitsPerNightHour ?? '—'}
+                    subtitle="Output intensity"
+                    color="from-teal-600 to-teal-900"
+                  />
+                  <StatCard
+                    icon={Activity}
+                    title="Peak log hour"
+                    value={nightData.summary.peakNightHourLabel ?? '—'}
+                    subtitle="By submission timestamp"
+                    color="from-orange-600 to-orange-900"
+                  />
+                  <StatCard
+                    icon={TrendingUp}
+                    title="Busiest weekday"
+                    value={nightData.summary.busiestWeekday ?? '—'}
+                    subtitle="Most night hours"
+                    color="from-rose-600 to-rose-900"
+                  />
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
@@ -7497,6 +8606,121 @@ const Visualization = () => {
 
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
                   <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-2 flex items-center"><BarChart3 className="w-5 h-5 mr-2 text-violet-400" /> Night hours by task</h2>
+                    <p className="text-gray-400 text-xs mb-4">Where night effort is spent — top tasks by hours.</p>
+                    <ResponsiveContainer width="100%" height={360}>
+                      <BarChart data={(nightData.taskNight || []).slice(0, 14)} layout="vertical" margin={{ left: 4, right: 12 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis type="number" stroke="#9ca3af" />
+                        <YAxis type="category" dataKey="task" stroke="#9ca3af" width={108} tick={{ fontSize: 10 }} />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Bar dataKey="hours" fill="#8b5cf6" name="Night hours" radius={[0, 6, 6, 0]} isAnimationActive={false} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-2 flex items-center"><BookMarked className="w-5 h-5 mr-2 text-teal-400" /> Night hours by book element</h2>
+                    <p className="text-gray-400 text-xs mb-4">Distribution across elements logged at night.</p>
+                    <ResponsiveContainer width="100%" height={360}>
+                      <BarChart data={(nightData.elementNight || []).slice(0, 12)} margin={{ bottom: 56 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis dataKey="element" stroke="#9ca3af" angle={-28} textAnchor="end" height={64} interval={0} fontSize={10} />
+                        <YAxis stroke="#9ca3af" />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Bar dataKey="hours" fill="#14b8a6" name="Night hours" radius={[6, 6, 0, 0]} isAnimationActive={false} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-4 flex items-center"><PieChartIcon className="w-5 h-5 mr-2 text-fuchsia-400" /> Night hours — task mix</h2>
+                    <ResponsiveContainer width="100%" height={300}>
+                      <PieChart>
+                        <Pie
+                          data={nightData.nightTaskShare || []}
+                          dataKey="value"
+                          nameKey="name"
+                          cx="50%"
+                          cy="50%"
+                          innerRadius={50}
+                          outerRadius={88}
+                          paddingAngle={1}
+                          stroke="#1f2937"
+                          isAnimationActive={false}
+                        >
+                          {(nightData.nightTaskShare || []).map((_, i) => (
+                            <Cell key={i} fill={COLORS[i % COLORS.length]} />
+                          ))}
+                        </Pie>
+                        <Tooltip
+                          content={({ active, payload }) =>
+                            active && payload?.[0] ? (
+                              <div className="rounded-lg border border-indigo-500 bg-gray-900 p-3 text-sm shadow-xl">
+                                <p className="text-white font-semibold">{payload[0].payload.fullName || payload[0].payload.name}</p>
+                                <p className="text-indigo-200 mt-1">
+                                  {(Number(payload[0].value) || 0).toFixed(1)} hrs · {payload[0].payload.nightPercentOfNightTotal ?? 0}%
+                                </p>
+                              </div>
+                            ) : null
+                          }
+                        />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-4 flex items-center"><LayoutGrid className="w-5 h-5 mr-2 text-cyan-400" /> Night share by team</h2>
+                    <ResponsiveContainer width="100%" height={300}>
+                      <PieChart>
+                        <Pie
+                          data={nightData.teamNightShare || []}
+                          dataKey="value"
+                          nameKey="name"
+                          cx="50%"
+                          cy="50%"
+                          innerRadius={50}
+                          outerRadius={88}
+                          paddingAngle={1}
+                          stroke="#1f2937"
+                          isAnimationActive={false}
+                        >
+                          {(nightData.teamNightShare || []).map((_, i) => (
+                            <Cell key={i} fill={COLORS[(i + 3) % COLORS.length]} />
+                          ))}
+                        </Pie>
+                        <Tooltip
+                          content={({ active, payload }) =>
+                            active && payload?.[0] ? (
+                              <div className="rounded-lg border border-indigo-500 bg-gray-900 p-3 text-sm shadow-xl">
+                                <p className="text-white font-semibold">{payload[0].payload.fullName || payload[0].payload.name}</p>
+                                <p className="text-indigo-200 mt-1">
+                                  {(Number(payload[0].value) || 0).toFixed(1)} hrs · {payload[0].payload.entries ?? 0} entries
+                                </p>
+                              </div>
+                            ) : null
+                          }
+                        />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-2 flex items-center"><Users className="w-5 h-5 mr-2 text-pink-400" /> Top contributors — night hours</h2>
+                    <p className="text-gray-400 text-xs mb-4">Absolute night hours logged (not % of own total).</p>
+                    <ResponsiveContainer width="100%" height={380}>
+                      <BarChart data={(nightData.contributorNight || []).slice(0, 14)} layout="vertical" margin={{ left: 8, right: 16 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis type="number" stroke="#9ca3af" />
+                        <YAxis type="category" dataKey="name" stroke="#9ca3af" width={100} tick={{ fontSize: 11 }} />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Bar dataKey="nightHours" fill="#6366f1" name="Night hours" radius={[0, 6, 6, 0]} isAnimationActive={false} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
                     <h2 className="text-xl font-bold text-white mb-2 flex items-center"><Users className="w-5 h-5 mr-2 text-pink-400" /> Contributors — night % of own hours</h2>
                     <p className="text-gray-400 text-xs mb-4">Who logs a large share of their time as Night mode (accountability lens).</p>
                     <ResponsiveContainer width="100%" height={380}>
@@ -7509,9 +8733,12 @@ const Visualization = () => {
                       </BarChart>
                     </ResponsiveContainer>
                   </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
                   <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
                     <h2 className="text-xl font-bold text-white mb-2 flex items-center"><Activity className="w-5 h-5 mr-2 text-emerald-400" /> Night vs day — hours by task (top)</h2>
-                    <p className="text-gray-400 text-xs mb-4">Ratio &gt; 1 means more night hours than selected day-modes for that task.</p>
+                    <p className="text-gray-400 text-xs mb-4">Side-by-side night hours vs day-mode hours for the same task.</p>
                     <ResponsiveContainer width="100%" height={380}>
                       <BarChart data={(nightData.nightVsDayByTask || []).filter((t) => t.nightHours > 0).slice(0, 12)} margin={{ bottom: 70 }}>
                         <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
@@ -7524,12 +8751,116 @@ const Visualization = () => {
                       </BarChart>
                     </ResponsiveContainer>
                   </div>
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-2 flex items-center"><Zap className="w-5 h-5 mr-2 text-amber-400" /> Night-to-day ratio by task</h2>
+                    <p className="text-gray-400 text-xs mb-4">
+                      Bars past <span className="text-amber-300 font-semibold">1.0</span> (dashed line) = more night than day-mode hours on that task.
+                    </p>
+                    <ResponsiveContainer width="100%" height={380}>
+                      <BarChart
+                        data={(nightData.nightVsDayByTask || [])
+                          .filter((t) => t.nightHours > 0)
+                          .map((t) => {
+                            const ratio =
+                              t.nightToDayHourRatio != null
+                                ? t.nightToDayHourRatio
+                                : t.dayHours > 0
+                                  ? t.nightHours / t.dayHours
+                                  : null;
+                            const rounded = ratio != null ? Math.round(ratio * 1000) / 1000 : null;
+                            return {
+                              task: t.task,
+                              ratio: rounded,
+                              nightHours: t.nightHours,
+                              dayHours: t.dayHours,
+                              fill: rounded != null && rounded >= 1 ? '#f59e0b' : '#6366f1'
+                            };
+                          })
+                          .filter((t) => t.ratio != null)
+                          .sort((a, b) => b.ratio - a.ratio)
+                          .slice(0, 12)}
+                        layout="vertical"
+                        margin={{ left: 8, right: 24 }}
+                      >
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis type="number" stroke="#9ca3af" domain={[0, 'auto']} />
+                        <YAxis type="category" dataKey="task" stroke="#9ca3af" width={100} tick={{ fontSize: 10 }} />
+                        <ReferenceLine x={1} stroke="#fbbf24" strokeDasharray="4 4" label={{ value: '1.0', fill: '#fbbf24', fontSize: 11 }} />
+                        <Tooltip
+                          content={({ active, payload }) =>
+                            active && payload?.[0] ? (
+                              <div className="rounded-lg border border-amber-500/60 bg-gray-900 p-3 text-sm shadow-xl">
+                                <p className="text-white font-semibold">{payload[0].payload.task}</p>
+                                <p className="text-amber-200 mt-1">
+                                  Ratio: <span className="font-bold text-white">{payload[0].payload.ratio}</span>
+                                </p>
+                                <p className="text-gray-400 text-xs mt-1">
+                                  Night {payload[0].payload.nightHours?.toFixed(1)}h · Day-mode {payload[0].payload.dayHours?.toFixed(1)}h
+                                </p>
+                              </div>
+                            ) : null
+                          }
+                        />
+                        <Bar dataKey="ratio" name="Night ÷ day-mode" radius={[0, 6, 6, 0]} isAnimationActive={false}>
+                          {(nightData.nightVsDayByTask || [])
+                            .filter((t) => t.nightHours > 0)
+                            .map((t) => {
+                              const ratio =
+                                t.nightToDayHourRatio != null
+                                  ? t.nightToDayHourRatio
+                                  : t.dayHours > 0
+                                    ? t.nightHours / t.dayHours
+                                    : null;
+                              const rounded = ratio != null ? Math.round(ratio * 1000) / 1000 : null;
+                              return { rounded, fill: rounded != null && rounded >= 1 ? '#f59e0b' : '#6366f1' };
+                            })
+                            .filter((x) => x.rounded != null)
+                            .sort((a, b) => b.rounded - a.rounded)
+                            .slice(0, 12)
+                            .map((x, i) => (
+                              <Cell key={i} fill={x.fill} />
+                            ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
                   <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
-                    <h2 className="text-xl font-bold text-white mb-2 flex items-center"><Clock className="w-5 h-5 mr-2 text-amber-400" /> Submission / log hour (UTC)</h2>
-                    <p className="text-gray-400 text-xs mb-4">Bucketed by timestamp used for analytics (see note above).</p>
+                    <h2 className="text-xl font-bold text-white mb-2 flex items-center"><CheckCircle className="w-5 h-5 mr-2 text-lime-400" /> Night entries by team</h2>
+                    <p className="text-gray-400 text-xs mb-4">Volume of night log rows vs hours — spot teams logging often at night.</p>
+                    <ResponsiveContainer width="100%" height={320}>
+                      <BarChart data={(nightData.teamNight || []).slice(0, 12)} margin={{ bottom: 60 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis dataKey="team" stroke="#9ca3af" angle={-35} textAnchor="end" height={70} interval={0} fontSize={10} />
+                        <YAxis stroke="#9ca3af" />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Legend />
+                        <Bar dataKey="entries" fill="#a78bfa" name="Entries" radius={[4, 4, 0, 0]} isAnimationActive={false} />
+                        <Bar dataKey="hours" fill="#6366f1" name="Hours" radius={[4, 4, 0, 0]} isAnimationActive={false} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-2 flex items-center"><BarChart3 className="w-5 h-5 mr-2 text-emerald-400" /> Night units by task</h2>
+                    <p className="text-gray-400 text-xs mb-4">Output (units) produced during night sessions.</p>
+                    <ResponsiveContainer width="100%" height={320}>
+                      <BarChart data={(nightData.taskNight || []).filter((t) => (t.units || 0) > 0).slice(0, 12)} margin={{ bottom: 70 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis dataKey="task" stroke="#9ca3af" angle={-30} textAnchor="end" height={80} interval={0} fontSize={10} />
+                        <YAxis stroke="#9ca3af" />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Bar dataKey="units" fill="#10b981" name="Units" radius={[6, 6, 0, 0]} isAnimationActive={false} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-2 flex items-center"><Clock className="w-5 h-5 mr-2 text-amber-400" /> Submission / log hour</h2>
+                    <p className="text-gray-400 text-xs mb-4">When night rows were submitted (hour of day).</p>
                     <ResponsiveContainer width="100%" height={280}>
                       <AreaChart data={nightData.hourlyBuckets || []} isAnimationActive={false}>
                         <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
@@ -7554,17 +8885,32 @@ const Visualization = () => {
                   </div>
                 </div>
 
-                <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
-                  <h2 className="text-xl font-bold text-white mb-4 flex items-center"><TrendingUp className="w-5 h-5 mr-2 text-sky-400" /> Night hours over time</h2>
-                  <ResponsiveContainer width="100%" height={300}>
-                    <LineChart data={nightData.nightTimeline || []} isAnimationActive={false}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                      <XAxis dataKey="date" stroke="#9ca3af" fontSize={11} />
-                      <YAxis stroke="#9ca3af" />
-                      <Tooltip content={<CustomTooltip />} />
-                      <Line type="monotone" dataKey="hours" stroke="#818cf8" strokeWidth={2} dot={false} name="Night hours" />
-                    </LineChart>
-                  </ResponsiveContainer>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-4 flex items-center"><TrendingUp className="w-5 h-5 mr-2 text-sky-400" /> Night hours — daily</h2>
+                    <ResponsiveContainer width="100%" height={300}>
+                      <LineChart data={nightData.nightTimeline || []} isAnimationActive={false}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis dataKey="date" stroke="#9ca3af" fontSize={11} />
+                        <YAxis stroke="#9ca3af" />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Line type="monotone" dataKey="hours" stroke="#818cf8" strokeWidth={2} dot={false} name="Night hours" />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-4 flex items-center"><TrendingUp className="w-5 h-5 mr-2 text-indigo-400" /> Night hours — by week</h2>
+                    <p className="text-gray-400 text-xs mb-3">Weeks start Monday (work date).</p>
+                    <ResponsiveContainer width="100%" height={300}>
+                      <BarChart data={nightData.weeklyNight || []} margin={{ bottom: 48 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis dataKey="weekStart" stroke="#9ca3af" fontSize={10} angle={-25} textAnchor="end" height={56} />
+                        <YAxis stroke="#9ca3af" />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Bar dataKey="hours" fill="#818cf8" name="Night hours" radius={[6, 6, 0, 0]} isAnimationActive={false} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
@@ -7603,7 +8949,8 @@ const Visualization = () => {
         )}
 
         {dashTab === 'books' && (
-          <div className="space-y-8 pb-8">
+          <div className="space-y-8 pb-8 relative min-h-[16rem]">
+            <FilterRefreshOverlay active={booksRefreshing} label="Updating cross-session books…" />
             <div className="rounded-xl border border-teal-500/40 bg-teal-950/20 p-4 text-teal-100 text-sm max-w-4xl">
               Books are grouped by stripping trailing academic session tokens from <code className="text-teal-300 bg-gray-900/80 px-1 rounded">project_name</code> (e.g. <code className="text-teal-300">…-25-26</code> and <code className="text-teal-300">…_26-27</code> collapse to the same base). Compare hours, contributors, and tasks across sessions to spot duplicate effort or unusual deltas.
             </div>
@@ -7621,16 +8968,16 @@ const Visualization = () => {
               {!booksLoading && crossBooks?.summary && (
                 <span className="text-gray-400 text-sm">{crossBooks.summary.groupsReturned} book(s) with at least {bookSessionMin} session suffixes.</span>
               )}
-              {booksLoading && (
-                <span className="text-gray-500 text-sm italic">Loading…</span>
+              {(booksLoading || booksRefreshing) && (
+                <span className="text-gray-500 text-sm italic">Updating…</span>
               )}
             </div>
-            {booksLoading && (
+            {booksLoading && !booksHasLoadedRef.current && (
               <div className="flex justify-center py-24">
                 <div className="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-teal-500" />
               </div>
             )}
-            {!booksLoading && crossBooks?.groups && (
+            {(booksHasLoadedRef.current || crossBooks?.groups) && !booksLoading && crossBooks?.groups && (
               <>
                 <div className="overflow-x-auto rounded-xl border border-gray-700">
                   <table className="min-w-full text-sm text-left">

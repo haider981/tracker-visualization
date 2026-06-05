@@ -604,7 +604,8 @@ import {
   CartesianGrid,
   Tooltip,
   Legend,
-  ResponsiveContainer
+  ResponsiveContainer,
+  ReferenceLine
 } from 'recharts';
 import {
   Filter,
@@ -657,6 +658,57 @@ function extractProjectSeriesToken(projectName) {
   const yearIdx = parts.findIndex((p) => p && /^\d{2}-\d{2}$/.test(p));
   if (yearIdx > 2) return parts[yearIdx - 1] || '';
   return parts[4] || parts[3] || '';
+}
+
+function parseChapterTokens(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s || s === '—') return [];
+  const parts = s
+    .split(/[,;/|]+|\s+and\s+/gi)
+    .map((p) => p.trim().replace(/^ch\.?\s*/i, ''))
+    .filter(Boolean);
+  const seen = new Set();
+  const out = [];
+  for (const p of parts) {
+    if (!seen.has(p)) {
+      seen.add(p);
+      out.push(p);
+    }
+  }
+  return out;
+}
+
+function addChapterEntryToMap(chm, chapterRaw, hours, units) {
+  const hh = Number(hours) || 0;
+  const uu = Number(units) || 0;
+  if (hh <= 0 && uu <= 0) return;
+  const tokens = parseChapterTokens(chapterRaw);
+  if (!tokens.length) {
+    const prev = chm.get('—') || { hours: 0, units: 0 };
+    chm.set('—', { hours: prev.hours + hh, units: prev.units + uu });
+    return;
+  }
+  const shareH = hh / tokens.length;
+  const shareU = uu / tokens.length;
+  for (const t of tokens) {
+    const prev = chm.get(t) || { hours: 0, units: 0 };
+    chm.set(t, { hours: prev.hours + shareH, units: prev.units + shareU });
+  }
+}
+
+function FilterRefreshOverlay({ active, label = 'Updating charts…' }) {
+  if (!active) return null;
+  return (
+    <div
+      className="pointer-events-none absolute inset-0 z-40 flex items-start justify-center bg-gray-900/45 backdrop-blur-[1px] pt-20"
+      aria-hidden
+    >
+      <div className="flex items-center gap-3 rounded-lg border border-purple-500/50 bg-gray-900/95 px-4 py-2.5 shadow-xl">
+        <div className="animate-spin rounded-full h-6 w-6 border-2 border-purple-400 border-t-transparent" />
+        <span className="text-gray-200 text-sm font-medium">{label}</span>
+      </div>
+    </div>
+  );
 }
 
 // Department → team-name matcher  (same logic as Visualization.jsx)
@@ -784,7 +836,7 @@ const HEATMAP_TASK_STAGE_ORDER = [
   'CR3',
   'R4',
   'CR4',
-  'R5',
+    'R5',
   'CR5',
   'FINAL',
   'FER',
@@ -869,6 +921,40 @@ function formatRangeLabel(start, end) {
   const s = start.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
   const e = end.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
   return `${s} - ${e}`;
+}
+
+function parseIsoDateLocal(iso) {
+  const [y, m, d] = String(iso).slice(0, 10).split('-').map(Number);
+  return new Date(y, (m || 1) - 1, d || 1);
+}
+
+/** Day-scale Gantt: one column per work day; narrow gap only when a calendar day has no work between two work days. */
+function buildGanttDayBucketsWithWorkGaps(workDateIsos) {
+  const unique = [...new Set(workDateIsos.map((d) => String(d).slice(0, 10)).filter(Boolean))].sort(
+    (a, b) => a.localeCompare(b)
+  );
+  const buckets = [];
+  const lookup = new Map();
+
+  for (let i = 0; i < unique.length; i += 1) {
+    const iso = unique[i];
+    if (i > 0) {
+      const prev = unique[i - 1];
+      const dayDiff = Math.round((parseIsoDateLocal(iso) - parseIsoDateLocal(prev)) / 86400000);
+      if (dayDiff > 1) {
+        buckets.push({ key: `__gap__${prev}__${iso}`, label: '', isGap: true });
+      }
+    }
+    const dt = parseIsoDateLocal(iso);
+    buckets.push({
+      key: iso,
+      label: dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+      isGap: false,
+    });
+    lookup.set(iso, iso);
+  }
+
+  return { buckets, dateToBucketKey: lookup };
 }
 
 /**
@@ -1110,6 +1196,8 @@ const Visualization2 = () => {
   /** Gantt rows without the Gantt-only department filter — used for task stage heatmap so it stays stable when Department changes. */
   const [ganttRowsStageHeatmap, setGanttRowsStageHeatmap] = useState([]);
   const [ganttLoading, setGanttLoading] = useState(false);
+  const [ganttRefreshing, setGanttRefreshing] = useState(false);
+  const ganttHasLoadedRef = useRef(false);
   const [ganttTooltip, setGanttTooltip] = useState(null);
   const ganttViewportRef = useRef(null);
   const [ganttViewportWidth, setGanttViewportWidth] = useState(0);
@@ -1117,13 +1205,22 @@ const Visualization2 = () => {
   const [projectBarsChartWidth, setProjectBarsChartWidth] = useState(0);
   const [projectInsights, setProjectInsights] = useState(null);
   const [insightsLoading, setInsightsLoading] = useState(false);
+  const [insightsRefreshing, setInsightsRefreshing] = useState(false);
+  const insightsHasLoadedRef = useRef(false);
   const [expandedTask, setExpandedTask] = useState(null);
 
   const [projectsLoading, setProjectsLoading] = useState(true);
+  const [projectsRefreshing, setProjectsRefreshing] = useState(false);
+  const [projectsHasLoaded, setProjectsHasLoaded] = useState(false);
+  const projectsHasLoadedRef = useRef(false);
   const [nightData, setNightData] = useState(null);
   const [nightLoading, setNightLoading] = useState(false);
+  const [nightRefreshing, setNightRefreshing] = useState(false);
+  const nightHasLoadedRef = useRef(false);
   const [crossBooks, setCrossBooks] = useState(null);
   const [booksLoading, setBooksLoading] = useState(false);
+  const [booksRefreshing, setBooksRefreshing] = useState(false);
+  const booksHasLoadedRef = useRef(false);
   const [selectedBookGroup, setSelectedBookGroup] = useState(null);
   const [bookSessionMin, setBookSessionMin] = useState(2);
   const crossBooksFetchSeq = useRef(0);
@@ -1186,9 +1283,10 @@ const Visualization2 = () => {
 
   // ─── fetch horizontal bar data and apply client-side filtering by segment/series/class/projects ───────────────────────────────
   const fetchProjects = async () => {
+    const isInitial = !projectsHasLoadedRef.current;
+    if (isInitial) setProjectsLoading(true);
+    else setProjectsRefreshing(true);
     try {
-      setProjectsLoading(true);
-      // Send filters to backend: segment/series/class/period + selected projects
       const params = new URLSearchParams();
       if (selSegment !== 'All') params.append('segment', selSegment);
       appendSeriesParams(params, selectedSeries);
@@ -1199,11 +1297,14 @@ const Visualization2 = () => {
       const res = await fetch(`${API_URL}/project-view/projects?${params.toString()}`);
       const data = tryParseJson(await res.text());
       setProjects(asJsonArray(data));
-      setProjectsLoading(false);
+      projectsHasLoadedRef.current = true;
+      setProjectsHasLoaded(true);
     } catch (e) {
       console.error('fetchProjects', e);
       setProjects([]);
+    } finally {
       setProjectsLoading(false);
+      setProjectsRefreshing(false);
     }
   };
 
@@ -1218,25 +1319,29 @@ const Visualization2 = () => {
   };
 
   const fetchNightAnalytics = async () => {
-    setNightLoading(true);
+    const isInitial = !nightHasLoadedRef.current;
+    if (isInitial) setNightLoading(true);
+    else setNightRefreshing(true);
     try {
       const qs = buildAnalyticsQueryParams();
       const res = await fetch(`${API_URL}/night-analytics${qs ? `?${qs}` : ''}`);
       const json = await res.json();
       setNightData(json.error ? null : json);
+      nightHasLoadedRef.current = true;
     } catch (e) {
       console.error('fetchNightAnalytics', e);
       setNightData(null);
     } finally {
       setNightLoading(false);
+      setNightRefreshing(false);
     }
   };
 
   const fetchCrossSessionBooks = async () => {
     const seq = ++crossBooksFetchSeq.current;
-    setBooksLoading(true);
-    setCrossBooks(null);
-    setSelectedBookGroup(null);
+    const isInitial = !booksHasLoadedRef.current;
+    if (isInitial) setBooksLoading(true);
+    else setBooksRefreshing(true);
     try {
       const params = new URLSearchParams();
       if (selSegment !== 'All') params.append('segment', selSegment);
@@ -1250,6 +1355,7 @@ const Visualization2 = () => {
       const json = await res.json();
       if (crossBooksFetchSeq.current !== seq) return;
       setCrossBooks(json.error ? null : json);
+      booksHasLoadedRef.current = true;
     } catch (e) {
       console.error('fetchCrossSessionBooks', e);
       if (crossBooksFetchSeq.current !== seq) return;
@@ -1257,6 +1363,7 @@ const Visualization2 = () => {
     } finally {
       if (crossBooksFetchSeq.current === seq) {
         setBooksLoading(false);
+        setBooksRefreshing(false);
       }
     }
   };
@@ -1275,17 +1382,26 @@ const Visualization2 = () => {
 
   /** null = fetch Gantt for all projects matching period + segment filters (no project_name). */
   const ganttFetchTarget = useMemo(() => {
+    if (activeProject) return [activeProject];
     if (selectedProjects.length === 0) return null;
-    return displayedProjects;
-  }, [selectedProjects.length, displayedProjects]);
+    return selectedProjects;
+  }, [activeProject, selectedProjects]);
+
+  /** Progress heatmap: all-time rows; scope from dropdown only (not top-bar focus). */
+  const heatmapFetchTarget = useMemo(() => {
+    if (selectedProjects.length === 0) return null;
+    return selectedProjects;
+  }, [selectedProjects]);
 
   const isAllSelectedMode = !activeProject && selectedProjects.length > 1;
   const currentScopeLabel =
-    selectedProjects.length === 0
-      ? 'All projects in scope'
-      : isAllSelectedMode
-        ? 'All Selected Projects'
-        : activeProject || selectedProjects[0] || '';
+    activeProject
+      ? activeProject
+      : selectedProjects.length === 0
+        ? 'All projects in scope'
+        : isAllSelectedMode
+          ? 'All Selected Projects'
+          : selectedProjects[0] || '';
 
   // ─── fetch timeline for selected projects (single or multiple) ──────────────────────────
   const fetchTimeline = async (projectNamesArray) => {
@@ -1316,8 +1432,10 @@ const Visualization2 = () => {
       setProjectInsights(null);
       return;
     }
+    const isInitial = !insightsHasLoadedRef.current;
+    if (isInitial) setInsightsLoading(true);
+    else setInsightsRefreshing(true);
     try {
-      setInsightsLoading(true);
       const params = new URLSearchParams();
       projectNamesArray.forEach(n => params.append('project_name', n));
       if (selPeriod !== 'All') params.append('period', selPeriod);
@@ -1333,20 +1451,22 @@ const Visualization2 = () => {
         !Array.isArray(data) &&
         data.error == null;
       setProjectInsights(ok ? data : null);
+      if (ok) insightsHasLoadedRef.current = true;
     } catch (e) {
       console.error('fetchProjectInsights', e);
       setProjectInsights(null);
     } finally {
       setInsightsLoading(false);
+      setInsightsRefreshing(false);
     }
   };
 
-  const fetchProjectGanttRows = async (projectNamesArray, department) => {
+  const fetchProjectGanttRows = async (projectNamesArray, department, { includePeriod = true } = {}) => {
     const params = new URLSearchParams();
     if (Array.isArray(projectNamesArray) && projectNamesArray.length > 0) {
       projectNamesArray.forEach((n) => params.append('project_name', n));
     }
-    if (selPeriod !== 'All') params.append('period', selPeriod);
+    if (includePeriod && selPeriod !== 'All') params.append('period', selPeriod);
     if (selSegment !== 'All') params.append('segment', selSegment);
     appendSeriesParams(params, selectedSeries);
     if (selClass !== 'All') params.append('class', selClass);
@@ -1361,21 +1481,25 @@ const Visualization2 = () => {
   };
 
   const fetchProjectGantt = async (projectNamesArray) => {
-    setGanttLoading(true);
+    const isInitial = !ganttHasLoadedRef.current;
+    if (isInitial) setGanttLoading(true);
+    else setGanttRefreshing(true);
     try {
       const data = await fetchProjectGanttRows(projectNamesArray, ganttDepartment);
       setGanttRows(data);
+      ganttHasLoadedRef.current = true;
     } catch (e) {
       console.error('fetchProjectGantt', e);
       setGanttRows([]);
     } finally {
       setGanttLoading(false);
+      setGanttRefreshing(false);
     }
   };
 
   const fetchProjectGanttStageHeatmapRows = async (projectNamesArray) => {
     try {
-      const data = await fetchProjectGanttRows(projectNamesArray, 'All');
+      const data = await fetchProjectGanttRows(projectNamesArray, 'All', { includePeriod: false });
       setGanttRowsStageHeatmap(data);
     } catch (e) {
       console.error('fetchProjectGanttStageHeatmapRows', e);
@@ -1394,14 +1518,15 @@ const Visualization2 = () => {
 
   // timeline + deep dive follow active project OR all selected projects
   useEffect(() => { fetchTimeline(timelineInsightProjects); }, [timelineInsightProjects, selPeriod, selSegment, seriesSelectionKey, selClass]);
-  useEffect(() => { fetchProjectGanttStageHeatmapRows(ganttFetchTarget); }, [ganttFetchTarget, selPeriod, selSegment, seriesSelectionKey, selClass]);
+  useEffect(() => { fetchProjectGanttStageHeatmapRows(heatmapFetchTarget); }, [heatmapFetchTarget, selSegment, seriesSelectionKey, selClass]);
   useEffect(() => { fetchProjectGantt(ganttFetchTarget); }, [ganttFetchTarget, selPeriod, selSegment, seriesSelectionKey, selClass, ganttDepartment]);
   useEffect(() => { fetchProjectInsights(timelineInsightProjects); }, [timelineInsightProjects, selPeriod, selSegment, seriesSelectionKey, selClass]);
   useEffect(() => {
-    if (activeProject && !selectedProjects.includes(activeProject)) {
+    if (!activeProject || !projects.length) return;
+    if (!projects.some((p) => p.name === activeProject)) {
       setActiveProject(null);
     }
-  }, [selectedProjects, activeProject]);
+  }, [projects, activeProject]);
   useEffect(() => { setExpandedTask(null); }, [projectInsights]);
 
   useEffect(() => {
@@ -1482,6 +1607,11 @@ const Visualization2 = () => {
     setActiveProject(null);
     setProjectInsights(null);
     setExpandedTask(null);
+  };
+
+  /** Top Projects bar: toggle focus row (does not filter the project list). */
+  const toggleTopProjectFocus = (name) => {
+    setActiveProject((prev) => (prev === name ? null : name));
   };
 
   // toggle selection for a project name
@@ -1701,11 +1831,32 @@ const Visualization2 = () => {
         return seg;
       });
 
-      // Highlight the active project that drives timeline/deep dive
       const isSelected = project.name === activeProject;
 
       return (
         <g key={pIdx}>
+          {isSelected && (
+            <rect
+              x={0}
+              y={y - ROW_GAP / 2}
+              width={horizontalBarDims.svgWidth}
+              height={BAR_HEIGHT + ROW_GAP}
+              fill="rgba(139, 92, 246, 0.18)"
+              stroke="rgba(167, 139, 250, 0.55)"
+              strokeWidth={1}
+              rx={4}
+              pointerEvents="none"
+            />
+          )}
+          <rect
+            x={0}
+            y={y}
+            width={horizontalBarDims.svgWidth}
+            height={BAR_HEIGHT}
+            fill="transparent"
+            style={{ cursor: 'pointer' }}
+            onClick={() => toggleTopProjectFocus(project.name)}
+          />
           {/* project name label — clickable */}
           <text
             x={LABEL_COL_WIDTH - 12}
@@ -1715,11 +1866,7 @@ const Visualization2 = () => {
             fill={isSelected ? '#fff' : '#d1d5db'}
             fontSize={12}
             fontWeight={isSelected ? 700 : 400}
-            style={{ cursor: 'pointer', userSelect: 'none' }}
-            onClick={() => {
-              setActiveProject(project.name);
-              setSelectedProjects(prev => prev.includes(project.name) ? prev : [...prev, project.name]);
-            }}
+            style={{ cursor: 'pointer', userSelect: 'none', pointerEvents: 'none' }}
           >
             {project.name.length > 36 ? project.name.slice(0, 34) + '…' : project.name}
           </text>
@@ -1806,31 +1953,50 @@ const Visualization2 = () => {
 
   const GANTT_LABEL_COL = 268;
   const GANTT_DAY_COL_MIN = 36;
+  const GANTT_GAP_COL = 14;
   const GANTT_ROW_H = 40;
 
   /** Same date window as timeline + API; single project → rows = tasks (segments = employees); multi → rows = projects (segments = tasks). */
   const projectGanttModel = useMemo(() => {
     const rowsAll = Array.isArray(ganttRows) ? ganttRows : [];
-    const useAllProjects = selectedProjects.length === 0;
+    const scopeList = activeProject
+      ? [activeProject]
+      : selectedProjects.length > 0
+        ? selectedProjects
+        : null;
+    const useAllProjects = scopeList == null;
     const rows = useAllProjects
       ? rowsAll
-      : rowsAll.filter((r) => displayedProjects.includes(r.project_name));
+      : rowsAll.filter((r) => scopeList.includes(r.project_name));
 
     if (!rows.length) return null;
 
     const scopeProjects = useAllProjects
       ? [...new Set(rows.map((r) => r.project_name).filter(Boolean))]
-      : [...displayedProjects];
-    const periodDates = getPeriodDateKeysAscending(selPeriod);
-    let dates = periodDates;
-    if (!dates) {
-      const dset = new Set(rows.map((r) => r.date));
-      dates = [...dset].sort((a, b) => b.localeCompare(a));
-    } else {
-      dates = [...dates].sort((a, b) => b.localeCompare(a));
-    }
+      : [...scopeList];
+    const workDatesFromRows = [
+      ...new Set(
+        rows
+          .filter((r) => (Number(r.hours) || 0) > 0)
+          .map((r) => String(r.date).slice(0, 10))
+          .filter(Boolean)
+      ),
+    ];
 
-    const { buckets, dateToBucketKey } = buildGanttBuckets(dates, ganttTimeScale);
+    let buckets;
+    let dateToBucketKey;
+    if (ganttTimeScale === 'Day') {
+      ({ buckets, dateToBucketKey } = buildGanttDayBucketsWithWorkGaps(workDatesFromRows));
+    } else {
+      const periodDates = getPeriodDateKeysAscending(selPeriod);
+      let dates = periodDates;
+      if (!dates) {
+        dates = [...workDatesFromRows].sort((a, b) => b.localeCompare(a));
+      } else {
+        dates = [...dates].sort((a, b) => b.localeCompare(a));
+      }
+      ({ buckets, dateToBucketKey } = buildGanttBuckets(dates, ganttTimeScale));
+    }
     const mode = scopeProjects.length === 1 ? 'task' : 'project';
 
     if (mode === 'task') {
@@ -1864,7 +2030,7 @@ const Visualization2 = () => {
         const ck = `${task}\t${bucketKey}\t${emp}`;
         if (!chapterBreakdownMap.has(ck)) chapterBreakdownMap.set(ck, new Map());
         const chm = chapterBreakdownMap.get(ck);
-        chm.set(chRaw, (chm.get(chRaw) || 0) + r.hours);
+        addChapterEntryToMap(chm, chRaw, r.hours, r.units || 0);
       }
 
       const empSet = new Set();
@@ -1887,9 +2053,29 @@ const Visualization2 = () => {
       const getTaskChapterBreakdown = (task, bucketKey, employee) => {
         const m = chapterBreakdownMap.get(`${task}\t${bucketKey}\t${employee}`);
         if (!m) return [];
-        return [...m.entries()]
-          .sort((a, b) => b[1] - a[1])
-          .map(([chapter, hours]) => ({ key: chapter, label: chapter === '—' ? 'No chapter' : `Ch. ${chapter}`, hours }));
+
+        // Allocate chapter hover hours proportionally using chapter units.
+        // This fixes cases where `hours_spent` per chapter is not perfectly proportional,
+        // but `number_of_units` represents the real chapter distribution.
+        const totalHoursForCell = cellMap.get(`${task}\t${bucketKey}`)?.get(employee) || 0;
+        let totalUnits = 0;
+        for (const [, v] of m.entries()) totalUnits += (v?.units || 0);
+
+        const entries = [...m.entries()].map(([chapter, v]) => {
+          const chapterUnits = v?.units || 0;
+          const allocatedHours = totalUnits > 0
+            ? totalHoursForCell * (chapterUnits / totalUnits)
+            : (v?.hours || 0);
+          return { chapter, chapterUnits, allocatedHours };
+        });
+
+        return entries
+          .sort((a, b) => b.allocatedHours - a.allocatedHours)
+          .map(({ chapter, allocatedHours }) => ({
+            key: chapter,
+            label: chapter === '—' ? 'No chapter' : `Ch. ${chapter}`,
+            hours: allocatedHours
+          }));
       };
 
       return {
@@ -1982,23 +2168,24 @@ const Visualization2 = () => {
       yAxisTitle: 'Project',
       scopeLabel: scopeProjects.length > 1 ? `${scopeProjects.length} projects` : scopeProjects[0]
     };
-  }, [ganttRows, displayedProjects, selPeriod, ganttTimeScale, globalTaskColorMap, selectedProjects.length]);
+  }, [ganttRows, activeProject, selectedProjects, selPeriod, ganttTimeScale, globalTaskColorMap]);
 
-  /** Y = projects in scope with hours; X = canonical task sequence; green = task has DB entry, blue = current active stage. */
+  /** Y = period-filtered top projects; progress cells = all-time work (not limited by period). */
   const taskStageHeatmapModel = useMemo(() => {
     const rowsAll = Array.isArray(ganttRowsStageHeatmap) ? ganttRowsStageHeatmap : [];
-    const filtered =
-      selectedProjects.length === 0
-        ? rowsAll
-        : rowsAll.filter((r) => displayedProjects.includes(r.project_name));
+    let projectNames = (Array.isArray(projects) ? projects : [])
+      .map((p) => p?.name)
+      .filter(Boolean);
+    if (selectedProjects.length > 0) {
+      projectNames = projectNames.filter((p) => selectedProjects.includes(p));
+    }
     const projTotals = {};
-    filtered.forEach((r) => {
-      const p = r.project_name;
-      projTotals[p] = (projTotals[p] || 0) + (Number(r.hours) || 0);
+    projectNames.forEach((p) => {
+      projTotals[p] = rowsAll
+        .filter((r) => r.project_name === p)
+        .reduce((s, r) => s + (Number(r.hours) || 0), 0);
     });
-    const projectNames = [...new Set(filtered.map((r) => r.project_name))].sort(
-      (a, b) => (projTotals[b] || 0) - (projTotals[a] || 0)
-    );
+    projectNames = [...projectNames].sort((a, b) => (projTotals[b] || 0) - (projTotals[a] || 0));
 
     const xTasks = HEATMAP_TASK_STAGE_ORDER;
     const currentStageByProject = {};
@@ -2009,7 +2196,7 @@ const Visualization2 = () => {
     const hasCurrentCanonicalByProject = {};
 
     for (const p of projectNames) {
-      const rp = filtered.filter((r) => r.project_name === p && (Number(r.hours) || 0) > 0);
+      const rp = rowsAll.filter((r) => r.project_name === p && (Number(r.hours) || 0) > 0);
       if (!rp.length) {
         currentStageByProject[p] = null;
         lastDateByProject[p] = null;
@@ -2104,10 +2291,10 @@ const Visualization2 = () => {
       lastDateByProject,
       projTotals
     };
-  }, [ganttRowsStageHeatmap, displayedProjects, selectedProjects.length]);
+  }, [ganttRowsStageHeatmap, projects, selectedProjects]);
 
   useEffect(() => {
-    if (dashTab !== 'projects' || projectsLoading) return undefined;
+    if (dashTab !== 'projects' || (projectsLoading && !projectsHasLoaded)) return undefined;
     const el = ganttViewportRef.current;
     if (!el) return undefined;
     const ro = new ResizeObserver(() => {
@@ -2119,7 +2306,7 @@ const Visualization2 = () => {
   }, [dashTab, projectsLoading, selectedProjects.length]);
 
   useEffect(() => {
-    if (dashTab !== 'projects' || projectsLoading) return undefined;
+    if (dashTab !== 'projects' || (projectsLoading && !projectsHasLoaded)) return undefined;
     const el = projectBarsViewportRef.current;
     if (!el) return undefined;
     const ro = new ResizeObserver(() => {
@@ -2381,8 +2568,22 @@ const Visualization2 = () => {
       </div>
 
       {/* ─── SCROLLABLE BODY ─── */}
-      <div className="px-8 py-6">
-        {dashTab === 'projects' && projectsLoading && (
+      <div className="px-8 py-6 relative min-h-[12rem]">
+        <FilterRefreshOverlay
+          active={
+            (dashTab === 'projects' && projectsRefreshing) ||
+            (dashTab === 'night' && nightRefreshing) ||
+            (dashTab === 'books' && booksRefreshing)
+          }
+          label={
+            dashTab === 'night'
+              ? 'Updating night analytics…'
+              : dashTab === 'books'
+                ? 'Updating cross-session books…'
+                : 'Updating project view…'
+          }
+        />
+        {dashTab === 'projects' && projectsLoading && !projectsHasLoaded && (
           <div className="flex justify-center py-24">
             <div className="text-center">
               <div className="animate-spin rounded-full h-24 w-24 border-t-4 border-b-4 border-purple-500 mx-auto mb-4" />
@@ -2391,7 +2592,7 @@ const Visualization2 = () => {
           </div>
         )}
 
-        {dashTab === 'projects' && !projectsLoading && (
+        {dashTab === 'projects' && projectsHasLoaded && (
           <>
             {/* ── Top projects (horizontal bars) ── */}
             <h2 className="text-3xl font-bold text-white text-center mb-3">Top Projects</h2>
@@ -2466,7 +2667,7 @@ const Visualization2 = () => {
             <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6 mb-6">
                 <h2 className="text-2xl font-bold text-white mb-1">Project Progress</h2>
                 <p className="text-gray-400 text-sm mb-3 max-w-4xl">
-                  Rows are projects in the current scope with logged hours. Columns follow your task sequence.{' '}
+                  Project rows follow the period filter (same as Top Projects). Stage colors use all-time work history — not limited by period.{' '}
                   <span className="text-emerald-400 font-semibold">Green</span> shows completed stages in sequence and{' '}
                   <span className="text-sky-400 font-semibold">Blue</span> starts from the{' '}
                   <strong className="text-gray-200">most recent calendar day</strong> (furthest stage touched that day),
@@ -2476,7 +2677,7 @@ const Visualization2 = () => {
                 </p>
                 {taskStageHeatmapModel.projects.length === 0 ? (
                   <p className="text-gray-500 text-sm py-8 text-center border border-gray-700 rounded-lg">
-                    No Gantt data for this period — select projects and ensure the period includes worklogs.
+                    No projects in scope for this period — adjust filters or period.
                   </p>
                 ) : (
                   <div className="max-h-[480px] overflow-y-auto overflow-x-auto rounded-lg border border-gray-700 bg-gray-950/80 w-full">
@@ -2597,8 +2798,10 @@ const Visualization2 = () => {
                         <option value="Month">Month</option>
                       </select>
                     </div>
-                    {ganttLoading && (
-                      <span className="text-purple-300 text-sm animate-pulse">Loading Gantt…</span>
+                    {(ganttLoading || ganttRefreshing) && (
+                      <span className="text-purple-300 text-sm animate-pulse">
+                        {ganttRefreshing ? 'Updating Gantt…' : 'Loading Gantt…'}
+                      </span>
                     )}
                   </div>
                 </div>
@@ -2640,9 +2843,18 @@ const Visualization2 = () => {
                         } = projectGanttModel;
                         const innerW = Math.max(360, ganttViewportWidth || 720);
                         const minColWidth = ganttTimeScale === 'Month' ? 86 : (ganttTimeScale === 'Week' ? 112 : GANTT_DAY_COL_MIN);
-                        const chartArea = Math.max(innerW - 32 - GANTT_LABEL_COL, buckets.length * minColWidth);
-                        const dayColW = Math.max(minColWidth, chartArea / Math.max(buckets.length, 1));
-                        const gridMinW = GANTT_LABEL_COL + buckets.length * dayColW;
+                        const workBucketCount = buckets.filter((b) => !b.isGap).length;
+                        const gapBucketCount = buckets.length - workBucketCount;
+                        const chartArea = Math.max(
+                          innerW - 32 - GANTT_LABEL_COL,
+                          workBucketCount * minColWidth + gapBucketCount * GANTT_GAP_COL
+                        );
+                        const dayColW = Math.max(
+                          minColWidth,
+                          (chartArea - gapBucketCount * GANTT_GAP_COL) / Math.max(workBucketCount, 1)
+                        );
+                        const colWidthFor = (bucket) => (bucket.isGap ? GANTT_GAP_COL : dayColW);
+                        const gridMinW = GANTT_LABEL_COL + buckets.reduce((s, b) => s + colWidthFor(b), 0);
 
                         return (
                           <div style={{ minWidth: gridMinW }} className="pb-1">
@@ -2656,10 +2868,15 @@ const Visualization2 = () => {
                               {buckets.map((bucket) => (
                                 <div
                                   key={bucket.key}
-                                  style={{ width: dayColW, minWidth: dayColW }}
-                                  className="shrink-0 border-l border-gray-700 text-center text-[10px] text-gray-300 py-2 leading-tight font-medium"
+                                  style={{ width: colWidthFor(bucket), minWidth: colWidthFor(bucket) }}
+                                  className={`shrink-0 text-center text-[10px] py-2 leading-tight font-medium ${
+                                    bucket.isGap
+                                      ? 'border-l border-dashed border-gray-600 bg-gray-950/80'
+                                      : 'border-l border-gray-700 text-gray-300'
+                                  }`}
+                                  title={bucket.isGap ? 'No work on skipped day(s)' : undefined}
                                 >
-                                  {bucket.label}
+                                  {bucket.isGap ? '' : bucket.label}
                                 </div>
                               ))}
                             </div>
@@ -2683,12 +2900,22 @@ const Visualization2 = () => {
                                     {rowLabel(yKey)}
                                   </div>
                                   {buckets.map((bucket) => {
+                                    if (bucket.isGap) {
+                                      return (
+                                        <div
+                                          key={`${yKey}-${bucket.key}`}
+                                          style={{ width: colWidthFor(bucket), minWidth: colWidthFor(bucket) }}
+                                          className="shrink-0 border-l border-dashed border-gray-600 bg-gray-950/90"
+                                          title="No work on skipped day(s)"
+                                        />
+                                      );
+                                    }
                                     const segs = getCell(yKey, bucket.key);
                                     const total = segs.reduce((s, x) => s + x.hours, 0);
                                     return (
                                       <div
                                         key={`${yKey}-${bucket.key}`}
-                                        style={{ width: dayColW, minWidth: dayColW }}
+                                        style={{ width: colWidthFor(bucket), minWidth: colWidthFor(bucket) }}
                                         className="shrink-0 border-l border-gray-800 p-px flex items-stretch bg-gray-950/50"
                                       >
                                         <div className="flex w-full h-8 my-auto overflow-hidden bg-gray-900/60">
@@ -2787,7 +3014,7 @@ const Visualization2 = () => {
                     <p className="text-gray-600 text-[10px] text-right mt-2">Uses the same filters and date range as the area chart timeline (when a single project is in scope).</p>
                   </>
                 )}
-                {!ganttLoading && !projectGanttModel && (
+                {!ganttLoading && !ganttRefreshing && !projectGanttModel && (
                   <p className="text-gray-500 text-sm py-10 text-center border border-gray-700 rounded-lg">
                     No Gantt rows for this period and filter set — widen the period or relax segment / series / class filters.
                   </p>
@@ -2925,7 +3152,7 @@ const Visualization2 = () => {
                     ? 'Focus one project in the timeline section above to view team contribution, task ownership, and hours.'
                     : 'Select or focus a project to view team contribution, task ownership, and hours.'}
                 </p>
-              ) : insightsLoading ? (
+              ) : insightsLoading && !insightsHasLoadedRef.current ? (
                 <p className="text-gray-300 text-center py-10">Loading detailed project insights...</p>
               ) : projectInsights?.summary ? (
                 <>
@@ -3140,21 +3367,24 @@ const Visualization2 = () => {
 
         {dashTab === 'night' && (
           <div className="space-y-8 pb-8">
-            <div className="rounded-xl border border-indigo-500/40 bg-indigo-950/30 p-4 text-indigo-100 text-sm max-w-4xl">
-              <strong className="text-indigo-200">Night view</strong> uses the same Segment, Series, Class, Project, and Period filters as this page. Only rows with Night work mode are included.
-            </div>
-            {nightLoading && (
+            {nightLoading && !nightHasLoadedRef.current && (
               <div className="flex justify-center py-24">
                 <div className="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-indigo-500" />
               </div>
             )}
-            {!nightLoading && nightData?.summary && (
+            {(nightHasLoadedRef.current || nightData?.summary) && !nightLoading && nightData?.summary && (
               <>
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
                   <StatCard icon={Moon} title="Night hours" value={Math.round(nightData.summary.totalNightHours || 0)} subtitle="Current filters" color="from-indigo-600 to-indigo-900" />
                   <StatCard icon={Clock} title="Night entries" value={nightData.summary.totalNightEntries || 0} subtitle="Row count" color="from-slate-600 to-slate-900" />
                   <StatCard icon={Users} title="Night contributors" value={nightData.summary.uniqueNightContributors || 0} subtitle="Distinct names" color="from-violet-600 to-violet-900" />
                   <StatCard icon={Zap} title="Night share" value={`${(nightData.summary.nightPercentOfFilteredHours || 0).toFixed(1)}%`} subtitle="Of filtered hours" color="from-fuchsia-600 to-purple-900" />
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                  <StatCard icon={Clock} title="Avg per entry" value={nightData.summary.avgHoursPerNightEntry ?? 0} subtitle="Hours per night log" color="from-amber-600 to-amber-900" />
+                  <StatCard icon={Target} title="Units / night hr" value={nightData.summary.globalUnitsPerNightHour ?? '—'} subtitle="Output intensity" color="from-teal-600 to-teal-900" />
+                  <StatCard icon={Activity} title="Peak log hour" value={nightData.summary.peakNightHourLabel ?? '—'} subtitle="Submission time" color="from-orange-600 to-orange-900" />
+                  <StatCard icon={TrendingUp} title="Busiest weekday" value={nightData.summary.busiestWeekday ?? '—'} subtitle="Most night hours" color="from-rose-600 to-rose-900" />
                 </div>
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
                   <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
@@ -3227,6 +3457,44 @@ const Visualization2 = () => {
                 </div>
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
                   <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-2 flex items-center"><Activity className="w-5 h-5 mr-2 text-violet-400" /> Night hours by task</h2>
+                    <ResponsiveContainer width="100%" height={360}>
+                      <BarChart data={(nightData.taskNight || []).slice(0, 14)} layout="vertical" margin={{ left: 4, right: 12 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis type="number" stroke="#9ca3af" />
+                        <YAxis type="category" dataKey="task" stroke="#9ca3af" width={108} tick={{ fontSize: 10 }} />
+                        <Tooltip content={<PtTooltip />} />
+                        <Bar dataKey="hours" fill="#8b5cf6" name="Night hours" radius={[0, 6, 6, 0]} isAnimationActive={false} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-2 flex items-center"><BookMarked className="w-5 h-5 mr-2 text-teal-400" /> Night hours by element</h2>
+                    <ResponsiveContainer width="100%" height={360}>
+                      <BarChart data={(nightData.elementNight || []).slice(0, 12)} margin={{ bottom: 56 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis dataKey="element" stroke="#9ca3af" angle={-28} textAnchor="end" height={64} interval={0} fontSize={10} />
+                        <YAxis stroke="#9ca3af" />
+                        <Tooltip content={<PtTooltip />} />
+                        <Bar dataKey="hours" fill="#14b8a6" name="Night hours" radius={[6, 6, 0, 0]} isAnimationActive={false} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-2 flex items-center"><Users className="w-5 h-5 mr-2 text-indigo-400" /> Top contributors — night hours</h2>
+                    <ResponsiveContainer width="100%" height={380}>
+                      <BarChart data={(nightData.contributorNight || []).slice(0, 14)} layout="vertical" margin={{ left: 8, right: 16 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis type="number" stroke="#9ca3af" />
+                        <YAxis type="category" dataKey="name" stroke="#9ca3af" width={100} tick={{ fontSize: 11 }} />
+                        <Tooltip content={<PtTooltip />} />
+                        <Bar dataKey="nightHours" fill="#6366f1" name="Night hours" radius={[0, 6, 6, 0]} isAnimationActive={false} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
                     <h2 className="text-xl font-bold text-white mb-2 flex items-center"><Users className="w-5 h-5 mr-2 text-pink-400" /> Night % of own hours</h2>
                     <ResponsiveContainer width="100%" height={380}>
                       <BarChart data={(nightData.contributorNight || []).slice(0, 14)} layout="vertical" margin={{ left: 8, right: 16 }}>
@@ -3238,6 +3506,8 @@ const Visualization2 = () => {
                       </BarChart>
                     </ResponsiveContainer>
                   </div>
+                </div>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
                   <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
                     <h2 className="text-xl font-bold text-white mb-2 flex items-center"><Activity className="w-5 h-5 mr-2 text-emerald-400" /> Night vs day-mode hours by task</h2>
                     <ResponsiveContainer width="100%" height={380}>
@@ -3249,6 +3519,77 @@ const Visualization2 = () => {
                         <Legend />
                         <Bar dataKey="nightHours" fill="#6366f1" name="Night hrs" isAnimationActive={false} />
                         <Bar dataKey="dayHours" fill="#94a3b8" name="Day-mode hrs" isAnimationActive={false} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-2 flex items-center"><Zap className="w-5 h-5 mr-2 text-amber-400" /> Night-to-day ratio by task</h2>
+                    <p className="text-gray-400 text-xs mb-4">Past 1.0 (dashed) = more night than day-mode hours on that task.</p>
+                    <ResponsiveContainer width="100%" height={380}>
+                      <BarChart
+                        data={(nightData.nightVsDayByTask || [])
+                          .filter((t) => t.nightHours > 0)
+                          .map((t) => {
+                            const ratio =
+                              t.nightToDayHourRatio != null
+                                ? t.nightToDayHourRatio
+                                : t.dayHours > 0
+                                  ? t.nightHours / t.dayHours
+                                  : null;
+                            const rounded = ratio != null ? Math.round(ratio * 1000) / 1000 : null;
+                            return {
+                              task: t.task,
+                              ratio: rounded,
+                              nightHours: t.nightHours,
+                              dayHours: t.dayHours,
+                              fill: rounded != null && rounded >= 1 ? '#f59e0b' : '#6366f1'
+                            };
+                          })
+                          .filter((t) => t.ratio != null)
+                          .sort((a, b) => b.ratio - a.ratio)
+                          .slice(0, 12)}
+                        layout="vertical"
+                        margin={{ left: 8, right: 24 }}
+                      >
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis type="number" stroke="#9ca3af" domain={[0, 'auto']} />
+                        <YAxis type="category" dataKey="task" stroke="#9ca3af" width={100} tick={{ fontSize: 10 }} />
+                        <ReferenceLine x={1} stroke="#fbbf24" strokeDasharray="4 4" label={{ value: '1.0', fill: '#fbbf24', fontSize: 11 }} />
+                        <Tooltip
+                          content={({ active, payload }) =>
+                            active && payload?.[0] ? (
+                              <div className="rounded-lg border border-amber-500/60 bg-gray-900 p-3 text-sm shadow-xl">
+                                <p className="text-white font-semibold">{payload[0].payload.task}</p>
+                                <p className="text-amber-200 mt-1">
+                                  Ratio: <span className="font-bold text-white">{payload[0].payload.ratio}</span>
+                                </p>
+                                <p className="text-gray-400 text-xs mt-1">
+                                  Night {payload[0].payload.nightHours?.toFixed(1)}h · Day-mode {payload[0].payload.dayHours?.toFixed(1)}h
+                                </p>
+                              </div>
+                            ) : null
+                          }
+                        />
+                        <Bar dataKey="ratio" name="Night ÷ day-mode" radius={[0, 6, 6, 0]} isAnimationActive={false}>
+                          {(nightData.nightVsDayByTask || [])
+                            .filter((t) => t.nightHours > 0)
+                            .map((t) => {
+                              const ratio =
+                                t.nightToDayHourRatio != null
+                                  ? t.nightToDayHourRatio
+                                  : t.dayHours > 0
+                                    ? t.nightHours / t.dayHours
+                                    : null;
+                              const rounded = ratio != null ? Math.round(ratio * 1000) / 1000 : null;
+                              return { rounded, fill: rounded != null && rounded >= 1 ? '#f59e0b' : '#6366f1' };
+                            })
+                            .filter((x) => x.rounded != null)
+                            .sort((a, b) => b.rounded - a.rounded)
+                            .slice(0, 12)
+                            .map((x, i) => (
+                              <Cell key={i} fill={x.fill} />
+                            ))}
+                        </Bar>
                       </BarChart>
                     </ResponsiveContainer>
                   </div>
@@ -3279,17 +3620,31 @@ const Visualization2 = () => {
                     </ResponsiveContainer>
                   </div>
                 </div>
-                <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
-                  <h2 className="text-xl font-bold text-white mb-4 flex items-center"><TrendingUp className="w-5 h-5 mr-2 text-sky-400" /> Night hours over time</h2>
-                  <ResponsiveContainer width="100%" height={300}>
-                    <LineChart data={nightData.nightTimeline || []} isAnimationActive={false}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                      <XAxis dataKey="date" stroke="#9ca3af" fontSize={11} />
-                      <YAxis stroke="#9ca3af" />
-                      <Tooltip content={<PtTooltip />} />
-                      <Line type="monotone" dataKey="hours" stroke="#818cf8" strokeWidth={2} dot={false} name="Night hours" />
-                    </LineChart>
-                  </ResponsiveContainer>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-4 flex items-center"><TrendingUp className="w-5 h-5 mr-2 text-sky-400" /> Night hours — daily</h2>
+                    <ResponsiveContainer width="100%" height={300}>
+                      <LineChart data={nightData.nightTimeline || []} isAnimationActive={false}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis dataKey="date" stroke="#9ca3af" fontSize={11} />
+                        <YAxis stroke="#9ca3af" />
+                        <Tooltip content={<PtTooltip />} />
+                        <Line type="monotone" dataKey="hours" stroke="#818cf8" strokeWidth={2} dot={false} name="Night hours" />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
+                    <h2 className="text-xl font-bold text-white mb-4 flex items-center"><TrendingUp className="w-5 h-5 mr-2 text-indigo-400" /> Night hours — by week</h2>
+                    <ResponsiveContainer width="100%" height={300}>
+                      <BarChart data={nightData.weeklyNight || []} margin={{ bottom: 48 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis dataKey="weekStart" stroke="#9ca3af" fontSize={10} angle={-25} textAnchor="end" height={56} />
+                        <YAxis stroke="#9ca3af" />
+                        <Tooltip content={<PtTooltip />} />
+                        <Bar dataKey="hours" fill="#818cf8" name="Night hours" radius={[6, 6, 0, 0]} isAnimationActive={false} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
                 </div>
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
                   <div className="bg-gray-800/50 backdrop-blur-lg rounded-xl p-6 border border-indigo-500/30">
@@ -3345,16 +3700,16 @@ const Visualization2 = () => {
               {!booksLoading && crossBooks?.summary && (
                 <span className="text-gray-400 text-sm">{crossBooks.summary.groupsReturned} book group(s) with at least {bookSessionMin} session suffixes.</span>
               )}
-              {booksLoading && (
-                <span className="text-gray-500 text-sm italic">Loading…</span>
+              {(booksLoading || booksRefreshing) && (
+                <span className="text-gray-500 text-sm italic">Updating…</span>
               )}
             </div>
-            {booksLoading && (
+            {booksLoading && !booksHasLoadedRef.current && (
               <div className="flex justify-center py-24">
                 <div className="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-teal-500" />
               </div>
             )}
-            {!booksLoading && crossBooks?.groups && (
+            {(booksHasLoadedRef.current || crossBooks?.groups) && !booksLoading && crossBooks?.groups && (
               <>
                 <div className="overflow-x-auto rounded-xl border border-gray-700">
                   <table className="min-w-full text-sm text-left">

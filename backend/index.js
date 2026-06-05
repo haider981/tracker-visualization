@@ -2974,6 +2974,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+app.use('/api/dashboard', (_req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.set('Pragma', 'no-cache');
+  next();
+});
+
 // Helper function to build where clause from query params
 function getPeriodDateRange(periodRaw) {
   const raw = String(periodRaw || '').trim();
@@ -3069,6 +3075,57 @@ function buildWhereClause(req) {
   }
   
   return where;
+}
+
+/** Users-table filters (department / team / employee) — same team mapping as buildWhereClause, no date period. */
+function buildUsersWhereClause(req) {
+  const and = [];
+
+  if (req.query.department && req.query.department !== 'All') {
+    if (req.query.department === 'DTP') {
+      and.push({
+        OR: [
+          { team: { startsWith: 'DTP' } },
+          { team: { startsWith: 'Animation' } },
+          { team: 'Animation_Maths' },
+        ],
+      });
+    } else if (req.query.department === 'Editorial') {
+      and.push({
+        OR: [
+          { team: { startsWith: 'Editorial' } },
+          { team: { startsWith: 'CSMA' } },
+        ],
+      });
+    } else if (req.query.department === 'Digital Marketing') {
+      and.push({ team: 'Digital_Marketing' });
+    }
+  }
+
+  if (req.query.team && req.query.team !== 'All') {
+    const teams = String(req.query.team)
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean);
+    if (teams.length === 1) {
+      and.push({ team: teams[0] });
+    } else if (teams.length > 1) {
+      and.push({ team: { in: teams } });
+    }
+  }
+
+  if (req.query.employee && req.query.employee !== 'All') {
+    and.push({ name: req.query.employee });
+  }
+
+  // Non-admins only; include null role (new users often have no role set yet)
+  and.push({
+    OR: [{ role: null }, { role: { not: 'ADMIN' } }],
+  });
+
+  if (and.length === 0) return {};
+  if (and.length === 1) return and[0];
+  return { AND: and };
 }
 
 /** Normalize repeated `series` query params (multi-select) to a non-empty string list. */
@@ -3223,10 +3280,8 @@ app.get('/api/dashboard/overview', async (req, res) => {
       }
     });
 
-    const totalEmployees = await prisma.masterDatabase.groupBy({
-      by: ['name'],
-      _count: true,
-      where: where
+    const totalEmployees = await prisma.users.count({
+      where: buildUsersWhereClause(req),
     });
 
     const totalHours = await prisma.masterDatabase.aggregate({
@@ -3240,7 +3295,7 @@ app.get('/api/dashboard/overview', async (req, res) => {
 
     res.json({
       totalProjects: totalProjects.length,
-      totalEmployees: totalEmployees.length,
+      totalEmployees,
       totalHours: totalHours._sum.hours_spent || 0,
       totalTasks: totalTasks,
     });
@@ -3889,6 +3944,7 @@ app.get('/api/dashboard/night-analytics', async (req, res) => {
           team: true,
           project_name: true,
           task_name: true,
+          book_element: true,
           hours_spent: true,
           number_of_units: true,
           date: true,
@@ -3982,27 +4038,70 @@ app.get('/api/dashboard/night-analytics', async (req, res) => {
       'Sat'
     ].map((d) => ({ day: d, hours: 0, entries: 0 }));
     const timelineByDate = {};
+    const elementByNight = {};
+    const weeklyByNight = {};
 
     for (const r of nightRows) {
+      const hrs = Number(r.hours_spent) || 0;
+      const el =
+        r.book_element != null && String(r.book_element).trim()
+          ? String(r.book_element).trim()
+          : 'Miscellaneous';
+      if (!elementByNight[el]) {
+        elementByNight[el] = { element: el, hours: 0, entries: 0, units: 0 };
+      }
+      elementByNight[el].hours += hrs;
+      elementByNight[el].entries += 1;
+      elementByNight[el].units += Number(r.number_of_units) || 0;
+
       const ts = r.submitted_at || r.date;
       if (ts) {
         const d = new Date(ts);
         const h = d.getHours();
         hourlyBuckets[h].count += 1;
-        hourlyBuckets[h].hours += r.hours_spent || 0;
+        hourlyBuckets[h].hours += hrs;
         const dow = d.getDay();
-        dowBuckets[dow].hours += r.hours_spent || 0;
+        dowBuckets[dow].hours += hrs;
         dowBuckets[dow].entries += 1;
       }
       if (r.date) {
         const key = r.date.toISOString().slice(0, 10);
         if (!timelineByDate[key]) timelineByDate[key] = { date: key, hours: 0, entries: 0 };
-        timelineByDate[key].hours += r.hours_spent || 0;
+        timelineByDate[key].hours += hrs;
         timelineByDate[key].entries += 1;
+
+        const [y, mo, da] = key.split('-').map(Number);
+        const dt = new Date(y, (mo || 1) - 1, da || 1);
+        const day = dt.getDay();
+        const diff = day === 0 ? -6 : 1 - day;
+        dt.setDate(dt.getDate() + diff);
+        const weekKey = dt.toISOString().slice(0, 10);
+        if (!weeklyByNight[weekKey]) {
+          weeklyByNight[weekKey] = { weekStart: weekKey, hours: 0, entries: 0 };
+        }
+        weeklyByNight[weekKey].hours += hrs;
+        weeklyByNight[weekKey].entries += 1;
       }
     }
 
     const nightTimeline = Object.values(timelineByDate).sort((a, b) => a.date.localeCompare(b.date));
+
+    const elementNight = Object.values(elementByNight)
+      .map((e) => ({
+        element: e.element,
+        hours: Math.round(e.hours * 100) / 100,
+        entries: e.entries,
+        units: e.units
+      }))
+      .sort((a, b) => b.hours - a.hours);
+
+    const weeklyNight = Object.values(weeklyByNight)
+      .map((w) => ({
+        weekStart: w.weekStart,
+        hours: Math.round(w.hours * 100) / 100,
+        entries: w.entries
+      }))
+      .sort((a, b) => a.weekStart.localeCompare(b.weekStart));
 
     const projectsNight = nightByProject
       .map((p) => {
@@ -4082,6 +4181,15 @@ app.get('/api/dashboard/night-analytics', async (req, res) => {
     }
     const topAnomalies = anomalies.slice(0, 25);
 
+    const peakHourBucket = hourlyBuckets.reduce(
+      (best, b) => ((b.hours || 0) > (best?.hours || 0) ? b : best),
+      hourlyBuckets[0]
+    );
+    const busiestDowBucket = dowBuckets.reduce(
+      (best, b) => ((b.hours || 0) > (best?.hours || 0) ? b : best),
+      dowBuckets[0]
+    );
+
     const summary = {
       totalNightHours: Math.round(totalNightHours * 100) / 100,
       totalNightEntries: totalNightEntries,
@@ -4091,7 +4199,13 @@ app.get('/api/dashboard/night-analytics', async (req, res) => {
       avgHoursPerNightEntry:
         totalNightEntries > 0 ? Math.round((totalNightHours / totalNightEntries) * 100) / 100 : 0,
       globalUnitsPerNightHour:
-        totalNightHours > 0 ? Math.round((totalNightUnits / totalNightHours) * 1000) / 1000 : null
+        totalNightHours > 0 ? Math.round((totalNightUnits / totalNightHours) * 1000) / 1000 : null,
+      peakNightHour: peakHourBucket?.hour ?? null,
+      peakNightHourLabel:
+        peakHourBucket != null && peakHourBucket.hour != null
+          ? `${peakHourBucket.hour}:00`
+          : '—',
+      busiestWeekday: busiestDowBucket?.day ?? '—'
     };
 
     const nightProjectShare = projectsNight.slice(0, 15).map((p) => ({
@@ -4101,17 +4215,39 @@ app.get('/api/dashboard/night-analytics', async (req, res) => {
       nightPercentOfNightTotal: totalNightHours > 0 ? Math.round((p.hours / totalNightHours) * 1000) / 10 : 0
     }));
 
+    const nightTaskShare = taskNight.slice(0, 12).map((t) => ({
+      name: t.task.length > 36 ? `${t.task.slice(0, 34)}…` : t.task,
+      fullName: t.task,
+      value: t.hours,
+      entries: t.entries,
+      nightPercentOfNightTotal:
+        totalNightHours > 0 ? Math.round((t.hours / totalNightHours) * 1000) / 10 : 0
+    }));
+
+    const teamNightShare = teamNight.slice(0, 10).map((t) => ({
+      name: t.team.length > 28 ? `${t.team.slice(0, 26)}…` : t.team,
+      fullName: t.team,
+      value: t.hours,
+      entries: t.entries,
+      nightPercentOfNightTotal:
+        totalNightHours > 0 ? Math.round((t.hours / totalNightHours) * 1000) / 10 : 0
+    }));
+
     res.json({
       summary,
       contributorNight,
       projectsNight,
       teamNight,
       taskNight,
+      elementNight,
+      weeklyNight,
       hourlyBuckets,
       dowBuckets,
       nightTimeline,
       nightVsDayByTask,
       nightProjectShare,
+      nightTaskShare,
+      teamNightShare,
       anomalies: topAnomalies
     });
   } catch (error) {
@@ -4312,6 +4448,38 @@ app.get('/api/dashboard/audit-status', async (req, res) => {
   }
 });
 
+// Per worklog slice: hours + units (for time-per-unit box plots by task)
+app.get('/api/dashboard/employee-task-rate-samples', async (req, res) => {
+  try {
+    const where = applyProjectTokenFilters(buildWhereClause(req), req);
+    const rows = await prisma.masterDatabase.groupBy({
+      by: ['name', 'task_name', 'project_name', 'chapter_number', 'date'],
+      _sum: { hours_spent: true, number_of_units: true },
+      where: {
+        ...where,
+        name: { notIn: ['', ' '] },
+        task_name: { not: null, notIn: ['', ' '] },
+        date: { not: null },
+      },
+    });
+    res.json(
+      rows
+        .map((r) => ({
+          employee: r.name,
+          task: r.task_name,
+          project: r.project_name,
+          chapter: r.chapter_number,
+          date: r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10),
+          hours: Number(r._sum.hours_spent) || 0,
+          units: Number(r._sum.number_of_units) || 0,
+        }))
+        .filter((r) => r.hours > 0 && r.units > 0)
+    );
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Employee × task (overall analytics: stacked bars + heatmap)
 app.get('/api/dashboard/employee-task-breakdown', async (req, res) => {
   try {
@@ -4454,6 +4622,39 @@ app.get('/api/dashboard/employee-performance-over-time', async (req, res) => {
   }
 });
 
+/** Split composite chapter_number values (e.g. "3, 8") into individual chapter tokens. */
+function parseChapterNumberTokens(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s || s === '—') return [];
+  const parts = s
+    .split(/[,;/|]+|\s+and\s+/gi)
+    .map((p) => p.trim().replace(/^ch\.?\s*/i, ''))
+    .filter(Boolean);
+  const seen = new Set();
+  const out = [];
+  for (const p of parts) {
+    if (!seen.has(p)) {
+      seen.add(p);
+      out.push(p);
+    }
+  }
+  return out;
+}
+
+function addHoursToChapterBucket(chaptersObj, chapterRaw, hours) {
+  const h = Number(hours) || 0;
+  if (h <= 0) return;
+  const tokens = parseChapterNumberTokens(chapterRaw);
+  if (!tokens.length) {
+    chaptersObj['—'] = (chaptersObj['—'] || 0) + h;
+    return;
+  }
+  const share = h / tokens.length;
+  for (const t of tokens) {
+    chaptersObj[t] = (chaptersObj[t] || 0) + share;
+  }
+}
+
 // Project Gantt rows (project x employee x date with task-hour breakdown + chapter split)
 app.get('/api/dashboard/project-gantt', async (req, res) => {
   try {
@@ -4496,7 +4697,7 @@ app.get('/api/dashboard/project-gantt', async (req, res) => {
       }
       const t = row.tasks[taskName];
       t.hours += h;
-      t.chapters[chRaw] = (t.chapters[chRaw] || 0) + h;
+      addHoursToChapterBucket(t.chapters, chRaw, h);
     }
 
     const payload = Array.from(byDay.values()).map((r) => ({
@@ -4843,7 +5044,7 @@ app.get('/api/dashboard/project-view/gantt', async (req, res) => {
 
     const rows = await prisma.masterDatabase.groupBy({
       by: ['project_name', 'date', 'task_name', 'name', 'chapter_number'],
-      _sum: { hours_spent: true },
+      _sum: { hours_spent: true, number_of_units: true },
       where: {
         ...where,
         date: { ...dateFilter, not: null },
@@ -4861,7 +5062,8 @@ app.get('/api/dashboard/project-view/gantt', async (req, res) => {
         r.chapter_number != null && String(r.chapter_number).trim()
           ? String(r.chapter_number).trim()
           : null,
-      hours: Number(r._sum?.hours_spent) || 0
+      hours: Number(r._sum?.hours_spent) || 0,
+      units: Number(r._sum?.number_of_units) || 0
     })).filter((x) => x.hours > 0);
 
     const seriesVals = normalizeSeriesQueryList(req);
