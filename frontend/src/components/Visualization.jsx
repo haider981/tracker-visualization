@@ -3721,8 +3721,8 @@ function buildChapterMapFromGantt(ganttRows, employeeName) {
   return out;
 }
 
-const EmployeeProjectStackTooltip = memo(({ active, payload, chapterMap }) => {
-  if (!active || !payload?.length) return null;
+const EmployeeProjectStackTooltipContent = memo(({ payload, chapterMap, scrollRef, onMouseEnter, onMouseLeave, wrapperStyle }) => {
+  if (!payload?.length) return null;
   const row = payload[0]?.payload;
   if (!row?.fullName) return null;
   const taskRows = payload
@@ -3735,11 +3735,55 @@ const EmployeeProjectStackTooltip = memo(({ active, payload, chapterMap }) => {
     .filter(Boolean)
     .sort((a, b) => b.hours - a.hours);
   const total = taskRows.reduce((s, r) => s + r.hours, 0);
+
+  const handleScrollKeys = useCallback((e) => {
+    const el = scrollRef?.current;
+    if (!el) return;
+    const scrollKeys = ['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp', 'Home', 'End'];
+    if (!scrollKeys.includes(e.key)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const pageStep = Math.max(el.clientHeight * 0.85, 48);
+    const lineStep = 28;
+    if (e.key === 'ArrowDown') el.scrollTop += lineStep;
+    else if (e.key === 'ArrowUp') el.scrollTop -= lineStep;
+    else if (e.key === 'PageDown') el.scrollTop += pageStep;
+    else if (e.key === 'PageUp') el.scrollTop -= pageStep;
+    else if (e.key === 'Home') el.scrollTop = 0;
+    else if (e.key === 'End') el.scrollTop = el.scrollHeight;
+  }, [scrollRef]);
+
+  const handleWheel = useCallback((e) => {
+    e.stopPropagation();
+    const el = e.currentTarget;
+    const { scrollTop, scrollHeight, clientHeight } = el;
+    const delta = e.deltaY;
+    const atTop = scrollTop <= 0 && delta < 0;
+    const atBottom = scrollTop + clientHeight >= scrollHeight - 1 && delta > 0;
+    if (!atTop && !atBottom) e.preventDefault();
+  }, []);
+
   return (
-    <div className="rounded-lg border border-purple-500 bg-gray-900 px-3 py-2 text-xs shadow-xl max-w-sm" style={{ zIndex: 10005 }}>
+    <div
+      className="rounded-lg border border-purple-500 bg-gray-900 px-3 py-2 text-xs shadow-xl max-w-sm"
+      style={{ zIndex: 10005, pointerEvents: 'auto', ...wrapperStyle }}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+      onWheel={(e) => e.stopPropagation()}
+      onKeyDown={handleScrollKeys}
+    >
       <p className="text-white font-semibold">{row.fullName}</p>
       <p className="text-gray-400 mt-1">Total: <span className="text-white font-bold">{total.toFixed(1)} hrs</span></p>
-      <div className="mt-2 space-y-2 max-h-52 overflow-y-auto">
+      <div
+        ref={scrollRef}
+        tabIndex={0}
+        role="region"
+        aria-label="Task and chapter breakdown"
+        className="mt-2 space-y-2 max-h-52 overflow-y-auto pr-1 custom-scrollbar focus:outline-none focus:ring-1 focus:ring-purple-500/50 rounded"
+        onWheel={handleWheel}
+        onKeyDown={handleScrollKeys}
+        style={{ WebkitOverflowScrolling: 'touch' }}
+      >
         {taskRows.map((tr) => {
           const chLines = chapterMap?.get(`${row.fullName}\t${tr.task}`) || [];
           return (
@@ -3759,6 +3803,111 @@ const EmployeeProjectStackTooltip = memo(({ active, payload, chapterMap }) => {
         })}
       </div>
     </div>
+  );
+});
+EmployeeProjectStackTooltipContent.displayName = 'EmployeeProjectStackTooltipContent';
+
+const EmployeeProjectStackTooltip = memo(({ active, payload, chapterMap }) => {
+  const [mousePos, setMousePos] = useState({ left: 0, top: 0 });
+  const [pointerInside, setPointerInside] = useState(false);
+  const lastPayloadRef = useRef(null);
+  const insideRef = useRef(false);
+  const scrollRef = useRef(null);
+  const rafRef = useRef(0);
+  const pendingRef = useRef(null);
+
+  React.useEffect(() => {
+    if (pointerInside) return;
+    if (active && payload?.length) {
+      lastPayloadRef.current = payload;
+    } else if (!active) {
+      lastPayloadRef.current = null;
+    }
+  }, [active, payload, pointerInside]);
+
+  const effectivePayload = lastPayloadRef.current;
+  const hasData = !!(effectivePayload && effectivePayload.length);
+  const shouldShow = hasData && (active || pointerInside);
+
+  React.useEffect(() => {
+    if (!shouldShow) return undefined;
+    const onMove = (e) => {
+      if (insideRef.current) return;
+      const margin = 10;
+      const width = 340;
+      const height = 400;
+      const left = Math.max(margin, Math.min(e.clientX + 16, window.innerWidth - width - margin));
+      const top = Math.max(margin, Math.min(e.clientY - 24, window.innerHeight - height - margin));
+      pendingRef.current = { left, top };
+      if (rafRef.current) return;
+      rafRef.current = window.requestAnimationFrame(() => {
+        rafRef.current = 0;
+        if (pendingRef.current) setMousePos(pendingRef.current);
+      });
+    };
+    window.addEventListener('mousemove', onMove, { passive: true });
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      if (rafRef.current) {
+        window.cancelAnimationFrame(rafRef.current);
+        rafRef.current = 0;
+      }
+      pendingRef.current = null;
+    };
+  }, [shouldShow]);
+
+  React.useEffect(() => {
+    if (!pointerInside) return undefined;
+    const onKey = (e) => {
+      const scrollKeys = ['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp', 'Home', 'End'];
+      if (!scrollKeys.includes(e.key)) return;
+      const el = scrollRef.current;
+      if (!el) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const pageStep = Math.max(el.clientHeight * 0.85, 48);
+      const lineStep = 28;
+      if (e.key === 'ArrowDown') el.scrollTop += lineStep;
+      else if (e.key === 'ArrowUp') el.scrollTop -= lineStep;
+      else if (e.key === 'PageDown') el.scrollTop += pageStep;
+      else if (e.key === 'PageUp') el.scrollTop -= pageStep;
+      else if (e.key === 'Home') el.scrollTop = 0;
+      else if (e.key === 'End') el.scrollTop = el.scrollHeight;
+    };
+    window.addEventListener('keydown', onKey, { capture: true });
+    return () => window.removeEventListener('keydown', onKey, { capture: true });
+  }, [pointerInside]);
+
+  const handleEnter = useCallback(() => {
+    insideRef.current = true;
+    setPointerInside(true);
+    scrollRef.current?.focus({ preventScroll: true });
+  }, []);
+  const handleLeave = useCallback(() => {
+    insideRef.current = false;
+    setPointerInside(false);
+    if (!active) lastPayloadRef.current = null;
+  }, [active]);
+
+  if (!shouldShow || typeof document === 'undefined') return null;
+  return createPortal(
+    <>
+      {pointerInside && (
+        <div
+          aria-hidden
+          style={{ position: 'fixed', inset: 0, zIndex: 10004, pointerEvents: 'auto', background: 'transparent' }}
+        />
+      )}
+      <EmployeeProjectStackTooltipContent
+        payload={effectivePayload}
+        chapterMap={chapterMap}
+        scrollRef={scrollRef}
+        onMouseEnter={handleEnter}
+        onMouseLeave={handleLeave}
+        wrapperStyle={{ position: 'fixed', left: mousePos.left, top: mousePos.top }}
+      />
+    </>,
+    document.body
   );
 });
 EmployeeProjectStackTooltip.displayName = 'EmployeeProjectStackTooltip';
@@ -4676,6 +4825,15 @@ function employeeNameInitials(name) {
   return (parts[0] || '?').slice(0, 2).toUpperCase();
 }
 
+function ganttRowInitials(label, rowMode = 'employee') {
+  if (rowMode === 'overall') {
+    const parts = String(label || '').split('_').filter(Boolean);
+    if (parts.length >= 2) return `${parts[0][0] || ''}${parts[1][0] || ''}`.toUpperCase();
+    return String(label || '?').slice(0, 2).toUpperCase();
+  }
+  return employeeNameInitials(label);
+}
+
 /** Interpolate blue scale: white (0) -> dark blue (high) */
 function purpleHeatAlpha(t) {
   const x = Math.max(0, Math.min(1, t));
@@ -5207,6 +5365,7 @@ const Visualization = () => {
   const [selectedProject, setSelectedProject] = useState(null);
   const [ganttHover, setGanttHover] = useState(null);
   const [ganttSortMode, setGanttSortMode] = useState('hours');
+  const [ganttRowMode, setGanttRowMode] = useState('overall');
   const [teamGanttTimeScale, setTeamGanttTimeScale] = useState('Week');
   /** Employee × time heatmap columns (independent from Gantt time scale) */
   const [teamHoursHeatmapScale, setTeamHoursHeatmapScale] = useState('Week');
@@ -5274,6 +5433,10 @@ const Visualization = () => {
     selectedDepartment !== 'All' && selectedTeam === 'All' && selectedEmployee === 'All';
   const isEmployeeDetailView =
     selectedDepartment !== 'All' && selectedTeam !== 'All' && selectedEmployee !== 'All';
+
+  const effectiveGanttRowMode =
+    selectedEmployee !== 'All' ? 'employee' : ganttRowMode;
+  const isOverallGanttRows = effectiveGanttRowMode === 'overall';
 
   const teamToDepartment = useCallback(
     (teamName) => {
@@ -5826,9 +5989,10 @@ const Visualization = () => {
     return { rows, stackKeys, slugToEmp, breakdownByProjEmp };
   }, [projectEmployeeBreakdown]);
 
-  /** Employee × time Gantt: rows = employees, lanes = projects, bar fill = tasks (same /project-gantt payload). */
+  /** Timeline Gantt: Overall = one row per team; Employee = one row per person (same /project-gantt payload). */
   const employeeGanttModel = useMemo(() => {
     const rows = Array.isArray(projectGanttRows) ? projectGanttRows : [];
+    const rowMode = isOverallGanttRows ? 'overall' : 'employee';
     if (!rows.length) {
       return {
         employees: [],
@@ -5839,23 +6003,30 @@ const Visualization = () => {
         taskColor: {},
         dateRangeLabel: '',
         empColW: GANTT_TEAM_EMPLOYEE_COL,
+        rowMode,
       };
     }
 
     const dateSet = new Set();
-    const byEmployee = new Map();
-    const employeeTotals = new Map();
+    const byRow = new Map();
+    const employeeTeamMap = new Map();
+    for (const r of rows) {
+      const emp = String(r?.employee || r?.name || '').trim();
+      const tm = String(r?.team || '').trim();
+      if (emp && tm && !employeeTeamMap.has(emp)) employeeTeamMap.set(emp, tm);
+    }
 
     for (const r of rows) {
       const project = String(r?.project || r?.project_name || '').trim();
       const employee = String(r?.employee || r?.name || '').trim();
+      const team = String(r?.team || '').trim() || employeeTeamMap.get(employee) || '';
+      const rowLabel = isOverallGanttRows ? team : employee;
       const date = String(r?.date || '').slice(0, 10);
-      if (!project || !employee || !date) continue;
+      if (!project || !rowLabel || !date) continue;
       dateSet.add(date);
-      employeeTotals.set(employee, (employeeTotals.get(employee) || 0) + (Number(r?.hours) || 0));
 
-      if (!byEmployee.has(employee)) byEmployee.set(employee, new Map());
-      const projMap = byEmployee.get(employee);
+      if (!byRow.has(rowLabel)) byRow.set(rowLabel, new Map());
+      const projMap = byRow.get(rowLabel);
       if (!projMap.has(project)) projMap.set(project, new Map());
       const dayMap = projMap.get(project);
 
@@ -5887,12 +6058,12 @@ const Visualization = () => {
     const { buckets, dateToBucketKey } = buildTeamGanttBuckets(dates, teamGanttTimeScale);
 
     const cellMap = new Map();
-    for (const [employee, projMap] of byEmployee.entries()) {
+    for (const [rowLabel, projMap] of byRow.entries()) {
       for (const [project, dayMap] of projMap.entries()) {
         for (const [dateStr, v] of dayMap.entries()) {
           const bk = dateToBucketKey.get(dateStr);
           if (!bk) continue;
-          const key = `${employee}\t${project}\t${bk}`;
+          const key = `${rowLabel}\t${project}\t${bk}`;
           if (!cellMap.has(key)) cellMap.set(key, { hours: 0, tasks: new Map(), taskChapters: new Map() });
           const cell = cellMap.get(key);
           cell.hours += v.hours || 0;
@@ -5936,14 +6107,14 @@ const Visualization = () => {
       : 42;
     const chartWidth = Math.max(usableWidth, buckets.length * colWidth);
 
-    const employees = Array.from(byEmployee.entries())
-      .map(([employee, projMap]) => {
+    const employees = Array.from(byRow.entries())
+      .map(([rowLabel, projMap]) => {
         const lanes = Array.from(projMap.entries())
           .map(([project, dayMap]) => {
             const withData = [];
             for (let bi = 0; bi < buckets.length; bi += 1) {
               const b = buckets[bi];
-              const cell = cellMap.get(`${employee}\t${project}\t${b.key}`);
+              const cell = cellMap.get(`${rowLabel}\t${project}\t${b.key}`);
               if (!cell || !(cell.hours > 0)) continue;
               withData.push({
                 idx: bi,
@@ -5996,17 +6167,19 @@ const Visualization = () => {
 
         const totalHours = lanes.reduce((s, l) => s + l.totalHours, 0);
         const mostRecentIdx = lanes.length ? Math.max(...lanes.map((l) => l.lastIdx)) : -1;
-        return { employee, lanes, totalHours, mostRecentIdx };
+        return { employee: rowLabel, lanes, totalHours, mostRecentIdx };
       })
       .filter((e) => e.totalHours > 0);
 
     employees.sort((a, b) => {
       if (ganttSortMode === 'recent') {
         if (b.mostRecentIdx !== a.mostRecentIdx) return b.mostRecentIdx - a.mostRecentIdx;
-        return b.totalHours - a.totalHours;
+        if (b.totalHours !== a.totalHours) return b.totalHours - a.totalHours;
+        return a.employee.localeCompare(b.employee);
       }
       if (b.totalHours !== a.totalHours) return b.totalHours - a.totalHours;
-      return b.mostRecentIdx - a.mostRecentIdx;
+      if (b.mostRecentIdx !== a.mostRecentIdx) return b.mostRecentIdx - a.mostRecentIdx;
+      return a.employee.localeCompare(b.employee);
     });
 
     const LANE_H = 42;
@@ -6024,8 +6197,9 @@ const Visualization = () => {
       dateRangeLabel,
       empColW: GANTT_TEAM_EMPLOYEE_COL,
       laneHeight: LANE_H,
+      rowMode,
     };
-  }, [projectGanttRows, ganttViewportWidth, ganttSortMode, teamGanttTimeScale]);
+  }, [projectGanttRows, ganttViewportWidth, ganttSortMode, teamGanttTimeScale, isOverallGanttRows]);
 
   /** Single employee: Y = projects, X = time buckets, bar stacks = tasks. */
   const employeeProjectGanttModel = useMemo(() => {
@@ -7091,7 +7265,14 @@ const Visualization = () => {
                         <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
                         <XAxis type="number" stroke="#9ca3af" tick={{ fontSize: 10 }} label={{ value: 'Hours', position: 'insideBottom', fill: '#9ca3af', fontSize: 11 }} />
                         <YAxis type="category" dataKey="name" width={160} stroke="#9ca3af" tick={{ fontSize: 9 }} interval={0} />
-                        <Tooltip content={<EmployeeProjectStackTooltip chapterMap={employeeChapterMap} />} wrapperStyle={{ zIndex: 10005 }} />
+                        <Tooltip
+                          content={<EmployeeProjectStackTooltip chapterMap={employeeChapterMap} />}
+                          cursor={false}
+                          wrapperStyle={{ zIndex: 10005, pointerEvents: 'none' }}
+                          contentStyle={{ backgroundColor: 'transparent', border: 'none', outline: 'none', boxShadow: 'none', padding: 0 }}
+                          isAnimationActive={false}
+                          animationDuration={0}
+                        />
                         <Legend wrapperStyle={{ fontSize: 10 }} />
                         {employeeTopProjectsStack.stackKeys.map((key, i) => (
                           <Bar key={key} dataKey={key} stackId="empProj" fill={COLORS[i % COLORS.length]} name={key} isAnimationActive={false} />
@@ -7700,15 +7881,17 @@ const Visualization = () => {
             </div>
           </section>
 
-          {/* Employee timeline Gantt (scrollable): time buckets × employees; bars = projects, stacks = tasks */}
+          {/* Timeline Gantt: Overall = teams combined; Employee = per-person rows */}
           <div className="bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-xl p-6 shadow-2xl border border-gray-700">
             <div className="mb-4 flex items-center justify-between gap-3 flex-wrap">
               <div>
                 <h2 className="text-2xl font-bold text-white flex items-center">
-                  <TrendingUp className="mr-2 text-blue-400" /> Employee timeline Gantt chart
+                  <TrendingUp className="mr-2 text-blue-400" /> {isOverallGanttRows ? 'Team timeline Gantt chart' : 'Employee timeline Gantt chart'}
                 </h2>
                 <p className="text-gray-400 text-sm mt-1 max-w-3xl">
-                  Shows what each employee is working on across projects. Bars are projects; colored stacks inside each bar are tasks (same filters as the dashboard).
+                  {isOverallGanttRows
+                    ? 'Combined workload per team across projects. Bars are projects; colored stacks inside each bar are tasks. Use filters to narrow to a department or a single team.'
+                    : 'Shows what each employee is working on across projects. Bars are projects; colored stacks inside each bar are tasks (same filters as the dashboard).'}
                 </p>
               </div>
               <div className="flex items-center gap-3 flex-wrap justify-end">
@@ -7745,13 +7928,28 @@ const Visualization = () => {
                     Sort: Most recent
                   </button>
                 </div>
-                <div className="rounded-md border border-blue-400 bg-blue-500/10 px-3 py-1 text-sm font-semibold text-blue-200 whitespace-nowrap">
-                  Employees: {employeeGanttModel.employees.length} · Columns: {employeeGanttModel.buckets.length}
+                <div className="inline-flex rounded-lg border border-blue-400/60 overflow-hidden text-xs font-semibold">
+                  <button
+                    type="button"
+                    disabled={selectedEmployee !== 'All'}
+                    title={selectedEmployee !== 'All' ? 'Employee filter active — showing individual rows' : undefined}
+                    className={`px-3 py-1.5 ${effectiveGanttRowMode === 'overall' ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'} ${selectedEmployee !== 'All' ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    onClick={() => setGanttRowMode('overall')}
+                  >
+                    Overall
+                  </button>
+                  <button
+                    type="button"
+                    className={`px-3 py-1.5 border-l border-blue-400/40 ${effectiveGanttRowMode === 'employee' ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+                    onClick={() => setGanttRowMode('employee')}
+                  >
+                    Employee
+                  </button>
                 </div>
               </div>
             </div>
             <p className="text-gray-400 text-xs mb-3">
-              X-axis: {teamGanttTimeScale.toLowerCase()} buckets (oldest on the left, newest on the right) · Y-axis: employees · bar border: accent · bar fill: task mix.
+              X-axis: {teamGanttTimeScale.toLowerCase()} buckets (oldest on the left, newest on the right) · Y-axis: {isOverallGanttRows ? 'teams' : 'employees'} · bar border: accent · bar fill: task mix.
             </p>
 
             {employeeGanttModel.employees.length > 0 && employeeGanttModel.buckets.length > 0 ? (
@@ -7766,7 +7964,7 @@ const Visualization = () => {
                       className="sticky left-0 z-30 shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-300 border-r-2 border-indigo-500/35 bg-gray-900/95"
                       style={{ width: employeeGanttModel.empColW, minWidth: employeeGanttModel.empColW }}
                     >
-                      Employee
+                      {isOverallGanttRows ? 'Team' : 'Employee'}
                     </div>
                     <div className="relative" style={{ width: `${employeeGanttModel.chartWidth}px` }}>
                       <div className="flex">
@@ -7789,16 +7987,20 @@ const Visualization = () => {
                     return (
                       <div key={row.employee} className="flex border-b-2 border-indigo-600/45">
                         <div
-                          className="sticky left-0 z-10 shrink-0 border-r-2 border-indigo-500/35 bg-gray-900/95 px-2 py-2 flex items-center gap-2"
-                          style={{ width: employeeGanttModel.empColW, minWidth: employeeGanttModel.empColW, minHeight: `${rowHeight}px` }}
-                          title={row.employee}
+                          className="sticky left-0 z-10 shrink-0 border-r-2 border-indigo-500/35 bg-gray-900/95"
+                          style={{ width: employeeGanttModel.empColW, minWidth: employeeGanttModel.empColW }}
                         >
-                          <div className="h-9 w-9 rounded-full bg-indigo-600 text-white text-[11px] font-bold flex items-center justify-center shrink-0">
-                            {employeeNameInitials(row.employee)}
-                          </div>
-                          <div className="min-w-0">
-                            <div className="text-xs font-semibold text-gray-100 truncate">{row.employee}</div>
-                            <div className="text-[10px] text-gray-400">{row.totalHours.toFixed(1)} hrs</div>
+                          <div
+                            className="sticky top-0 z-20 flex items-start gap-2 px-2 py-2 bg-gray-900/95"
+                            title={row.employee}
+                          >
+                            <div className="h-9 w-9 rounded-full bg-indigo-600 text-white text-[11px] font-bold flex items-center justify-center shrink-0">
+                              {ganttRowInitials(row.employee, employeeGanttModel.rowMode)}
+                            </div>
+                            <div className="min-w-0">
+                              <div className="text-xs font-semibold text-gray-100 truncate">{row.employee}</div>
+                              <div className="text-[10px] text-gray-400">{row.totalHours.toFixed(1)} hrs</div>
+                            </div>
                           </div>
                         </div>
                         <div
@@ -7906,7 +8108,9 @@ const Visualization = () => {
               </div>
             ) : (
               <div className="h-[220px] flex items-center justify-center text-gray-500 text-sm rounded-lg border border-gray-700">
-                No employee timeline data for current filters.
+                {isOverallGanttRows
+                  ? 'No team timeline data for current filters.'
+                  : 'No employee timeline data for current filters.'}
               </div>
             )}
 

@@ -4661,7 +4661,7 @@ app.get('/api/dashboard/project-gantt', async (req, res) => {
     // Include project-name token filters (segment/class/series)
     const where = applyProjectTokenFilters(buildWhereClause(req), req);
     const rows = await prisma.masterDatabase.groupBy({
-      by: ['project_name', 'name', 'date', 'task_name', 'chapter_number'],
+      by: ['project_name', 'name', 'team', 'date', 'task_name', 'chapter_number'],
       _sum: { hours_spent: true },
       where: {
         ...where,
@@ -4674,11 +4674,13 @@ app.get('/api/dashboard/project-gantt', async (req, res) => {
     const byDay = new Map();
     for (const r of rows) {
       const dateStr = r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10);
-      const key = `${r.project_name}\t${r.name}\t${dateStr}`;
+      const teamName = r.team != null && String(r.team).trim() ? String(r.team).trim() : null;
+      const key = `${r.project_name}\t${r.name}\t${teamName || ''}\t${dateStr}`;
       if (!byDay.has(key)) {
         byDay.set(key, {
           project: r.project_name,
           employee: r.name,
+          team: teamName,
           date: dateStr,
           hours: 0,
           tasks: {}
@@ -4703,6 +4705,7 @@ app.get('/api/dashboard/project-gantt', async (req, res) => {
     const payload = Array.from(byDay.values()).map((r) => ({
       project: r.project,
       employee: r.employee,
+      team: r.team,
       date: r.date,
       hours: r.hours,
       tasks: Object.entries(r.tasks || {})
