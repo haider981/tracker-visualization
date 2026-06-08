@@ -3148,6 +3148,10 @@ function applyProjectTokenFilters(where, req) {
     // class/year is the second token: _<class>_...
     tokenFilters.push({ project_name: { contains: `_${req.query.class}_` } });
   }
+  if (req.query.subject && req.query.subject !== 'All') {
+    // subject is the fourth token: _<board>_<subject>_...
+    tokenFilters.push({ project_name: { contains: `_${req.query.subject}_` } });
+  }
   const seriesVals = normalizeSeriesQueryList(req);
   if (seriesVals.length === 1) {
     tokenFilters.push({ project_name: { contains: `_${seriesVals[0]}_` } });
@@ -4923,6 +4927,10 @@ app.get('/api/dashboard/project-view/projects', async (req, res) => {
       // class -> token[1]
       if (req.query.class && req.query.class !== 'All') {
         if (tokens[1] !== req.query.class) return false;
+      }
+      // subject -> token[3] (fourth part; token[2] is board e.g. CBSE)
+      if (req.query.subject && req.query.subject !== 'All') {
+        if (tokens[3] !== req.query.subject) return false;
       }
       // series -> exact token match (same extraction as project-view UI; avoids SureS matching SureS_WB via substring)
       const seriesVals = normalizeSeriesQueryList(req);

@@ -1,16 +1,40 @@
+const VALID_SEGMENT_RE = /^[A-Z]{2}$/i;
+
+function splitProjectTokens(projectName) {
+  if (!projectName || typeof projectName !== 'string') return [];
+  return projectName.split('_').map((p) => p.trim()).filter(Boolean);
+}
+
+/** First token when it looks like a segment code (VK, FK, …). */
+function extractSegmentFromProjectName(projectName) {
+  const parts = splitProjectTokens(projectName);
+  const seg = parts[0] || '';
+  return VALID_SEGMENT_RE.test(seg) ? seg.toUpperCase() : '';
+}
+
+/** Second token — class / year band. */
+function extractClassFromProjectName(projectName) {
+  const parts = splitProjectTokens(projectName);
+  return parts[1] || '';
+}
+
+/** Fourth token — subject (e.g. VK_9th_CBSE_Math_SM_(Eng)_26-27 → Math). Token 3 is board. */
+function extractSubjectFromProjectName(projectName) {
+  const parts = splitProjectTokens(projectName);
+  return parts[3] || '';
+}
+
 /**
- * Extract the "series" token from a project_name using the same rules as the project-view UI
- * (token before a parenthesised language tag, else before YY-YY session, else 4th/3rd token).
- * This avoids treating "SureS" as matching "SureSWB" or matching a split "SureS_WB" via substring SQL.
+ * Fifth token / token before medium — e.g. VK_9th_CBSE_Math_SM_(Eng)_26-27 → SM.
+ * Falls back to token before (Lang) or YY-YY session when present.
  */
 function extractSeriesFromProjectName(projectName) {
-  if (!projectName || typeof projectName !== 'string') return '';
-  const parts = projectName.split('_').map((p) => p.trim()).filter(Boolean);
+  const parts = splitProjectTokens(projectName);
   const parenIdx = parts.findIndex((p) => p && /^\(.+\)$/.test(p));
   if (parenIdx > 2) return parts[parenIdx - 1] || '';
   const yearIdx = parts.findIndex((p) => p && /^\d{2}-\d{2}$/.test(p));
   if (yearIdx > 2) return parts[yearIdx - 1] || '';
-  return parts[4] || parts[3] || '';
+  return parts[4] || '';
 }
 
 /** True when no series filter, or project series token equals one of the selected values (exact). */
@@ -21,6 +45,11 @@ function projectMatchesSeriesSelection(projectName, seriesVals) {
 }
 
 module.exports = {
+  VALID_SEGMENT_RE,
+  splitProjectTokens,
+  extractSegmentFromProjectName,
+  extractClassFromProjectName,
+  extractSubjectFromProjectName,
   extractSeriesFromProjectName,
   projectMatchesSeriesSelection
 };

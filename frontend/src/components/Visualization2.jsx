@@ -649,15 +649,64 @@ function appendSeriesParams(params, seriesArr) {
   });
 }
 
-/** Series token for project_name — must match backend `projectSeriesToken` rules. */
+function appendProjectTokenParams(params, { segment, series, subject, classVal, period, projectNames } = {}) {
+  if (segment && segment !== 'All') params.append('segment', segment);
+  appendSeriesParams(params, series);
+  if (subject && subject !== 'All') params.append('subject', subject);
+  if (classVal && classVal !== 'All') params.append('class', classVal);
+  if (period && period !== 'All') params.append('period', period);
+  (Array.isArray(projectNames) ? projectNames : []).forEach((p) => {
+    if (p) params.append('project_name', p);
+  });
+}
+
+const VALID_SEGMENT_RE = /^[A-Z]{2}$/i;
+
+function splitProjectTokens(projectName) {
+  if (!projectName || typeof projectName !== 'string') return [];
+  return projectName.split('_').map((x) => x.trim()).filter(Boolean);
+}
+
+/** First token when it looks like a segment code (VK, FK, …). */
+function extractProjectSegmentToken(projectName) {
+  const parts = splitProjectTokens(projectName);
+  const seg = parts[0] || '';
+  return VALID_SEGMENT_RE.test(seg) ? seg.toUpperCase() : '';
+}
+
+/** Second token — class / year band. */
+function extractProjectClassToken(projectName) {
+  return splitProjectTokens(projectName)[1] || '';
+}
+
+/** Fourth token — subject (e.g. VK_9th_CBSE_Math_SM_(Eng)_26-27 → Math). Token 3 is board. */
+function extractProjectSubjectToken(projectName) {
+  return splitProjectTokens(projectName)[3] || '';
+}
+
+/** Fifth token / token before medium — e.g. VK_9th_CBSE_Math_SM_(Eng)_26-27 → SM. */
 function extractProjectSeriesToken(projectName) {
-  if (!projectName || typeof projectName !== 'string') return '';
-  const parts = projectName.split('_').map((x) => x.trim()).filter(Boolean);
+  const parts = splitProjectTokens(projectName);
   const parenIdx = parts.findIndex((p) => p && /^\(.+\)$/.test(p));
   if (parenIdx > 2) return parts[parenIdx - 1] || '';
   const yearIdx = parts.findIndex((p) => p && /^\d{2}-\d{2}$/.test(p));
   if (yearIdx > 2) return parts[yearIdx - 1] || '';
-  return parts[4] || parts[3] || '';
+  return parts[4] || '';
+}
+
+function projectMatchesSubjectFilter(projectName, subject) {
+  if (!subject || subject === 'All') return true;
+  return extractProjectSubjectToken(projectName) === subject;
+}
+
+function projectMatchesClassFilter(projectName, classVal) {
+  if (!classVal || classVal === 'All') return true;
+  return extractProjectClassToken(projectName) === classVal;
+}
+
+function projectMatchesSegmentFilter(projectName, segment) {
+  if (!segment || segment === 'All') return true;
+  return extractProjectSegmentToken(projectName) === segment;
 }
 
 function parseChapterTokens(raw) {
@@ -1166,12 +1215,14 @@ const Visualization2 = () => {
   const dashTab = projectDashTabFromPath(location.pathname);
 
   // ── filter state (Segment / Series / Class / Project multi-select) ──
-  const [segments, setSegments] = useState([]);
+  const [segments, setSegments] = useState(['All']);
   const [seriesList, setSeriesList] = useState([]);
+  const [subjectsList, setSubjectsList] = useState([]);
   const [classesList, setClassesList] = useState([]);
 
   const [selSegment, setSelSegment] = useState('All');
   const [selectedSeries, setSelectedSeries] = useState([]);
+  const [selSubject, setSelSubject] = useState('All');
   const [selClass, setSelClass] = useState('All');
   const [selPeriod, setSelPeriod] = useState('Last 7 Days');
   const [ganttTimeScale, setGanttTimeScale] = useState('Week');
@@ -1260,24 +1311,27 @@ const Visualization2 = () => {
       const names = asJsonArray(namesRaw);
       setProjectNames(names);
 
-      // derive Segment / Class / Series from FULL list using heuristics
+      // derive Segment / Series / Subject / Class from FULL list (segment=0, class=1, board=2, subject=3, series≈4)
       const segSet = new Set();
       const classSet = new Set();
+      const subjectSet = new Set();
       const seriesSet = new Set();
 
-      const detectSeries = (parts) => extractProjectSeriesToken(parts.join('_'));
-
-      names.forEach(n => {
-        const parts = n.split('_').map(p => p.trim()).filter(Boolean);
-        if (parts[0]) segSet.add(parts[0]);
-        if (parts[1]) classSet.add(parts[1]);
-        const s = detectSeries(parts);
+      names.forEach((n) => {
+        const seg = extractProjectSegmentToken(n);
+        if (seg) segSet.add(seg);
+        const cls = extractProjectClassToken(n);
+        if (cls) classSet.add(cls);
+        const subj = extractProjectSubjectToken(n);
+        if (subj) subjectSet.add(subj);
+        const s = extractProjectSeriesToken(n);
         if (s) seriesSet.add(s);
       });
 
-      setSegments(['All', ...[...segSet]]);
-      setClassesList(['All', ...[...classSet]]);
-      setSeriesList(['All', ...[...seriesSet]]);
+      setSegments(['All', ...[...segSet].sort((a, b) => a.localeCompare(b))]);
+      setClassesList(['All', ...[...classSet].sort((a, b) => a.localeCompare(b))]);
+      setSubjectsList(['All', ...[...subjectSet].sort((a, b) => a.localeCompare(b))]);
+      setSeriesList(['All', ...[...seriesSet].sort((a, b) => a.localeCompare(b))]);
     } catch (e) { console.error('fetchFilters', e); }
   };
 
@@ -1288,11 +1342,14 @@ const Visualization2 = () => {
     else setProjectsRefreshing(true);
     try {
       const params = new URLSearchParams();
-      if (selSegment !== 'All') params.append('segment', selSegment);
-      appendSeriesParams(params, selectedSeries);
-      if (selClass !== 'All') params.append('class', selClass);
-      if (selPeriod !== 'All') params.append('period', selPeriod);
-      if (selectedProjects.length > 0) selectedProjects.forEach(p => params.append('project_name', p));
+      appendProjectTokenParams(params, {
+        segment: selSegment,
+        series: selectedSeries,
+        subject: selSubject,
+        classVal: selClass,
+        period: selPeriod,
+        projectNames: selectedProjects,
+      });
 
       const res = await fetch(`${API_URL}/project-view/projects?${params.toString()}`);
       const data = tryParseJson(await res.text());
@@ -1310,11 +1367,14 @@ const Visualization2 = () => {
 
   const buildAnalyticsQueryParams = () => {
     const params = new URLSearchParams();
-    if (selSegment !== 'All') params.append('segment', selSegment);
-    appendSeriesParams(params, selectedSeries);
-    if (selClass !== 'All') params.append('class', selClass);
-    if (selPeriod !== 'All') params.append('period', selPeriod);
-    selectedProjects.forEach((p) => params.append('project_name', p));
+    appendProjectTokenParams(params, {
+      segment: selSegment,
+      series: selectedSeries,
+      subject: selSubject,
+      classVal: selClass,
+      period: selPeriod,
+      projectNames: selectedProjects,
+    });
     return params.toString();
   };
 
@@ -1344,11 +1404,14 @@ const Visualization2 = () => {
     else setBooksRefreshing(true);
     try {
       const params = new URLSearchParams();
-      if (selSegment !== 'All') params.append('segment', selSegment);
-      appendSeriesParams(params, selectedSeries);
-      if (selClass !== 'All') params.append('class', selClass);
-      if (selPeriod !== 'All') params.append('period', selPeriod);
-      selectedProjects.forEach((p) => params.append('project_name', p));
+      appendProjectTokenParams(params, {
+        segment: selSegment,
+        series: selectedSeries,
+        subject: selSubject,
+        classVal: selClass,
+        period: selPeriod,
+        projectNames: selectedProjects,
+      });
       params.append('minSessions', String(bookSessionMin));
       const qs = params.toString();
       const res = await fetch(`${API_URL}/cross-session-books${qs ? `?${qs}` : ''}`);
@@ -1380,18 +1443,33 @@ const Visualization2 = () => {
     return [];
   }, [activeProject, selectedProjects]);
 
-  /** null = fetch Gantt for all projects matching period + segment filters (no project_name). */
+  const topProjectNames = useMemo(
+    () => (Array.isArray(projects) ? projects : []).map((p) => p?.name).filter(Boolean),
+    [projects]
+  );
+
+  /** Scope Gantt to focused/selected projects, or top bar-chart projects (never the full DB). */
   const ganttFetchTarget = useMemo(() => {
     if (activeProject) return [activeProject];
-    if (selectedProjects.length === 0) return null;
-    return selectedProjects;
-  }, [activeProject, selectedProjects]);
+    if (selectedProjects.length > 0) return selectedProjects;
+    return topProjectNames.length > 0 ? topProjectNames : null;
+  }, [activeProject, selectedProjects, topProjectNames]);
 
-  /** Progress heatmap: all-time rows; scope from dropdown only (not top-bar focus). */
+  const ganttFetchTargetKey = useMemo(
+    () => (ganttFetchTarget ? [...ganttFetchTarget].sort((a, b) => a.localeCompare(b)).join('\t') : ''),
+    [ganttFetchTarget]
+  );
+
+  /** Progress heatmap: all-time rows; same project scope as Gantt default. */
   const heatmapFetchTarget = useMemo(() => {
-    if (selectedProjects.length === 0) return null;
-    return selectedProjects;
-  }, [selectedProjects]);
+    if (selectedProjects.length > 0) return selectedProjects;
+    return topProjectNames.length > 0 ? topProjectNames : null;
+  }, [selectedProjects, topProjectNames]);
+
+  const heatmapFetchTargetKey = useMemo(
+    () => (heatmapFetchTarget ? [...heatmapFetchTarget].sort((a, b) => a.localeCompare(b)).join('\t') : ''),
+    [heatmapFetchTarget]
+  );
 
   const isAllSelectedMode = !activeProject && selectedProjects.length > 1;
   const currentScopeLabel =
@@ -1408,11 +1486,14 @@ const Visualization2 = () => {
     if (!projectNamesArray || projectNamesArray.length === 0) { setTimeline([]); setTimelineTasks([]); return; }
     try {
       const params = new URLSearchParams();
-      projectNamesArray.forEach(n => params.append('project_name', n));
-      if (selPeriod !== 'All') params.append('period', selPeriod);
-      if (selSegment !== 'All') params.append('segment', selSegment);
-      appendSeriesParams(params, selectedSeries);
-      if (selClass !== 'All') params.append('class', selClass);
+      appendProjectTokenParams(params, {
+        segment: selSegment,
+        series: selectedSeries,
+        subject: selSubject,
+        classVal: selClass,
+        period: selPeriod,
+        projectNames: projectNamesArray,
+      });
 
       const res = await fetch(`${API_URL}/project-view/timeline?${params}`);
       const body = tryParseJson(await res.text());
@@ -1437,11 +1518,14 @@ const Visualization2 = () => {
     else setInsightsRefreshing(true);
     try {
       const params = new URLSearchParams();
-      projectNamesArray.forEach(n => params.append('project_name', n));
-      if (selPeriod !== 'All') params.append('period', selPeriod);
-      if (selSegment !== 'All') params.append('segment', selSegment);
-      appendSeriesParams(params, selectedSeries);
-      if (selClass !== 'All') params.append('class', selClass);
+      appendProjectTokenParams(params, {
+        segment: selSegment,
+        series: selectedSeries,
+        subject: selSubject,
+        classVal: selClass,
+        period: selPeriod,
+        projectNames: projectNamesArray,
+      });
 
       const res = await fetch(`${API_URL}/project-view/project-insights?${params.toString()}`);
       const data = tryParseJson(await res.text());
@@ -1463,13 +1547,14 @@ const Visualization2 = () => {
 
   const fetchProjectGanttRows = async (projectNamesArray, department, { includePeriod = true } = {}) => {
     const params = new URLSearchParams();
-    if (Array.isArray(projectNamesArray) && projectNamesArray.length > 0) {
-      projectNamesArray.forEach((n) => params.append('project_name', n));
-    }
-    if (includePeriod && selPeriod !== 'All') params.append('period', selPeriod);
-    if (selSegment !== 'All') params.append('segment', selSegment);
-    appendSeriesParams(params, selectedSeries);
-    if (selClass !== 'All') params.append('class', selClass);
+    appendProjectTokenParams(params, {
+      segment: selSegment,
+      series: selectedSeries,
+      subject: selSubject,
+      classVal: selClass,
+      period: includePeriod ? selPeriod : 'All',
+      projectNames: projectNamesArray,
+    });
     if (department != null && department !== 'All') {
       const deptApiValue = department === 'Digital_Marketing' ? 'Digital Marketing' : department;
       params.append('department', deptApiValue);
@@ -1508,19 +1593,34 @@ const Visualization2 = () => {
   };
 
   // ─── effects ─────────────────────────────────────────────────
-  // Load filter vocabulary once; chain is segment → series → class → period (period must not reshape series/class options)
+  // Priority: bar chart first; filter vocabulary loads after so it does not compete on cold start.
   useEffect(() => {
-    fetchFilters();
-  }, []);
+    fetchProjects();
+  }, [selSegment, seriesSelectionKey, selSubject, selClass, selPeriod, selectedProjects]);
 
-  // refetch projects automatically when filter selections change
-  useEffect(() => { fetchProjects(); }, [selSegment, seriesSelectionKey, selClass, selPeriod, selectedProjects]);
+  useEffect(() => {
+    if (!projectsHasLoaded) return undefined;
+    const id = window.setTimeout(() => { fetchFilters(); }, 0);
+    return () => window.clearTimeout(id);
+  }, [projectsHasLoaded]);
 
   // timeline + deep dive follow active project OR all selected projects
-  useEffect(() => { fetchTimeline(timelineInsightProjects); }, [timelineInsightProjects, selPeriod, selSegment, seriesSelectionKey, selClass]);
-  useEffect(() => { fetchProjectGanttStageHeatmapRows(heatmapFetchTarget); }, [heatmapFetchTarget, selSegment, seriesSelectionKey, selClass]);
-  useEffect(() => { fetchProjectGantt(ganttFetchTarget); }, [ganttFetchTarget, selPeriod, selSegment, seriesSelectionKey, selClass, ganttDepartment]);
-  useEffect(() => { fetchProjectInsights(timelineInsightProjects); }, [timelineInsightProjects, selPeriod, selSegment, seriesSelectionKey, selClass]);
+  useEffect(() => { fetchTimeline(timelineInsightProjects); }, [timelineInsightProjects, selPeriod, selSegment, seriesSelectionKey, selSubject, selClass]);
+  useEffect(() => {
+    if (!projectsHasLoaded || !heatmapFetchTargetKey) {
+      if (projectsHasLoaded && !heatmapFetchTargetKey) setGanttRowsStageHeatmap([]);
+      return;
+    }
+    fetchProjectGanttStageHeatmapRows(heatmapFetchTarget);
+  }, [projectsHasLoaded, heatmapFetchTargetKey, selSegment, seriesSelectionKey, selSubject, selClass]);
+  useEffect(() => {
+    if (!projectsHasLoaded || !ganttFetchTargetKey) {
+      if (projectsHasLoaded && !ganttFetchTargetKey) setGanttRows([]);
+      return;
+    }
+    fetchProjectGantt(ganttFetchTarget);
+  }, [projectsHasLoaded, ganttFetchTargetKey, selPeriod, selSegment, seriesSelectionKey, selSubject, selClass, ganttDepartment]);
+  useEffect(() => { fetchProjectInsights(timelineInsightProjects); }, [timelineInsightProjects, selPeriod, selSegment, seriesSelectionKey, selSubject, selClass]);
   useEffect(() => {
     if (!activeProject || !projects.length) return;
     if (!projects.some((p) => p.name === activeProject)) {
@@ -1531,7 +1631,7 @@ const Visualization2 = () => {
 
   useEffect(() => {
     if (dashTab === 'night') fetchNightAnalytics();
-  }, [dashTab, selSegment, seriesSelectionKey, selClass, selPeriod, selectedProjects]);
+  }, [dashTab, selSegment, seriesSelectionKey, selSubject, selClass, selPeriod, selectedProjects]);
 
   useEffect(() => {
     if (dashTab !== 'books') return undefined;
@@ -1540,7 +1640,7 @@ const Visualization2 = () => {
       crossBooksFetchSeq.current += 1;
       setBooksLoading(false);
     };
-  }, [dashTab, selSegment, seriesSelectionKey, selClass, selPeriod, selectedProjects, bookSessionMin]);
+  }, [dashTab, selSegment, seriesSelectionKey, selSubject, selClass, selPeriod, selectedProjects, bookSessionMin]);
 
   useEffect(() => {
     if (!selectedBookGroup) return;
@@ -1598,6 +1698,7 @@ const Visualization2 = () => {
   const clearAll = () => {
     setSelSegment('All');
     setSelectedSeries([]);
+    setSelSubject('All');
     setSelClass('All');
     setSelPeriod('Last 7 Days');
     setProjectSearch(''); setSelectedProjects([]);
@@ -1633,55 +1734,42 @@ const Visualization2 = () => {
   const filteredProjNames = useMemo(() => {
     let results = projectNames;
 
-    // filter by segment
     if (selSegment !== 'All') {
-      results = results.filter(n => {
-        const parts = n.split('_').map(x => x.trim()).filter(Boolean);
-        return parts[0] === selSegment;
-      });
-    }
-
-    // filter by class
-    if (selClass !== 'All') {
-      results = results.filter(n => {
-        const parts = n.split('_').map(x => x.trim()).filter(Boolean);
-        return parts[1] === selClass;
-      });
-    }
-
-    // filter by series
-    if (selectedSeries.length > 0) {
-      results = results.filter(n => selectedSeries.includes(extractProjectSeriesToken(n)));
-    }
-
-    // filter by search text
-    if (projectSearch.trim()) {
-      results = results.filter(n => n.toLowerCase().includes(projectSearch.toLowerCase()));
-    }
-
-    return results;
-  }, [projectNames, selSegment, selClass, seriesSelectionKey, projectSearch]);
-
-  /** Project names matching segment / class / series (ignores project search) — used to prune stale multi-select. */
-  const projectNamesMatchingFilters = useMemo(() => {
-    let results = projectNames;
-    if (selSegment !== 'All') {
-      results = results.filter((n) => {
-        const parts = n.split('_').map((x) => x.trim()).filter(Boolean);
-        return parts[0] === selSegment;
-      });
-    }
-    if (selClass !== 'All') {
-      results = results.filter((n) => {
-        const parts = n.split('_').map((x) => x.trim()).filter(Boolean);
-        return parts[1] === selClass;
-      });
+      results = results.filter((n) => projectMatchesSegmentFilter(n, selSegment));
     }
     if (selectedSeries.length > 0) {
       results = results.filter((n) => selectedSeries.includes(extractProjectSeriesToken(n)));
     }
+    if (selSubject !== 'All') {
+      results = results.filter((n) => projectMatchesSubjectFilter(n, selSubject));
+    }
+    if (selClass !== 'All') {
+      results = results.filter((n) => projectMatchesClassFilter(n, selClass));
+    }
+    if (projectSearch.trim()) {
+      results = results.filter((n) => n.toLowerCase().includes(projectSearch.toLowerCase()));
+    }
+
     return results;
-  }, [projectNames, selSegment, selClass, seriesSelectionKey]);
+  }, [projectNames, selSegment, selClass, selSubject, seriesSelectionKey, projectSearch]);
+
+  /** Project names matching segment / series / subject / class (ignores project search). */
+  const projectNamesMatchingFilters = useMemo(() => {
+    let results = projectNames;
+    if (selSegment !== 'All') {
+      results = results.filter((n) => projectMatchesSegmentFilter(n, selSegment));
+    }
+    if (selectedSeries.length > 0) {
+      results = results.filter((n) => selectedSeries.includes(extractProjectSeriesToken(n)));
+    }
+    if (selSubject !== 'All') {
+      results = results.filter((n) => projectMatchesSubjectFilter(n, selSubject));
+    }
+    if (selClass !== 'All') {
+      results = results.filter((n) => projectMatchesClassFilter(n, selClass));
+    }
+    return results;
+  }, [projectNames, selSegment, selClass, selSubject, seriesSelectionKey]);
 
   useEffect(() => {
     if (!projectNames.length) return;
@@ -1692,34 +1780,45 @@ const Visualization2 = () => {
       return next.length === prev.length ? prev : next;
     });
     setActiveProject((prev) => (prev && !allow.has(prev) ? null : prev));
-  }, [projectNames, projectNamesMatchingFilters, selSegment, selClass, seriesSelectionKey]);
+  }, [projectNames, projectNamesMatchingFilters, selSegment, selClass, selSubject, seriesSelectionKey]);
 
-  // derived lists for Series and Class based on selected Segment/Series
   const derivedSeries = useMemo(() => {
-    // compute series options based on selected segment
-    if (selSegment === 'All') return seriesList;
     const set = new Set();
-    projectNames.forEach(n => {
-      const parts = n.split('_').map(x => x.trim()).filter(Boolean);
-      if (parts[0] !== selSegment) return;
+    projectNames.forEach((n) => {
+      if (!projectMatchesSegmentFilter(n, selSegment)) return;
       const tok = extractProjectSeriesToken(n);
       if (tok) set.add(tok);
     });
-    return ['All', ...[...set]];
-  }, [selSegment, projectNames, seriesList]);
+    return ['All', ...[...set].sort((a, b) => a.localeCompare(b))];
+  }, [selSegment, projectNames]);
+
+  const derivedSubjects = useMemo(() => {
+    const set = new Set();
+    projectNames.forEach((n) => {
+      if (!projectMatchesSegmentFilter(n, selSegment)) return;
+      if (selectedSeries.length > 0 && !selectedSeries.includes(extractProjectSeriesToken(n))) return;
+      const subj = extractProjectSubjectToken(n);
+      if (subj) set.add(subj);
+    });
+    return ['All', ...[...set].sort((a, b) => a.localeCompare(b))];
+  }, [selSegment, selectedSeries, projectNames]);
 
   const derivedClasses = useMemo(() => {
     const set = new Set();
-    projectNames.forEach(n => {
-      const parts = n.split('_').map(x => x.trim()).filter(Boolean);
-      if (selSegment !== 'All' && parts[0] !== selSegment) return;
-      if (selectedSeries.length > 0) {
-        if (!selectedSeries.includes(extractProjectSeriesToken(n))) return;
-      }
-      if (parts[1]) set.add(parts[1]);
+    projectNames.forEach((n) => {
+      if (!projectMatchesSegmentFilter(n, selSegment)) return;
+      if (selectedSeries.length > 0 && !selectedSeries.includes(extractProjectSeriesToken(n))) return;
+      if (!projectMatchesSubjectFilter(n, selSubject)) return;
+      const cls = extractProjectClassToken(n);
+      if (cls) set.add(cls);
     });
-    return ['All', ...[...set]];
-  }, [selSegment, selectedSeries, projectNames]);
+    return ['All', ...[...set].sort((a, b) => a.localeCompare(b))];
+  }, [selSegment, selectedSeries, selSubject, projectNames]);
+
+  useEffect(() => {
+    if (selSubject === 'All') return;
+    if (!derivedSubjects.includes(selSubject)) setSelSubject('All');
+  }, [selSubject, derivedSubjects]);
 
   useEffect(() => {
     if (selClass === 'All') return;
@@ -2365,6 +2464,25 @@ const Visualization2 = () => {
                 </button>
               </div>
             </div>
+            {selectedSeries.length > 0 && (
+              <div className="shrink-0 border-b border-gray-600 px-2 py-2">
+                <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-gray-400">Selected</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {selectedSeries.map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      onClick={() => setSelectedSeries((prev) => prev.filter((x) => x !== s))}
+                      className="inline-flex max-w-full items-center gap-1 rounded-full border border-purple-500/50 bg-purple-900/40 px-2 py-0.5 text-xs text-purple-100 hover:bg-purple-800/50"
+                      title={`Remove ${s}`}
+                    >
+                      <span className="truncate">{s}</span>
+                      <X className="h-3 w-3 shrink-0" />
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
             <div className="min-h-0 flex-1 overflow-y-auto py-1">
               {seriesOptionsFiltered.map((s) => (
                 <div
@@ -2466,37 +2584,68 @@ const Visualization2 = () => {
                 </button>
               </div>
             </div>
-            {/* One row: Segment/Series/Class scroll horizontally inside their own box so Project dropdown is not clipped by overflow-x */}
+            {/* One row: Segment → Series → Subject → Class (scroll inside filter strip) */}
             <div className="flex flex-nowrap items-end gap-3 w-full min-w-0">
               <div className="flex gap-3 min-w-0 flex-1 overflow-x-auto pb-1 shrink">
                 <div className="w-[7.5rem] shrink-0">
                   <label className="text-white text-sm font-semibold mb-2 block">Segment</label>
-                  <select value={selSegment} onChange={e => { setSelSegment(e.target.value); setSelectedSeries([]); setSelClass('All'); }}
-                    className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500">
+                  <select
+                    value={selSegment}
+                    onChange={(e) => {
+                      setSelSegment(e.target.value);
+                      setSelectedSeries([]);
+                      setSelSubject('All');
+                      setSelClass('All');
+                    }}
+                    className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  >
                     <option value="All">All</option>
-                    {segments.filter(s => s).map(s => <option key={s} value={s}>{s}</option>)}
+                    {segments.filter((s) => s && s !== 'All').map((s) => (
+                      <option key={s} value={s}>{s}</option>
+                    ))}
                   </select>
                 </div>
-                <div className="relative min-w-[12.5rem] w-[13rem] shrink-0" ref={seriesDropRef}>
+                <div className="relative min-w-[11rem] w-[min(18rem,28vw)] shrink-0" ref={seriesDropRef}>
                   <label className="text-white text-sm font-semibold mb-2 block">Series</label>
                   <button
                     type="button"
                     onClick={() => setShowSeriesDrop((v) => !v)}
-                    className="flex w-full items-center justify-between gap-1 rounded-lg border border-gray-600 bg-gray-700 px-2 py-2 text-left text-sm text-white focus:outline-none focus:ring-2 focus:ring-purple-500"
+                    className="flex min-h-[2.5rem] w-full items-center justify-between gap-1 rounded-lg border border-gray-600 bg-gray-700 px-2 py-2 text-left text-sm text-white focus:outline-none focus:ring-2 focus:ring-purple-500"
+                    title={selectedSeries.length > 0 ? selectedSeries.join(', ') : 'All series'}
                   >
-                    <span className="truncate">
-                      {selectedSeries.length === 0 ? 'All series' : `${selectedSeries.length} selected`}
+                    <span className="line-clamp-2 min-w-0 flex-1 leading-snug">
+                      {selectedSeries.length === 0 ? 'All series' : selectedSeries.join(', ')}
                     </span>
                     <ChevronDown
                       className={`h-4 w-4 shrink-0 text-gray-400 transition-transform ${showSeriesDrop ? 'rotate-180' : ''}`}
                     />
                   </button>
                 </div>
+                <div className="w-[8.5rem] shrink-0">
+                  <label className="text-white text-sm font-semibold mb-2 block">Subject</label>
+                  <select
+                    value={selSubject}
+                    onChange={(e) => {
+                      setSelSubject(e.target.value);
+                      setSelClass('All');
+                    }}
+                    className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  >
+                    {derivedSubjects.map((s) => (
+                      <option key={s} value={s}>{s}</option>
+                    ))}
+                  </select>
+                </div>
                 <div className="w-[7.5rem] shrink-0">
                   <label className="text-white text-sm font-semibold mb-2 block">Class</label>
-                  <select value={selClass} onChange={e => setSelClass(e.target.value)}
-                    className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500">
-                    {derivedClasses.map(c => <option key={c} value={c}>{c}</option>)}
+                  <select
+                    value={selClass}
+                    onChange={(e) => setSelClass(e.target.value)}
+                    className="w-full bg-gray-700 text-white border border-gray-600 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  >
+                    {derivedClasses.map((c) => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
                   </select>
                 </div>
               </div>
@@ -2583,20 +2732,22 @@ const Visualization2 = () => {
                 : 'Updating project view…'
           }
         />
-        {dashTab === 'projects' && projectsLoading && !projectsHasLoaded && (
-          <div className="flex justify-center py-24">
-            <div className="text-center">
-              <div className="animate-spin rounded-full h-24 w-24 border-t-4 border-b-4 border-purple-500 mx-auto mb-4" />
-              <p className="text-white text-xl">Loading Project View…</p>
-            </div>
-          </div>
-        )}
-
-        {dashTab === 'projects' && projectsHasLoaded && (
+        {dashTab === 'projects' && (
           <>
             {/* ── Top projects (horizontal bars) ── */}
             <h2 className="text-3xl font-bold text-white text-center mb-3">Top Projects</h2>
 
+            {projectsLoading && !projectsHasLoaded && (
+              <div className="flex justify-center py-16 mb-6">
+                <div className="text-center">
+                  <div className="animate-spin rounded-full h-14 w-14 border-t-4 border-b-4 border-purple-500 mx-auto mb-3" />
+                  <p className="text-white text-lg">Loading top projects…</p>
+                </div>
+              </div>
+            )}
+
+            {!projectsLoading || projectsHasLoaded ? (
+              <>
             {/* ── scrollable legend (task colours) ── */}
             <div className="flex items-center gap-1.5 mb-3 overflow-x-auto pb-1" style={{ scrollbarWidth: 'thin' }}>
               {legendTasks.map(t => (
@@ -2662,6 +2813,8 @@ const Visualization2 = () => {
                 <span className="text-gray-500 text-xs">{projects.length} projects</span>
               </div>
             </div>
+              </>
+            ) : null}
 
             {/* ── PROJECT PROGRESS (task-stage heatmap — same period as Gantt) ── */}
             <div className="bg-gray-800 bg-opacity-50 rounded-xl border border-gray-700 shadow-xl p-6 mb-6">
@@ -3016,7 +3169,7 @@ const Visualization2 = () => {
                 )}
                 {!ganttLoading && !ganttRefreshing && !projectGanttModel && (
                   <p className="text-gray-500 text-sm py-10 text-center border border-gray-700 rounded-lg">
-                    No Gantt rows for this period and filter set — widen the period or relax segment / series / class filters.
+                    No Gantt rows for this period and filter set — widen the period or relax segment / series / subject / class filters.
                   </p>
                 )}
               </div>
@@ -3742,7 +3895,7 @@ const Visualization2 = () => {
                   </table>
                 </div>
                 {crossBooks.groups.length === 0 && (
-                  <p className="text-gray-400">No multi-session books for these filters. Try widening segment/period or lowering the session threshold.</p>
+                  <p className="text-gray-400">No multi-session books for these filters. Try widening segment / series / subject / period or lowering the session threshold.</p>
                 )}
                 {selectedBookGroup && (
                   <div
