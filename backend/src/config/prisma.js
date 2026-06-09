@@ -14,10 +14,15 @@ function poolingDatabaseUrl(urlString) {
     return urlString;
   }
 
-  // Optional override. If not set, keep DATABASE_URL value.
   const explicit = process.env.DATABASE_CONNECTION_LIMIT?.trim();
+  const defaultLimit = "6";
   if (explicit && /^\d+$/.test(explicit) && explicit !== "0") {
     parsed.searchParams.set("connection_limit", explicit);
+  } else {
+    const current = parsed.searchParams.get("connection_limit");
+    if (!current || current === "3") {
+      parsed.searchParams.set("connection_limit", defaultLimit);
+    }
   }
 
   // Optional override. If not set, keep DATABASE_URL value.

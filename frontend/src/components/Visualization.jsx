@@ -6579,89 +6579,73 @@ const Visualization = () => {
     }
   };
 
-  /** One bad endpoint cannot wipe the dashboard; pool/timeouts won't reject the whole bundle. */
+  /** Single bundled API call — avoids 15 parallel DB connections per user. */
   const fetchDashboardBundle = async (department, team, employee, period, { bustCache = false } = {}) => {
     const urlSuffix = dashboardUrlSuffix(department, team, employee, period);
-    const withBust = (path) => {
-      if (!bustCache) return path;
-      const sep = path.includes('?') ? '&' : '?';
-      return `${path}${sep}_=${Date.now()}`;
-    };
-    const dashboardFetch = (path) =>
-      fetch(withBust(path), { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
-    const endpoints = [
-      `${API_URL}/overview${urlSuffix}`,
-      `${API_URL}/projects${urlSuffix}`,
-      `${API_URL}/employees${urlSuffix}`,
-      `${API_URL}/teams${urlSuffix}`,
-      `${API_URL}/timeline${urlSuffix}`,
-      `${API_URL}/workmode${urlSuffix}`,
-      `${API_URL}/workmode-by-days${urlSuffix}`,
-      `${API_URL}/elements${urlSuffix}`,
-      `${API_URL}/tasks${urlSuffix}`,
-      `${API_URL}/status${urlSuffix}`,
-      `${API_URL}/employee-task-breakdown${urlSuffix}`,
-      `${API_URL}/employee-task-rate-samples${urlSuffix}`,
-      `${API_URL}/project-task-effort${urlSuffix}`,
-      `${API_URL}/project-employee-breakdown${urlSuffix}`,
-      `${API_URL}/project-gantt${urlSuffix}`,
-    ];
+    const bust = bustCache ? `${urlSuffix ? '&' : '?'}_=${Date.now()}` : '';
+    const url = `${API_URL}/bundle${urlSuffix}${bust}`;
 
-    const settled = await Promise.allSettled(endpoints.map((u) => dashboardFetch(u)));
-    const responses = settled.map((r) => (r.status === 'fulfilled' ? r.value : null));
-
-    const [
-      overview,
-      projects,
-      employees,
-      teams,
-      timelinePayload,
-      workMode,
-      workModeByDays,
-      elements,
-      tasks,
-      statuses,
-      jt1,
-      jt1b,
-      jt2,
-      jt3,
-      jt4,
-    ] = await Promise.all([
-      responses[0] ? parseOverviewJson(responses[0]) : Promise.resolve(null),
-      responses[1] ? parseArrJson(responses[1]) : Promise.resolve([]),
-      responses[2] ? parseArrJson(responses[2]) : Promise.resolve([]),
-      responses[3] ? parseArrJson(responses[3]) : Promise.resolve([]),
-      responses[4] ? parseTimelineJson(responses[4]) : Promise.resolve({ timeline: [], totalProjects: 0 }),
-      responses[5] ? parseArrJson(responses[5]) : Promise.resolve([]),
-      responses[6] ? parseArrJson(responses[6]) : Promise.resolve([]),
-      responses[7] ? parseArrJson(responses[7]) : Promise.resolve([]),
-      responses[8] ? parseArrJson(responses[8]) : Promise.resolve([]),
-      responses[9] ? parseArrJson(responses[9]) : Promise.resolve([]),
-      responses[10] ? parseArrJson(responses[10]) : Promise.resolve([]),
-      responses[11] ? parseArrJson(responses[11]) : Promise.resolve([]),
-      responses[12] ? parseArrJson(responses[12]) : Promise.resolve([]),
-      responses[13] ? parseArrJson(responses[13]) : Promise.resolve([]),
-      responses[14] ? parseArrJson(responses[14]) : Promise.resolve([]),
-    ]);
-
-    return {
-      overview,
-      projects,
-      employees,
-      teams,
-      timeline: timelinePayload.timeline,
-      timelineTotalProjects: timelinePayload.totalProjects,
-      workMode,
-      workModeByDays,
-      elements,
-      tasks,
-      statuses,
-      employeeTaskBreakdown: jt1,
-      employeeTaskRateSamples: jt1b,
-      projectTaskEffort: jt2,
-      projectEmployeeBreakdown: jt3,
-      projectGanttRows: jt4,
-    };
+    try {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) {
+        return {
+          overview: null,
+          projects: [],
+          employees: [],
+          teams: [],
+          timeline: [],
+          timelineTotalProjects: 0,
+          workMode: [],
+          workModeByDays: [],
+          elements: [],
+          tasks: [],
+          statuses: [],
+          employeeTaskBreakdown: [],
+          employeeTaskRateSamples: [],
+          projectTaskEffort: [],
+          projectEmployeeBreakdown: [],
+          projectGanttRows: [],
+        };
+      }
+      const b = await res.json();
+      return {
+        overview: b.overview ?? null,
+        projects: b.projects || [],
+        employees: b.employees || [],
+        teams: b.teams || [],
+        timeline: b.timeline || [],
+        timelineTotalProjects: Number(b.timelineTotalProjects) || 0,
+        workMode: b.workMode || [],
+        workModeByDays: b.workModeByDays || [],
+        elements: b.elements || [],
+        tasks: b.tasks || [],
+        statuses: b.statuses || [],
+        employeeTaskBreakdown: b.employeeTaskBreakdown || [],
+        employeeTaskRateSamples: b.employeeTaskRateSamples || [],
+        projectTaskEffort: b.projectTaskEffort || [],
+        projectEmployeeBreakdown: b.projectEmployeeBreakdown || [],
+        projectGanttRows: b.projectGanttRows || [],
+      };
+    } catch {
+      return {
+        overview: null,
+        projects: [],
+        employees: [],
+        teams: [],
+        timeline: [],
+        timelineTotalProjects: 0,
+        workMode: [],
+        workModeByDays: [],
+        elements: [],
+        tasks: [],
+        statuses: [],
+        employeeTaskBreakdown: [],
+        employeeTaskRateSamples: [],
+        projectTaskEffort: [],
+        projectEmployeeBreakdown: [],
+        projectGanttRows: [],
+      };
+    }
   };
 
   const applyDashboardBundle = (b) => {

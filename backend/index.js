@@ -2964,21 +2964,21 @@
 
 
 
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const prisma = require('./src/config/prisma');
 const { projectMatchesSeriesSelection } = require('./src/utils/projectSeriesToken');
+const { createResponseCache, stableQueryString } = require('./src/utils/responseCache');
 
 const app = express();
 
 app.use(cors());
 app.use(express.json());
 
-app.use('/api/dashboard', (_req, res, next) => {
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
-  res.set('Pragma', 'no-cache');
-  next();
-});
+const DASHBOARD_CACHE_TTL_MS = Number(process.env.DASHBOARD_CACHE_TTL_MS) || 45_000;
+app.use('/api/dashboard', createResponseCache({ ttlMs: DASHBOARD_CACHE_TTL_MS }));
 
 // Helper function to build where clause from query params
 function getPeriodDateRange(periodRaw) {
@@ -3209,6 +3209,95 @@ function stripSessionForDisplay(projectName) {
   if (!m) return trimmed;
   return trimmed.slice(0, m.index).replace(/[-_]+$/g, '') || trimmed;
 }
+
+// ===== DASHBOARD BUNDLE (single request, batched DB load) =====
+
+const BUNDLE_SECTIONS = [
+  'overview',
+  'projects',
+  'employees',
+  'teams',
+  'timeline',
+  'workmode',
+  'workmode-by-days',
+  'elements',
+  'tasks',
+  'status',
+  'employee-task-breakdown',
+  'employee-task-rate-samples',
+  'project-task-effort',
+  'project-employee-breakdown',
+  'project-gantt',
+];
+
+const BUNDLE_BATCH_SIZE = Math.max(
+  1,
+  Math.min(5, Number(process.env.DASHBOARD_BUNDLE_BATCH_SIZE) || 3)
+);
+
+async function fetchDashboardSection(port, section, queryString) {
+  const qs = queryString ? `?${queryString}` : '';
+  const url = `http://127.0.0.1:${port}/api/dashboard/${section}${qs}`;
+  const response = await fetch(url, {
+    headers: { 'X-Internal-Bundle': '1' },
+    signal: AbortSignal.timeout(120_000),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`${section} failed (${response.status}): ${text.slice(0, 200)}`);
+  }
+  return response.json();
+}
+
+app.get('/api/dashboard/bundle', async (req, res) => {
+  try {
+    const port = Number(process.env.PORT) || 3001;
+    const queryString = stableQueryString(req.query);
+    const data = {};
+
+    for (let i = 0; i < BUNDLE_SECTIONS.length; i += BUNDLE_BATCH_SIZE) {
+      const batch = BUNDLE_SECTIONS.slice(i, i + BUNDLE_BATCH_SIZE);
+      const settled = await Promise.allSettled(
+        batch.map(async (section) => {
+          const json = await fetchDashboardSection(port, section, queryString);
+          return { section, json };
+        })
+      );
+
+      for (const result of settled) {
+        if (result.status === 'fulfilled') {
+          data[result.value.section] = result.value.json;
+        }
+      }
+    }
+
+    const timeline = data.timeline;
+    const timelineArr = Array.isArray(timeline) ? timeline : timeline?.timeline || [];
+
+    res.json({
+      overview: data.overview ?? null,
+      projects: data.projects || [],
+      employees: data.employees || [],
+      teams: data.teams || [],
+      timeline: timelineArr,
+      timelineTotalProjects: Array.isArray(timeline)
+        ? 0
+        : Number(timeline?.totalProjects) || 0,
+      workMode: data.workmode || [],
+      workModeByDays: data['workmode-by-days'] || [],
+      elements: data.elements || [],
+      tasks: data.tasks || [],
+      statuses: data.status || [],
+      employeeTaskBreakdown: data['employee-task-breakdown'] || [],
+      employeeTaskRateSamples: data['employee-task-rate-samples'] || [],
+      projectTaskEffort: data['project-task-effort'] || [],
+      projectEmployeeBreakdown: data['project-employee-breakdown'] || [],
+      projectGanttRows: data['project-gantt'] || [],
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // ===== FILTER ENDPOINTS =====
 
