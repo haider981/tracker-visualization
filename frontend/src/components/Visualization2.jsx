@@ -622,11 +622,14 @@ import {
   TrendingUp,
   Target,
   Activity,
-  ChevronDown
+  ChevronDown,
+  FileText,
 } from 'lucide-react';
+import ReportGenerator from './ReportGenerator';
 
 const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL || '').replace(/\/$/, '');
 const API_URL = `${BACKEND_URL}/api/dashboard`;
+const REPORTS_API_URL = `${BACKEND_URL}/api/reports`;
 
 // 30 distinct colours — enough to cover all task types without collisions
 const TASK_COLORS = [
@@ -1259,6 +1262,7 @@ const Visualization2 = () => {
   const [insightsRefreshing, setInsightsRefreshing] = useState(false);
   const insightsHasLoadedRef = useRef(false);
   const [expandedTask, setExpandedTask] = useState(null);
+  const [showReportGenerator, setShowReportGenerator] = useState(false);
 
   const [projectsLoading, setProjectsLoading] = useState(true);
   const [projectsRefreshing, setProjectsRefreshing] = useState(false);
@@ -2567,8 +2571,29 @@ const Visualization2 = () => {
             >
               <Briefcase className="w-4 h-4" /> Project view
             </NavLink>
+            <button
+              type="button"
+              onClick={() => setShowReportGenerator(true)}
+              className="px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors bg-amber-700/90 text-white hover:bg-amber-600 border border-amber-500/40"
+            >
+              <FileText className="w-4 h-4" /> Generate Report
+            </button>
           </div>
         </div>
+
+        <ReportGenerator
+          isOpen={showReportGenerator}
+          onClose={() => setShowReportGenerator(false)}
+          reportsApiUrl={REPORTS_API_URL}
+          dashboardFilters={{
+            department: 'All',
+            team: 'All',
+            employee: 'All',
+            period: selPeriod,
+          }}
+          defaultReportType="project"
+          defaultProjectName={activeProject || selectedProjects[0] || ''}
+        />
 
         {/* filters grid: row1 = Dept | ProjectCategory(search) | Employee | Element
                           row2 = Team | ProjectName            | Period   | Task   + CLEAR ALL */}

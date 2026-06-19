@@ -3077,6 +3077,23 @@ function buildWhereClause(req) {
   return where;
 }
 
+const BLANK_PROJECT_NAMES = ['', ' ', 'blank', 'Blank', 'BLANK'];
+
+function withWorkingProjects(where = {}) {
+  return {
+    AND: [where, { project_name: { not: null, notIn: BLANK_PROJECT_NAMES } }],
+  };
+}
+
+function withLeaveProjects(where = {}) {
+  return {
+    AND: [
+      where,
+      { OR: [{ project_name: null }, { project_name: { in: BLANK_PROJECT_NAMES } }] },
+    ],
+  };
+}
+
 /** Users-table filters (department / team / employee) — same team mapping as buildWhereClause, no date period. */
 function buildUsersWhereClause(req) {
   const and = [];
@@ -3377,20 +3394,28 @@ app.get('/api/dashboard/overview', async (req, res) => {
       where: buildUsersWhereClause(req),
     });
 
-    const totalHours = await prisma.masterDatabase.aggregate({
-      _sum: { hours_spent: true },
-      where: where
-    });
+    const [totalWorking, totalLeave, totalTasks] = await Promise.all([
+      prisma.masterDatabase.aggregate({
+        _sum: { hours_spent: true },
+        where: withWorkingProjects(where),
+      }),
+      prisma.masterDatabase.aggregate({
+        _sum: { hours_spent: true },
+        where: withLeaveProjects(where),
+      }),
+      prisma.masterDatabase.count({ where }),
+    ]);
 
-    const totalTasks = await prisma.masterDatabase.count({
-      where: where
-    });
+    const totalWorkingHours = totalWorking._sum.hours_spent || 0;
+    const totalLeaveHours = totalLeave._sum.hours_spent || 0;
 
     res.json({
       totalProjects: totalProjects.length,
       totalEmployees,
-      totalHours: totalHours._sum.hours_spent || 0,
-      totalTasks: totalTasks,
+      totalHours: totalWorkingHours + totalLeaveHours,
+      totalWorkingHours,
+      totalLeaveHours,
+      totalTasks,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -3475,30 +3500,49 @@ app.get('/api/dashboard/projects', async (req, res) => {
 app.get('/api/dashboard/employees', async (req, res) => {
   try {
     const where = buildWhereClause(req);
-    
-    const employees = await prisma.masterDatabase.groupBy({
-      by: ['name', 'team'],
-      _sum: { 
-        hours_spent: true,
-        number_of_units: true 
-      },
-      _count: true,
-      where: where,
-      orderBy: {
-        _sum: {
-          hours_spent: 'desc',
-        },
-      },
-      take: 20,
-    });
 
-    res.json(employees.map(e => ({
-      name: e.name,
-      team: e.team,
-      hours: e._sum.hours_spent || 0,
-      units: e._sum.number_of_units || 0,
-      tasks: e._count,
-    })));
+    const [workingRows, leaveRows] = await Promise.all([
+      prisma.masterDatabase.groupBy({
+        by: ['name', 'team'],
+        _sum: {
+          hours_spent: true,
+          number_of_units: true,
+        },
+        _count: true,
+        where: withWorkingProjects(where),
+        orderBy: {
+          _sum: {
+            hours_spent: 'desc',
+          },
+        },
+        take: 20,
+      }),
+      prisma.masterDatabase.groupBy({
+        by: ['name', 'team'],
+        _sum: { hours_spent: true },
+        _count: true,
+        where: withLeaveProjects(where),
+      }),
+    ]);
+
+    const leaveMap = new Map(
+      leaveRows.map((r) => [`${r.name}\t${r.team}`, r])
+    );
+
+    res.json(workingRows.map((e) => {
+      const leave = leaveMap.get(`${e.name}\t${e.team}`);
+      const workingHours = e._sum.hours_spent || 0;
+      const leaveHours = leave?._sum.hours_spent || 0;
+      return {
+        name: e.name,
+        team: e.team,
+        hours: workingHours,
+        workingHours,
+        leaveHours,
+        units: e._sum.number_of_units || 0,
+        tasks: e._count + (leave?._count || 0),
+      };
+    }));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -3508,28 +3552,45 @@ app.get('/api/dashboard/employees', async (req, res) => {
 app.get('/api/dashboard/teams', async (req, res) => {
   try {
     const where = buildWhereClause(req);
-    
-    const teams = await prisma.masterDatabase.groupBy({
-      by: ['team'],
-      _sum: { 
-        hours_spent: true,
-        number_of_units: true 
-      },
-      _count: true,
-      where: where,
-      orderBy: {
-        _sum: {
-          hours_spent: 'desc',
-        },
-      },
-    });
 
-    res.json(teams.map(t => ({
-      name: t.team,
-      hours: t._sum.hours_spent || 0,
-      units: t._sum.number_of_units || 0,
-      tasks: t._count,
-    })));
+    const [workingRows, leaveRows] = await Promise.all([
+      prisma.masterDatabase.groupBy({
+        by: ['team'],
+        _sum: {
+          hours_spent: true,
+          number_of_units: true,
+        },
+        _count: true,
+        where: withWorkingProjects(where),
+        orderBy: {
+          _sum: {
+            hours_spent: 'desc',
+          },
+        },
+      }),
+      prisma.masterDatabase.groupBy({
+        by: ['team'],
+        _sum: { hours_spent: true },
+        _count: true,
+        where: withLeaveProjects(where),
+      }),
+    ]);
+
+    const leaveMap = new Map(leaveRows.map((r) => [r.team, r]));
+
+    res.json(workingRows.map((t) => {
+      const leave = leaveMap.get(t.team);
+      const workingHours = t._sum.hours_spent || 0;
+      const leaveHours = leave?._sum.hours_spent || 0;
+      return {
+        name: t.team,
+        hours: workingHours,
+        workingHours,
+        leaveHours,
+        units: t._sum.number_of_units || 0,
+        tasks: t._count + (leave?._count || 0),
+      };
+    }));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -5464,6 +5525,10 @@ app.get('/api/dashboard/project-view/project-insights', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// ===== PDF REPORT GENERATION =====
+const reportRoutes = require('./src/routes/reportRoutes');
+app.use('/api/reports', reportRoutes);
 
 const PORT = process.env.PORT || 3001;
 

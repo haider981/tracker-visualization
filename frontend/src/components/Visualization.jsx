@@ -3571,10 +3571,12 @@ import React, { useState, useEffect, useMemo, memo, useRef, useCallback } from '
 import { NavLink, useLocation } from 'react-router-dom';
 import { createPortal } from 'react-dom';
 import { BarChart, Bar, LineChart, Line, PieChart, Pie, AreaChart, Area, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Treemap, LabelList, ReferenceLine } from 'recharts';
-import { TrendingUp, Users, Clock, Briefcase, Activity, Zap, Target, CheckCircle, Filter, X, Search, Moon, BookMarked, AlertTriangle, LayoutDashboard, LayoutGrid, CircleHelp, BarChart3, PieChart as PieChartIcon } from 'lucide-react';
+import { TrendingUp, Users, Clock, Briefcase, Activity, Zap, Target, CheckCircle, Filter, X, Search, Moon, BookMarked, AlertTriangle, LayoutDashboard, LayoutGrid, CircleHelp, BarChart3, PieChart as PieChartIcon, FileText } from 'lucide-react';
+import ReportGenerator from './ReportGenerator';
 
 const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL || '').replace(/\/$/, '');
 const API_URL = `${BACKEND_URL}/api/dashboard`;
+const REPORTS_API_URL = `${BACKEND_URL}/api/reports`;
 const REFRESH_INTERVAL = 60000;
 /** Default Overall dashboard slice: smaller query for fast first paint; full range prefetched in background */
 const DEFAULT_DASH_PERIOD = 'Last 7 Days';
@@ -5084,9 +5086,11 @@ function ProjectEffortTreemapContent(props) {
     props.rankRatio
   );
   const rankRatio = rankRatioRaw ?? valueRatio;
-  const blended = 0.35 * valueRatio + 0.65 * rankRatio;
-  const ratio = Number.isFinite(blended) ? Math.pow(Math.max(0, Math.min(1, blended)), 0.85) : 0.5;
+  const blended = 0.5 * valueRatio + 0.5 * rankRatio;
+  const ratio = Number.isFinite(blended) ? Math.pow(Math.max(0, Math.min(1, blended)), 0.72) : 0.5;
   const fill = shadeByValue(base, ratio);
+  const tileStroke = treemapTileStroke(ratio);
+  const tileInset = 1;
   if (width < 3 || height < 3) return null;
 
   const maxChars = Math.max(4, Math.min(28, Math.floor((width - 10) / 6.2)));
@@ -5105,17 +5109,23 @@ function ProjectEffortTreemapContent(props) {
   const textStroke = 'rgba(15, 23, 42, 0.92)';
   const textFill = '#f8fafc';
 
+  const tileX = x + tileInset;
+  const tileY = y + tileInset;
+  const tileW = Math.max(0, width - tileInset * 2);
+  const tileH = Math.max(0, height - tileInset * 2);
+
   return (
     <g>
       <rect
-        x={x}
-        y={y}
-        width={width}
-        height={height}
+        x={tileX}
+        y={tileY}
+        width={tileW}
+        height={tileH}
         fill={fill}
-        stroke="rgba(15,23,42,0.85)"
-        strokeWidth={1}
-        rx={2}
+        stroke={tileStroke}
+        strokeWidth={1.5}
+        rx={3}
+        shapeRendering="geometricPrecision"
       />
       {stacked && (
         <>
@@ -5282,9 +5292,16 @@ function hexToHsl(hex) {
 function shadeByValue(baseHex, ratio) {
   const r = Math.max(0, Math.min(1, ratio));
   const { h, s } = hexToHsl(baseHex);
-  const lightness = 94 - r * 72;
-  const saturation = Math.max(40, s - (1 - r) * 28);
+  const eased = Math.pow(r, 0.68);
+  const lightness = 92 - eased * 64;
+  const saturation = Math.min(96, Math.max(55, s + eased * 32));
   return `hsl(${h}, ${saturation}%, ${lightness}%)`;
+}
+
+function treemapTileStroke(ratio) {
+  const r = Math.max(0, Math.min(1, ratio));
+  const alpha = 0.38 + r * 0.28;
+  return `rgba(255, 255, 255, ${alpha.toFixed(2)})`;
 }
 
 const StatCard = ({ icon: Icon, title, value, subtitle, color }) => (
@@ -5389,6 +5406,7 @@ const Visualization = () => {
   const [showEmployeeDropdown, setShowEmployeeDropdown] = useState(false);
   const [filteredEmployees, setFilteredEmployees] = useState([]);
   const [showTeamDropdown, setShowTeamDropdown] = useState(false);
+  const [showReportGenerator, setShowReportGenerator] = useState(false);
 
   /** Selected team(s) parsed as an array. Empty array = "All". */
   const selectedTeamList = useMemo(
@@ -6347,9 +6365,10 @@ const Visualization = () => {
     };
   }, [isEmployeeDetailView, projectGanttRows, selectedEmployee, ganttViewportWidth, teamGanttTimeScale]);
 
-  /** Rows = employees, columns = week or month; cell = total hours in that bucket (all projects). */
+  /** Rows = teams (Overall) or employees; columns = day/week/month; cell = total hours in bucket (all projects). */
   const employeeHoursHeatmapModel = useMemo(() => {
     const rows = Array.isArray(projectGanttRows) ? projectGanttRows : [];
+    const rowMode = isOverallGanttRows ? 'overall' : 'employee';
     if (!rows.length) {
       return {
         employees: [],
@@ -6361,22 +6380,31 @@ const Visualization = () => {
         empColW: 160,
         timeScale: teamHoursHeatmapScale,
         valueMode: teamHeatmapValueMode,
+        rowMode,
       };
     }
 
     const dateSet = new Set();
-    const employeeTotals = new Map();
-    const dayHoursByEmp = new Map();
+    const rowTotals = new Map();
+    const dayHoursByRow = new Map();
+    const employeeTeamMap = new Map();
+    for (const r of rows) {
+      const emp = String(r?.employee || r?.name || '').trim();
+      const tm = String(r?.team || '').trim();
+      if (emp && tm && !employeeTeamMap.has(emp)) employeeTeamMap.set(emp, tm);
+    }
 
     for (const r of rows) {
       const employee = String(r?.employee || r?.name || '').trim();
+      const team = String(r?.team || '').trim() || employeeTeamMap.get(employee) || '';
+      const rowLabel = isOverallGanttRows ? team : employee;
       const date = String(r?.date || '').slice(0, 10);
-      if (!employee || !date) continue;
+      if (!rowLabel || !date) continue;
       dateSet.add(date);
       const h = Number(r?.hours) || 0;
-      employeeTotals.set(employee, (employeeTotals.get(employee) || 0) + h);
-      if (!dayHoursByEmp.has(employee)) dayHoursByEmp.set(employee, new Map());
-      const dm = dayHoursByEmp.get(employee);
+      rowTotals.set(rowLabel, (rowTotals.get(rowLabel) || 0) + h);
+      if (!dayHoursByRow.has(rowLabel)) dayHoursByRow.set(rowLabel, new Map());
+      const dm = dayHoursByRow.get(rowLabel);
       dm.set(date, (dm.get(date) || 0) + h);
     }
 
@@ -6396,11 +6424,11 @@ const Visualization = () => {
     const bucketByKey = new Map(buckets.map((b) => [b.key, b]));
 
     const cellMap = new Map();
-    for (const [employee, dm] of dayHoursByEmp.entries()) {
+    for (const [rowLabel, dm] of dayHoursByRow.entries()) {
       for (const [dateStr, h] of dm.entries()) {
         const bk = dateToBucketKey.get(dateStr);
         if (!bk) continue;
-        const key = `${employee}\t${bk}`;
+        const key = `${rowLabel}\t${bk}`;
         cellMap.set(key, (cellMap.get(key) || 0) + h);
       }
     }
@@ -6421,7 +6449,7 @@ const Visualization = () => {
     }
     if (!Number.isFinite(hMin)) hMin = 0;
 
-    const employees = Array.from(employeeTotals.entries())
+    const employees = Array.from(rowTotals.entries())
       .filter(([, t]) => t > 0)
       .sort((a, b) => b[1] - a[1])
       .map(([name]) => name);
@@ -6436,8 +6464,9 @@ const Visualization = () => {
       empColW: 160,
       timeScale: teamHoursHeatmapScale,
       valueMode: teamHeatmapValueMode,
+      rowMode,
     };
-  }, [projectGanttRows, teamHoursHeatmapScale, teamHeatmapValueMode, selectedPeriod]);
+  }, [projectGanttRows, teamHoursHeatmapScale, teamHeatmapValueMode, selectedPeriod, isOverallGanttRows]);
 
   useEffect(() => {
     if (teamHeatmapValueMode === 'avgWeekly' && (teamHoursHeatmapScale === 'Day' || teamHoursHeatmapScale === 'Week')) {
@@ -7022,8 +7051,32 @@ const Visualization = () => {
             >
               <Briefcase className="w-4 h-4" /> Project view
             </NavLink>
+            <button
+              type="button"
+              onClick={() => setShowReportGenerator(true)}
+              className="px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors bg-amber-700/90 text-white hover:bg-amber-600 border border-amber-500/40"
+            >
+              <FileText className="w-4 h-4" /> Generate Report
+            </button>
           </div>
         </div>
+
+        <ReportGenerator
+          isOpen={showReportGenerator}
+          onClose={() => setShowReportGenerator(false)}
+          reportsApiUrl={REPORTS_API_URL}
+          dashboardFilters={{
+            department: selectedDepartment,
+            team: selectedTeam,
+            employee: selectedEmployee,
+            period: selectedPeriod,
+            ganttRowMode,
+          }}
+          departments={departments}
+          filteredTeams={filteredTeams}
+          employeeNames={employeeNames}
+          ganttRowMode={ganttRowMode}
+        />
 
         {/* Filters Section */}
         <div className="px-8 pb-6">
@@ -8181,15 +8234,17 @@ const Visualization = () => {
               )}
           </div>
 
-          {/* Employee × day/week/month hours heatmap (after Gantt) */}
+          {/* Team / employee × day/week/month hours heatmap (after Gantt) */}
           <div className="bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-xl p-6 shadow-2xl border border-gray-700">
             <div className="mb-4 flex items-center justify-between gap-3 flex-wrap">
               <div>
                 <h2 className="text-2xl font-bold text-white flex items-center">
-                  <LayoutGrid className="mr-2 text-cyan-400" /> Employee hours heatmap
+                  <LayoutGrid className="mr-2 text-cyan-400" /> {isOverallGanttRows ? 'Team hours heatmap' : 'Employee hours heatmap'}
                 </h2>
                 <p className="text-gray-400 text-sm mt-1 max-w-3xl">
-                  Rows are employees for the current team filters; columns are calendar days, weeks, or months (oldest on the left, newest on the right).{' '}
+                  {isOverallGanttRows
+                    ? 'Rows are teams for the current department and team filters; columns are calendar days, weeks, or months (oldest on the left, newest on the right). Use Overall to compare teams; switch to Employee for individual rows.'
+                    : 'Rows are employees for the current team filters; columns are calendar days, weeks, or months (oldest on the left, newest on the right).'}{' '}
                   <span className="text-gray-500">
                     {teamHeatmapValueMode === 'total'
                       ? 'Each cell shows total hours logged in that bucket across all projects.'
@@ -8198,6 +8253,24 @@ const Visualization = () => {
                 </p>
               </div>
               <div className="flex flex-col items-end gap-2 sm:flex-row sm:items-center sm:gap-3 flex-wrap justify-end">
+                <div className="inline-flex rounded-lg border border-blue-400/60 overflow-hidden text-xs font-semibold">
+                  <button
+                    type="button"
+                    disabled={selectedEmployee !== 'All'}
+                    title={selectedEmployee !== 'All' ? 'Employee filter active — showing individual rows' : undefined}
+                    className={`px-3 py-1.5 ${effectiveGanttRowMode === 'overall' ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'} ${selectedEmployee !== 'All' ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    onClick={() => setGanttRowMode('overall')}
+                  >
+                    Overall
+                  </button>
+                  <button
+                    type="button"
+                    className={`px-3 py-1.5 border-l border-blue-400/40 ${effectiveGanttRowMode === 'employee' ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+                    onClick={() => setGanttRowMode('employee')}
+                  >
+                    Employee
+                  </button>
+                </div>
                 <div className="flex items-center gap-2 flex-wrap justify-end">
                   <span className="text-gray-400 text-xs font-semibold whitespace-nowrap">Values:</span>
                   <div className="inline-flex rounded-lg border border-gray-600 overflow-hidden text-xs font-semibold">
@@ -8265,7 +8338,7 @@ const Visualization = () => {
               </div>
             </div>
             <p className="text-gray-400 text-xs mb-3">
-              Uses the same underlying data as the employee timeline Gantt. Darker blue = higher values in the current mode.{' '}
+              Uses the same underlying data and Overall / Employee toggle as the timeline Gantt. Darker blue = higher values in the current mode. Y-axis: {isOverallGanttRows ? 'teams' : 'employees'}.{' '}
               {teamHoursHeatmapScale === 'Day'
                 ? `Day columns match the Period filter when it is a fixed window (e.g. Last 7 Days through today); for All or unknown periods they span the earliest–latest logged date. Days with no hours show 0. Scroll horizontally for the full range.`
                 : 'Scroll wide grids horizontally as needed.'}
@@ -8283,7 +8356,7 @@ const Visualization = () => {
 
             {employeeHoursHeatmapModel.employees.length > 0 && employeeHoursHeatmapModel.buckets.length > 0 ? (
               <div
-                key={`emp-hours-heat-${teamHoursHeatmapScale}-${teamHeatmapValueMode}-${employeeHoursHeatmapModel.employees.length}-${employeeHoursHeatmapModel.buckets.length}`}
+                key={`emp-hours-heat-${teamHoursHeatmapScale}-${teamHeatmapValueMode}-${effectiveGanttRowMode}-${employeeHoursHeatmapModel.employees.length}-${employeeHoursHeatmapModel.buckets.length}`}
                 className={`isolate w-full overflow-x-auto overflow-y-auto rounded-lg border border-gray-700 bg-gray-900/40 ${
                   teamHoursHeatmapScale === 'Day' ? 'max-h-[min(75vh,560px)]' : 'max-h-[min(70vh,480px)]'
                 }`}
@@ -8304,7 +8377,7 @@ const Visualization = () => {
                   <thead>
                     <tr>
                       <th className="sticky top-0 left-0 z-30 w-[160px] bg-gray-800 px-3 py-2 text-left font-semibold text-gray-300 border-b border-r border-gray-700">
-                        Employee
+                        {isOverallGanttRows ? 'Team' : 'Employee'}
                       </th>
                       {employeeHoursHeatmapModel.buckets.map((b) => (
                         <th
@@ -8479,7 +8552,7 @@ const Visualization = () => {
                 </div>
                 {projectClusterRows.length ? (
                   <div
-                    className="flex flex-col gap-2"
+                    className="flex flex-col gap-2.5"
                     style={{ height: 480 }}
                   >
                     {projectClusterRows.map((row, rIdx) => {
@@ -8493,7 +8566,7 @@ const Visualization = () => {
                       return (
                         <div
                           key={`row-${rIdx}`}
-                          className="flex gap-2"
+                          className="flex gap-2.5"
                           style={{ flex: rowFlex, minHeight: 0 }}
                         >
                           {row.map((cluster) => {
@@ -8508,18 +8581,20 @@ const Visualization = () => {
                               <div
                                 key={cluster.name}
                                 title={`${cluster.name}\n${cluster.hours.toFixed(1)} h · ${cluster.units} units · ${cluster.pctOfScope.toFixed(1)}% of scope`}
-                                className="flex flex-col rounded-md overflow-hidden border border-slate-900 shadow-lg"
+                                className="flex flex-col rounded-md overflow-hidden shadow-lg"
                                 style={{
                                   flex: flexVal,
                                   minWidth: 0,
-                                  backgroundColor: clusterColor
+                                  backgroundColor: clusterColor,
+                                  border: '2px solid rgba(255, 255, 255, 0.32)',
+                                  boxShadow: 'inset 0 0 0 1px rgba(0, 0, 0, 0.15)'
                                 }}
                               >
                                 <div
                                   className="px-2.5 py-1.5"
                                   style={{
                                     backgroundColor: 'rgba(15, 23, 42, 0.55)',
-                                    borderBottom: '1px solid rgba(248, 250, 252, 0.18)'
+                                    borderBottom: '1px solid rgba(248, 250, 252, 0.35)'
                                   }}
                                 >
                                   <p
@@ -8539,7 +8614,7 @@ const Visualization = () => {
                                         data={cluster.tasks}
                                         dataKey="size"
                                         nameKey="name"
-                                        stroke="rgba(15,23,42,0.85)"
+                                        stroke="rgba(255,255,255,0.45)"
                                         aspectRatio={4 / 3}
                                         isAnimationActive={false}
                                         content={<ProjectEffortTreemapContent />}
