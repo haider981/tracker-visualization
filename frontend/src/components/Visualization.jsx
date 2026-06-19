@@ -3665,6 +3665,40 @@ Internet/System Issue\tI`;
 })();
 const TASK_IC_MODE_LOWER = new Map(Object.entries(TASK_IC_MODE).map(([k, v]) => [k.toLowerCase(), v]));
 
+/** Canonical column order for team-view employee×task heatmap (matches TASK_IC_MODE). */
+const WORK_DISTRIBUTION_TASK_ORDER = Object.keys(TASK_IC_MODE);
+
+const TASK_HEATMAP_ALIASES = new Map([
+  ['cmp', 'Compiling'],
+  ['flat colouring', 'Flat colour'],
+  ['website design', 'Website design/check'],
+  ['misc', 'Miscellaneous'],
+]);
+
+/** Merge alias / repeated variants into canonical heatmap task labels. */
+function normalizeHeatmapTaskName(raw) {
+  let t = String(raw || '').trim();
+  if (!t) return t;
+  t = t.replace(/\s*\(repeated\)\s*$/i, '').trim();
+  const alias = TASK_HEATMAP_ALIASES.get(t.toLowerCase());
+  return alias || t;
+}
+
+function sortTasksByWorkOrder(tasks) {
+  const orderIndex = new Map(
+    WORK_DISTRIBUTION_TASK_ORDER.map((t, i) => [t.toLowerCase(), i])
+  );
+  const fallback = WORK_DISTRIBUTION_TASK_ORDER.length;
+  return [...tasks].sort((a, b) => {
+    const ai = orderIndex.get(String(a).toLowerCase());
+    const bi = orderIndex.get(String(b).toLowerCase());
+    const aIdx = ai !== undefined ? ai : fallback;
+    const bIdx = bi !== undefined ? bi : fallback;
+    if (aIdx !== bIdx) return aIdx - bIdx;
+    return String(a).localeCompare(String(b));
+  });
+}
+
 function classifyTaskIndependentOrCollab(taskName) {
   const t = String(taskName || '').trim();
   if (!t) return 'I';
@@ -5654,7 +5688,10 @@ const Visualization = () => {
   }, [isEmployeeDetailView, employeeTaskRateSamples, employeeTaskBreakdown, selectedEmployee]);
 
   const workDistributionAgg = useMemo(() => {
-    const flatRaw = employeeTaskBreakdown || [];
+    const flatRaw = (employeeTaskBreakdown || []).map((r) => ({
+      ...r,
+      task: normalizeHeatmapTaskName(r.task),
+    }));
     const flat = isAllDepartmentView
       ? flatRaw
           .map((r) => ({ ...r, employee: teamToDepartment(r.team) }))
@@ -5739,9 +5776,7 @@ const Visualization = () => {
     const allHeatEmps = Object.entries(heatEmpTotals)
       .sort((a, b) => b[1] - a[1])
       .map(([e]) => e);
-    const taskColsHeat = Object.entries(heatTaskTotals)
-      .sort((a, b) => b[1] - a[1])
-      .map(([t]) => t);
+    const taskColsHeat = sortTasksByWorkOrder(Object.keys(heatTaskTotals));
 
     let heatRows = [...allHeatEmps];
     if (selectedEmployeeFromStack) {
